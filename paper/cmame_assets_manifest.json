@@ -1,0 +1,170 @@
+{
+  "outputs": [
+    {
+      "bytes": 39000,
+      "path": "paper/figures/cmame_offline_online_architecture.pdf",
+      "sha256": "913a30c63b15f4afeff97918826b69d3cdd6a217135c804e6fba883e59e77d1e"
+    },
+    {
+      "bytes": 131758,
+      "path": "paper/figures/cmame_offline_online_architecture.png",
+      "sha256": "922d8cf570d316d772b295d3cbc6a9229788ca2775c0ef9ea572e60c12c4270e"
+    },
+    {
+      "bytes": 109461,
+      "path": "paper/figures/cmame_fixed_rve_morphology.pdf",
+      "sha256": "8f202e92e2859aed6f142aa02823505402d4499c1c7edafd75f3f0a2f7bdaaed"
+    },
+    {
+      "bytes": 372152,
+      "path": "paper/figures/cmame_fixed_rve_morphology.png",
+      "sha256": "30fcc453ebeafee894ddf443e9a92bc841bba3de91d65d7e8a3cd76bb91ecd71"
+    },
+    {
+      "bytes": 16892,
+      "path": "paper/figures/cmame_voxel_scaling.pdf",
+      "sha256": "6eb89a755c7f06995570321c70a436602bae569c473a7fd90939266e5fe081f3"
+    },
+    {
+      "bytes": 79655,
+      "path": "paper/figures/cmame_voxel_scaling.png",
+      "sha256": "acbbc419c2ba2d6ac96d84e939cd5f2f01e1d478feef5bbed974f997128ac618"
+    },
+    {
+      "bytes": 303,
+      "path": "paper/tables/cmame_voxel_scaling.tex",
+      "sha256": "49a048724f6178a75a3fcc6368492c00ce9e4aa1bc2b1827fb87bf4dfa4d5c48"
+    },
+    {
+      "bytes": 18364,
+      "path": "paper/figures/cmame_inclusion_benchmark.pdf",
+      "sha256": "045908cb48fcef19bfbcfacc08900ef47a103d084ba71a53d8b26e2eab2b1180"
+    },
+    {
+      "bytes": 81900,
+      "path": "paper/figures/cmame_inclusion_benchmark.png",
+      "sha256": "1a2d9284c16b1434e825126a6d8c72d35a40a8a24ed8dd88653b9330e526d739"
+    },
+    {
+      "bytes": 349,
+      "path": "paper/tables/cmame_inclusion_benchmark.tex",
+      "sha256": "4959f0a3b5671f16055fbd97c6afb8313ee57a3de1eb4091e9393e509646dfbd"
+    },
+    {
+      "bytes": 21494,
+      "path": "paper/figures/cmame_geometry_descriptors.pdf",
+      "sha256": "35c7f17e34c7f6d5b875aac14a7e98b7706a4ab528ab7054d722f56aac0c7878"
+    },
+    {
+      "bytes": 199187,
+      "path": "paper/figures/cmame_geometry_descriptors.png",
+      "sha256": "7d009c22ee85167dd0e8aae7c0c8aebcf9d6d68166b72ddeafd3f418e648f4c0"
+    },
+    {
+      "bytes": 16340,
+      "path": "paper/figures/cmame_geometry_slices.pdf",
+      "sha256": "8d0486330293791d38dee599179c043054a199070ce724dc6e63747f66a5d7c5"
+    },
+    {
+      "bytes": 32602,
+      "path": "paper/figures/cmame_geometry_slices.png",
+      "sha256": "e972f3306ef885409d41acc6627f7f2db46b663ee951fc65fe4b5ceabd3b2e9c"
+    },
+    {
+      "bytes": 226,
+      "path": "paper/tables/cmame_geometry_summary.tex",
+      "sha256": "086bf03bbb3d2c2db203152b9415edd90ac29890d3294618197729725f9b4fe0"
+    },
+    {
+      "bytes": 21844,
+      "path": "paper/figures/cmame_uq_distributions.pdf",
+      "sha256": "b43e77ab21f9a4554927e791f227b5338e691a8e22fc577b0c52ad50d3c3771f"
+    },
+    {
+      "bytes": 75993,
+      "path": "paper/figures/cmame_uq_distributions.png",
+      "sha256": "7e327e9c4bf1a5b12606fe3d2339ddd386372539047f0820bc8a0b8725c44103"
+    },
+    {
+      "bytes": 435,
+      "path": "paper/tables/cmame_uq_summary.tex",
+      "sha256": "6b3194bd543f9dfd6ed1eef395a5f8c002a021af962cebdfadae3329419c6978"
+    },
+    {
+      "bytes": 29541,
+      "path": "paper/figures/cmame_bound_reliability.pdf",
+      "sha256": "34f1cc92dc75da4c30122879e2e0249eba2c845a9a3700763288f0d5dc8681ae"
+    },
+    {
+      "bytes": 210628,
+      "path": "paper/figures/cmame_bound_reliability.png",
+      "sha256": "0a6be2bded5a6d66d449cac593744cc968b1bd601105f192ab437befdb88def8"
+    },
+    {
+      "bytes": 24141,
+      "path": "paper/figures/cmame_loewner_eigenvalues.pdf",
+      "sha256": "de4c60ff21932f52b4c5abe854a3ab7811df1440c660f7ffe368e0110b562629"
+    },
+    {
+      "bytes": 264299,
+      "path": "paper/figures/cmame_loewner_eigenvalues.png",
+      "sha256": "fa4c80669c7ad63dc7fb91b2f990c54b985e77c0411b48594a1ab86668f8040a"
+    },
+    {
+      "bytes": 662,
+      "path": "paper/tables/cmame_bound_summary.tex",
+      "sha256": "568e9234f44ca3bf24cf7db97324fa4fd3a7e8c115c2a85c67ec37c84f6af776"
+    },
+    {
+      "bytes": 29541,
+      "path": "paper/figures/cmame_bound_reliability.pdf",
+      "sha256": "34f1cc92dc75da4c30122879e2e0249eba2c845a9a3700763288f0d5dc8681ae"
+    },
+    {
+      "bytes": 210628,
+      "path": "paper/figures/cmame_bound_reliability.png",
+      "sha256": "0a6be2bded5a6d66d449cac593744cc968b1bd601105f192ab437befdb88def8"
+    },
+    {
+      "bytes": 24141,
+      "path": "paper/figures/cmame_loewner_eigenvalues.pdf",
+      "sha256": "de4c60ff21932f52b4c5abe854a3ab7811df1440c660f7ffe368e0110b562629"
+    },
+    {
+      "bytes": 264299,
+      "path": "paper/figures/cmame_loewner_eigenvalues.png",
+      "sha256": "fa4c80669c7ad63dc7fb91b2f990c54b985e77c0411b48594a1ab86668f8040a"
+    },
+    {
+      "bytes": 662,
+      "path": "paper/tables/cmame_bound_summary.tex",
+      "sha256": "568e9234f44ca3bf24cf7db97324fa4fd3a7e8c115c2a85c67ec37c84f6af776"
+    },
+    {
+      "bytes": 21920,
+      "path": "paper/figures/cmame_conditional_inverse.pdf",
+      "sha256": "fba6a2ed03d21bb8aa3e055dc1400c285fe0bf801ded7537ae083b02cebdf802"
+    },
+    {
+      "bytes": 94314,
+      "path": "paper/figures/cmame_conditional_inverse.png",
+      "sha256": "4f980382c0ba6a189810666256d26429b84689f6f905e10bf2f283dc871d0007"
+    },
+    {
+      "bytes": 220,
+      "path": "paper/tables/cmame_conditional_inverse_summary.tex",
+      "sha256": "1044524b3bcb56b72128b8c17d97276c4aca8f5e14c8fa60b6b4c94dbc9847db"
+    },
+    {
+      "bytes": 13627,
+      "path": "paper/figures/cmame_adaptive_convergence.pdf",
+      "sha256": "8829a9fff28d1b8ee6435a9dee1235ca765f606bba4a774ad9c14b4c5536e6a8"
+    },
+    {
+      "bytes": 55157,
+      "path": "paper/figures/cmame_adaptive_convergence.png",
+      "sha256": "439cb4f7f3bb93891322365814be249bd0034932712648fbcdb2e6a8ea1618ff"
+    }
+  ],
+  "source_root": "/home/user/Documents/geometry_compiled/results/cmame_method"
+}

@@ -1,0 +1,1446 @@
+\documentclass[a4paper,fleqn,review]{cas-sc}
+
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{siunitx}
+
+\graphicspath{{figures/}}
+\setlength{\emergencystretch}{3em}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue,
+  pdftitle={Goal-Oriented Constitutive Transfer Operators for Parametric FFT Homogenization},
+  pdfauthor={Kevin Vidal, Victor Alulema, Victor Berrazueta, Patrick Vandewalle, Esteban Valencia},
+  pdfsubject={Goal-oriented model reduction for parametric computational homogenization},
+  pdfkeywords={computational homogenization, reduced basis, FFT homogenization, constitutive transfer operator, short-fiber composites, a posteriori error estimation}
+}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\G}{\mathcal{G}}
+\newcommand{\Tg}{\mathcal{T}_{\G}}
+\newcommand{\Hmap}{\mathcal{H}_{\G}}
+\newcommand{\XiD}{\mathcal{D}_{\xi}}
+\newcommand{\Ceff}{C^{\mathrm{eff}}}
+\newcommand{\Cr}{C^{\mathrm{eff}}_r}
+\newcommand{\Cfom}{C^{\mathrm{eff}}_{\mathrm{FOM}}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\diag}{\operatorname{diag}}
+
+\newtheorem{proposition}{Proposition}
+
+\begin{document}
+\renewcommand{\bibfont}{\normalsize}
+\let\WriteBookmarks\relax
+\def\floatpagepagefraction{0.8}
+\def\textpagefraction{0.1}
+
+\shorttitle{Constitutive transfer operators for FFT homogenization}
+\shortauthors{Vidal et al.}
+
+\title[mode=title]{\texorpdfstring{Goal-Oriented Constitutive Transfer Operators\\ for Parametric FFT Homogenization}{Goal-Oriented Constitutive Transfer Operators for Parametric FFT Homogenization}}
+
+\author[1]{Kevin Vidal}[orcid=0009-0006-8667-4525]
+\cormark[1]
+\ead{kevin.vidal@epn.edu.ec}
+\credit{Conceptualization, Methodology, Software, Formal analysis, Investigation, Data curation, Visualization, Writing -- original draft}
+
+\author[1,2]{Victor Alulema}[orcid=0000-0001-7351-5281]
+\credit{Conceptualization, Methodology, Validation, Formal analysis, Investigation, Writing -- review and editing}
+
+\author[1]{Victor Berrazueta}[orcid=0009-0005-8405-6208]
+\credit{Validation, Resources, Writing -- review and editing}
+
+\author[2]{Patrick Vandewalle}[orcid=0000-0002-7106-8024]
+\credit{Methodology, Supervision, Resources, Writing -- review and editing}
+
+\author[1]{Esteban Valencia}[orcid=0000-0002-6496-9908]
+\credit{Supervision, Project administration, Resources, Writing -- review and editing}
+
+\affiliation[1]{
+  organization={Escuela Polit\'ecnica Nacional, Department of Mechanical Engineering},
+  addressline={LUAS-EPN; ATA-EPN Research Group},
+  city={Quito},
+  postcode={170143},
+  country={Ecuador}}
+
+\affiliation[2]{
+  organization={EAVISE, PSI, Department of Electrical Engineering (ESAT), KU Leuven},
+  addressline={Jan Pieter de Nayerlaan 5},
+  city={Sint-Katelijne-Waver},
+  country={Belgium}}
+
+\cortext[1]{Corresponding author.}
+
+\begin{abstract}
+Repeated computational homogenization is formulated as a many-query
+constitutive transfer problem for a fixed microstructure \(\G\) and varying
+constituent vector \(\boldsymbol{\xi}\).  Its discrete
+full-order response is the Schur map
+\(\Cfom=D-B^TK^{-1}B\).  We compile the geometry-dependent affine blocks once
+and enrich a Ritz space only with the six physical macroscopic-strain
+responses at selected materials.  The resulting operator preserves the
+variational hierarchy and interpolates the effective tensor and its affine
+sensitivities at enrichment points.  A transverse--longitudinal factorization
+of an isotropic Fourier reference compiles all six-output residual pairings
+into \(BB\), \(BK\), and \(KK\) contractions.  Consequently, the matrix error
+bound is evaluated online by reduced dense algebra, with no voxel-count
+dependence at fixed rank.  For three-dimensional periodic short-fiber composites, a rank-168
+operator reaches a maximum relative tensor error of
+\(4.15\times10^{-5}\) over 128 independent materials.  On 16 high-precision
+points, the direct bound has median effectivity 8.94; adding the exact
+\(48\rightarrow168\) Schur drop to the bounded enriched tail gives zero
+upper-bound violations and median effectivity 1.10.  The compiled operator then performs material
+screening, sensitivity-guided conditional identification, and \(200\,000\)
+uncertainty-propagation queries without further full-order solves.
+\end{abstract}
+
+\begin{highlights}
+\item Homogenized stiffness is treated as a static constitutive transfer map.
+\item Six-load tangential Ritz enrichment targets \(D-B^TK^{-1}B\), not all voxel fields.
+\item A Ritz/Schur identity gives Loewner monotonicity and a residual error bound.
+\item At fixed rank, two Fourier kernels remove voxel-count dependence online.
+\item The reduced operator supports screening and rank-revealing conditional inversion.
+\end{highlights}
+
+\begin{keywords}
+Computational homogenization \sep FFT homogenization \sep reduced basis methods \sep constitutive transfer operator \sep short-fiber composites \sep a posteriori error estimation
+\end{keywords}
+
+\maketitle
+
+\section{Introduction}
+
+Short-fiber composites offer a large design space because constituent
+properties, fiber content, orientation, aspect ratio, and spatial organization
+can all be adjusted.  Their macroscopic behavior, however, cannot generally be
+read from the constituent data alone.  It must be obtained from a periodic
+microscopic boundary-value problem whose solution resolves the interaction
+between material contrast and the heterogeneous geometry.  Computational
+homogenization provides this connection and returns the effective stiffness
+needed by structural analysis and material design.
+
+The difficulty changes character when homogenization is embedded in a design
+workflow.  A single accurate cell solve is no longer the final task.  Material
+screening, inverse identification, optimization, and uncertainty propagation
+may require thousands or hundreds of thousands of evaluations for the same
+microstructure.  In three-dimensional elasticity, every candidate normally
+requires six independent macroscopic load cases on a voxel grid with hundreds
+of thousands or millions of unknowns.  Repeating that calculation while only
+the constituent coefficients change makes the microscopic solver the dominant
+computational bottleneck.
+
+FFT homogenization reduces the cost of each periodic solve, while POD,
+reduced-basis homogenization, and parametric model reduction compress families
+of microscopic states
+\cite{yvonnet2007r3m,fritzen2013hybrid,hernandez2014highperformance,
+kunc2019finite,kochmann2019sparsefft,pham2024rbhm}.
+Nevertheless, the engineering quantity ultimately queried is usually not the
+entire fluctuation field.  It is the \(6\times6\) effective constitutive tensor,
+and in identification problems also its derivatives with respect to the
+material parameters.  A state-oriented approximation can therefore spend
+offline information on field directions that have little influence on this
+small output.  Moreover, a useful many-query model needs an error indicator
+that can be evaluated without invoking the voxel fields or an FFT solve for
+every candidate.
+
+This paper asks whether the fixed microstructure can instead be compiled into
+a reusable constitutive transfer operator.  The proposed answer starts from
+the Schur-complement structure of linear computational homogenization.  The
+geometry-dependent operators are assembled once; subsequent enrichment uses
+only the six physical responses associated with the macroscopic strain space.
+The reduced model is then constructed to preserve the Ritz energy hierarchy,
+to interpolate constitutive sensitivities at selected materials, and to expose
+a residual identity directly associated with the effective stiffness.
+
+The central methodological step is an offline--online error estimator.  An
+isotropic reference inverse separates into transverse and longitudinal Fourier
+kernels, allowing all voxel-level residual contractions to be precomputed.
+Online evaluation consequently involves only reduced dense matrices.  This
+connects the physical six-load enrichment, the constitutive output, and the
+error-control mechanism in one transfer formulation rather than treating them
+as independent accelerations.
+
+The specific methodological contributions are:
+\begin{enumerate}[label=(\roman*)]
+\item a geometry-compiled, six-load Ritz transfer operator for the effective
+Schur map, with constitutive and sensitivity interpolation at enrichment
+points;
+\item a matrix-valued residual compiler based on precomputed \(BB\), \(BK\),
+and \(KK\) contractions and two isotropic Fourier kernels, making online error
+control independent of the voxel count at fixed rank;
+\item causal tensor- and sensitivity-oriented enrichment rules together with a
+truth-free relative certificate stopping criterion; and
+\item a reproducible assessment spanning high-precision energetic checks,
+equal-budget controls, voxel and morphology variation, and three many-query
+applications.
+\end{enumerate}
+
+Several properties used to analyze this construction are deliberately not
+claimed as new.  Galerkin best approximation, compliant-output quadratic error,
+coercivity-scaled residual bounds, and affine offline--online residual norms are
+standard RB results
+\cite{prudhomme2002reliable,quarteroni2011certified,boyaval2008homogenization}.
+POD/RB acceleration of constitutive homogenization across linear and nonlinear
+settings is likewise well established
+\cite{yvonnet2007r3m,fritzen2013hybrid,hernandez2014highperformance,
+kunc2019finite,michel2016variational,pham2024rbhm}.
+Reduced Schur systems, Schur-complement perturbation bounds, and their
+certification in static-condensation RB methods are also established
+\cite{huynh2013scrbe,eftang2013port,smetana2015certification}.
+Likewise, projection-based interpolation of parameter derivatives is established
+in parametric model reduction \cite{baur2011interpolatory}, and variational
+bounds for homogenized operators predate this work
+\cite{kerfriden2014cre,vondrejc2015bounds}.  We state these classical results
+only in their matrix-valued constitutive specialization and cite their proofs.
+The novelty claim is therefore deliberately narrow.  To the authors'
+knowledge, the closest antecedents do not compile all six-output residual
+pairings of the homogenized constitutive map through the
+transverse/longitudinal Fourier split into the dense \(BB\), \(BK\), and
+\(KK\) arrays to obtain a voxel-free online matrix bound integrated with
+physical tangential enrichment and constitutive sensitivity interpolation.
+
+Table~\ref{tab:literature} positions this combination against the closest
+antecedents.  POD, reduced bases, CRE certification, affine separation, and FFT
+reduction are not claimed as isolated novelties.
+
+The remainder of the paper follows the mathematical construction.
+Section~\ref{sec:homogenization}
+introduces periodic homogenization and its Schur-complement transfer
+representation.  Section~\ref{sec:transfer} constructs the goal-oriented
+reduced operator, Section~\ref{sec:estimator} derives its offline--online Schur
+estimator, and Section~\ref{sec:sensitivities} establishes the constitutive
+sensitivity interpolation property.  Section~\ref{sec:protocol} defines the
+FFT implementation and numerical protocol.  Results and their interpretation
+are presented together in Section~\ref{sec:results}, followed by the
+conclusions in Section~\ref{sec:conclusions}.
+
+\input{tables/literature_positioning.tex}
+
+\section{Periodic homogenization and constitutive transfer}
+\label{sec:homogenization}
+
+\subsection{Periodic cell problem and effective response}
+
+Let \(Y\) be a periodic representative cell with local stiffness
+\(\mathbb{C}(\boldsymbol{x};\boldsymbol{\xi},\G)\).  For a prescribed macroscopic strain
+\(\overline{\boldsymbol{\varepsilon}}(g)\), represented by the Mandel vector
+\(g\in\R^6\), the fluctuation \(u_g\) belongs to the periodic, zero-mean
+compatible space and satisfies
+\begin{equation}
+\label{eq:cell_problem}
+\int_Y
+\boldsymbol{\varepsilon}(v):
+\mathbb{C}(\boldsymbol{x};\boldsymbol{\xi},\G):
+\left[\overline{\boldsymbol{\varepsilon}}(g)+\boldsymbol{\varepsilon}(u_g)\right]
+\,\mathrm{d}\boldsymbol{x}=0
+\qquad \forall v\in\mathcal{V}_{\mathrm{per}},
+\end{equation}
+where
+\[
+\boldsymbol{\varepsilon}(u)=\tfrac{1}{2}
+\left(\nabla u+\nabla u^T\right),
+\qquad
+\langle u_g\rangle_Y=0.
+\]
+The effective constitutive tensor is defined by the volume-averaged stress,
+\begin{equation}
+\label{eq:effective_response}
+\Ceff(\boldsymbol{\xi};\G)g
+=
+\left\langle
+\mathbb{C}(\boldsymbol{x};\boldsymbol{\xi},\G):
+\left[\overline{\boldsymbol{\varepsilon}}(g)+\boldsymbol{\varepsilon}(u_g)\right]
+\right\rangle_Y .
+\end{equation}
+Equations~\eqref{eq:cell_problem}--\eqref{eq:effective_response} make the
+separation central to the paper explicit: \(\G\)
+fixes the phase and orientation fields, while \(\boldsymbol{\xi}\) changes the
+constituent law over repeated queries.
+
+\subsection{Discrete Schur-complement transfer representation}
+
+Let \(u\in\R^n\) denote the compatible, zero-mean fluctuation field and
+\(g\in\R^6\) a macroscopic Mandel strain vector.  After discretizing a linear
+periodic cell problem, the microscopic energy is
+\begin{equation}
+\label{eq:discrete_energy}
+\mathcal{E}(u,g;\boldsymbol{\xi})
+=
+\frac{1}{2}u^TK(\boldsymbol{\xi})u
+-u^TB(\boldsymbol{\xi})g
++\frac{1}{2}g^TD(\boldsymbol{\xi})g.
+\end{equation}
+Stationarity of Eq.~\eqref{eq:discrete_energy} with respect to the fluctuation,
+applied to the six independent macroscopic strains, gives the full-order
+response matrix \(X(\boldsymbol{\xi})\in\R^{n\times6}\):
+\begin{equation}
+\label{eq:fom_response}
+K(\boldsymbol{\xi})X(\boldsymbol{\xi})=B(\boldsymbol{\xi}),
+\end{equation}
+Eliminating this response from Eq.~\eqref{eq:discrete_energy} then
+produces the effective stiffness as the Schur complement
+\begin{equation}
+\label{eq:schur_transfer}
+\boxed{
+\Cfom(\boldsymbol{\xi})
+=D(\boldsymbol{\xi})
+-B(\boldsymbol{\xi})^T K(\boldsymbol{\xi})^{-1}B(\boldsymbol{\xi}).
+}
+\end{equation}
+Hereafter, \(\Cfom\) denotes this converged discrete FFT response, whereas
+\(\Ceff\) is reserved for the continuum quantity defined in
+Eq.~\eqref{eq:effective_response}.  The ROM bound controls
+\(\Cr-\Cfom\); voxel refinement is reported separately.
+The formulation is first abstract: \(K(\boldsymbol{\xi})\) is symmetric
+positive definite on the compatible fluctuation space and \(B\) contains the
+six macroscopic right-hand sides.  Section~\ref{sec:protocol} defines the
+short-fiber FFT realization of this structure.
+
+\subsection{Material parameters and geometry-affine separation}
+
+The physical material vector used throughout the study is
+\[
+\boldsymbol{\xi}
+=
+(E_m,\nu_m,E_L,E_T,G_{LT},\nu_{LT},\nu_{TT})\in\XiD.
+\]
+It contains the isotropic matrix Young modulus and Poisson ratio together with
+five engineering constants for the transversely isotropic fiber.  We retain
+this dimensional seven-parameter interface because it is the one used to
+generate and validate all numerical evidence in the paper.  Linear elasticity
+admits a reduction by the global elastic scale \(E_m\), as discussed in
+Appendix~\ref{app:scale}, but that optional quotient is not used in the
+reported campaigns.
+
+For the isotropic-matrix/transversely-isotropic-fiber case, the local elastic
+law is affine in seven coefficients
+\[
+\boldsymbol{\gamma}(\boldsymbol{\xi})
+=
+(\lambda_m,\mu_m,c_{TT},c_{TT}^{\times},c_{LT},c_{LL},g_{LT}),
+\]
+so that
+\begin{equation}
+\label{eq:affine_operators}
+\begin{aligned}
+K(\boldsymbol{\xi})
+&=\sum_{q=1}^{Q}\gamma_q(\boldsymbol{\xi})K_q(\G),\qquad
+B(\boldsymbol{\xi})
+=\sum_{q=1}^{Q}\gamma_q(\boldsymbol{\xi})B_q(\G),\\
+D(\boldsymbol{\xi})
+&=\sum_{q=1}^{Q}\gamma_q(\boldsymbol{\xi})D_q(\G),
+\qquad Q=7.
+\end{aligned}
+\end{equation}
+The microstructure \(\G\) contains phase, orientation, periodicity,
+discretization, fiber volume fraction, aspect ratio, and topology.  The
+operators \(K_q(\G)\), \(B_q(\G)\), and \(D_q(\G)\) are geometry-dependent and
+are assembled once.  The online material dependence is carried only by
+\(\gamma_q(\boldsymbol{\xi})\).  The separation in
+Eq.~\eqref{eq:affine_operators} is the mechanism that turns
+the Schur map in Eq.~\eqref{eq:schur_transfer} into an offline--online transfer
+problem.
+
+Table~\ref{tab:material_domain} specifies the physical parameter box used for
+all training, validation, and many-query campaigns.
+
+\input{tables/material_domain.tex}
+
+\section{Goal-oriented constitutive transfer reduction}
+\label{sec:transfer}
+
+The construction has one offline stage and one online stage.  Offline, the
+continuous microstructure is rasterized, its affine geometry operators are
+assembled, selected material points are solved under the six physical loads,
+and the reduced and residual-contraction tensors are compiled.  Online, a new
+physical material vector is converted into seven affine coefficients and only
+small dense systems are evaluated:
+\begin{equation}
+\label{eq:offline_online_flow}
+\underbrace{
+\G\longrightarrow\{K_q,B_q,D_q\}_{q=1}^{7}
+\longrightarrow V_r
+\longrightarrow\{BB,BK,KK\}
+}_{\text{offline compilation}}
+\qquad
+\underbrace{
+\boldsymbol{\xi}\longrightarrow\boldsymbol{\gamma}
+\longrightarrow
+\left(\Cr,\nabla_{\xi}\Cr,\eta_{\mathrm{cert}}\right)
+}_{\text{online query}}.
+\end{equation}
+Equation~\eqref{eq:offline_online_flow} also fixes the information boundary:
+voxel fields are used during compilation, whereas a deployed query uses only
+the saved reduced arrays.  Figure~\ref{fig:offline_online_architecture} makes
+this separation concrete using the dimensions of the final operator: 28
+six-load material responses produce a rank-168 space, while the online path
+receives only a seven-parameter vector and the compiled reduced arrays.
+
+\begin{figure*}
+\centering
+\includegraphics[width=0.98\textwidth]{cmame_offline_online_architecture.pdf}
+\caption{Data flow of the implemented constitutive-transfer method.  The upper
+band contains the voxel-dependent offline operations and the actual dimensions
+of the two-kernel contractions.  The lower band contains the online query,
+which assembles and solves only a \(168\times168\) dense system and returns the
+effective tensor, its material sensitivities, and the Schur bound.}
+\label{fig:offline_online_architecture}
+\end{figure*}
+
+The reported basis is stopped at the scientific target \(10^{-4}\).  During
+method validation this decision is checked on an untouched material set; once
+the estimator is compiled, Eq.~\eqref{eq:relative_certificate_conversion}
+provides the corresponding truth-free online stopping test.  Smaller errors
+are retained for solver and identity diagnostics but do not motivate further
+enrichment.
+
+\subsection{Ritz projection and six-load tangential enrichment}
+
+Let \(V_r\in\R^{n\times r}\) be a reduced Ritz basis built from selected
+full-order response matrices.  Projection gives
+\[
+K_r(\boldsymbol{\xi})=V_r^TK(\boldsymbol{\xi})V_r,\qquad
+B_r(\boldsymbol{\xi})=V_r^TB(\boldsymbol{\xi}),
+\]
+\[
+X_r(\boldsymbol{\xi})
+=V_rK_r(\boldsymbol{\xi})^{-1}B_r(\boldsymbol{\xi}),
+\]
+and substitution into the full Schur map~\eqref{eq:schur_transfer} gives the
+reduced transfer output
+\begin{equation}
+\label{eq:reduced_transfer}
+\boxed{
+\Cr(\boldsymbol{\xi})
+=D(\boldsymbol{\xi})
+-B_r(\boldsymbol{\xi})^TK_r(\boldsymbol{\xi})^{-1}B_r(\boldsymbol{\xi}).
+}
+\end{equation}
+Each enrichment material \(\boldsymbol{\xi}^{(j)}\) contributes the six
+physical response columns from Eq.~\eqref{eq:fom_response},
+\[
+X(\boldsymbol{\xi}^{(j)})
+=K(\boldsymbol{\xi}^{(j)})^{-1}B(\boldsymbol{\xi}^{(j)}),
+\]
+and the basis is updated as
+\begin{equation}
+\label{eq:tangential_enrichment}
+V_{r+6}
+=
+\operatorname{orth}
+\left[
+V_r,\,
+X(\boldsymbol{\xi}^{(j)})
+\right].
+\end{equation}
+Thus, one material point corresponds transparently to six full-order load
+solves and at most six new reduced directions.  We report the number of
+material points, load solves, and reduced dimension separately in
+Section~\ref{sec:results}.
+
+The adaptive material-space loop is output-oriented:
+\begin{equation}
+\label{eq:adaptive_selection}
+\boldsymbol{\xi}^{\star}
+=
+\arg\max_{\boldsymbol{\xi}\in\Xi_{\mathrm{cand}}}
+\eta_C(\boldsymbol{\xi}),
+\end{equation}
+where \(\eta_C\) is the tensor-oriented score assembled from the Schur
+estimator derived in Section~\ref{sec:estimator}.
+Only the maximizer \(\boldsymbol{\xi}^{\star}\) in
+Eq.~\eqref{eq:adaptive_selection} is sent to the full-order FFT solver for the
+next six-load tangential block through Eq.~\eqref{eq:tangential_enrichment}.
+
+\section{Offline--online Schur error estimation}
+\label{sec:estimator}
+
+\subsection{Residual energy and two-kernel factorization}
+
+Define the residual matrix
+\begin{equation}
+\label{eq:residual}
+R(\boldsymbol{\xi})
+=B(\boldsymbol{\xi})-K(\boldsymbol{\xi})X_r(\boldsymbol{\xi}).
+\end{equation}
+A field residual alone is not the target quantity of interest.  We instead
+map Eq.~\eqref{eq:residual} back to the six-output constitutive space through
+the positive-semidefinite matrix
+\[
+\mathcal{E}_M(\boldsymbol{\xi})
+=R(\boldsymbol{\xi})^TM(\boldsymbol{\xi})^{-1}R(\boldsymbol{\xi}),
+\]
+where \(M\) is an isotropic Fourier reference operator.  For every nonzero
+wave vector, its inverse separates exactly into transverse and longitudinal
+traction kernels.  This Green-operator decomposition is classical
+\cite{moulinec1998numerical,vondrejc2014fft}; the proposition below concerns
+the subsequent pairwise compilation, not the decomposition itself:
+\begin{equation}
+\label{eq:two_kernel_inverse}
+M^{-1}=\mu_0^{-1}P_T+(\lambda_0+2\mu_0)^{-1}P_L.
+\end{equation}
+Pairwise Gram precomputation for affine residual norms is also standard in
+offline--online RB methods
+\cite{prudhomme2002reliable,quarteroni2011certified}.  The construction below
+specializes that principle simultaneously to the six constitutive columns and
+to the two physical Fourier kernels.
+Using the decomposition~\eqref{eq:two_kernel_inverse}, and writing
+\(X_r=V_rY_r\) and
+\(R=\sum_p\gamma_p(B_p-K_pV_rY_r)\), we precompute, for
+\(\alpha\in\{T,L\}\),
+\begin{equation}
+\label{eq:compiled_contractions}
+BB^\alpha_{pq}=B_p^TP_\alpha B_q,\quad
+BK^\alpha_{pq}=B_p^TP_\alpha K_qV_r,\quad
+KK^\alpha_{pq}=V_r^TK_p^TP_\alpha K_qV_r.
+\end{equation}
+The online kernel matrix is then assembled as
+\begin{align}
+E_\alpha={}&\sum_{p,q}\gamma_p\gamma_q
+\bigl(BB^\alpha_{pq}-BK^\alpha_{pq}Y_r
+-Y_r^T(BK^\alpha_{qp})^T
++Y_r^TKK^\alpha_{pq}Y_r\bigr),
+\label{eq:kernel_contraction}\\
+R^TM^{-1}R={}&\mu_0^{-1}E_T
++(\lambda_0+2\mu_0)^{-1}E_L.
+\label{eq:kernel_recombination}
+\end{align}
+\begin{proposition}[Exact six-output two-kernel compilation]
+\label{prop:two_kernel_compilation}
+Under the affine residual decomposition above and an isotropic reference
+operator, Eqs.~\eqref{eq:compiled_contractions}--\eqref{eq:kernel_recombination}
+recover \(R^TM^{-1}R\) exactly, up to floating-point arithmetic.  After the
+reduced solve, their evaluation costs
+\(O(Q^2r^2+Q^2r n_g)\) operations with \(n_g=6\), stores
+\(O(Q^2r^2)\) numbers, and has no explicit voxel-count dependence for fixed
+\(r\).
+\end{proposition}
+
+Including affine reduced assembly and a dense factorization, one transfer
+query costs \(O(Qr^2+r^3+Q^2r^2)\) for fixed \(n_g=6\).  A hierarchical query
+repeats this work for its two ranks; neither expression depends on
+\(N_{\mathrm{vox}}\) once those ranks have been compiled.
+
+Appendix~\ref{app:offlineonline} proves
+Proposition~\ref{prop:two_kernel_compilation}.  The compiled contractions are
+stored as \texttt{online\_estimator.npz} beside the reduced operators;
+direct-Fourier and dense evaluations are compared automatically during
+compilation.
+
+\subsection{Ritz/Schur identity and Loewner hierarchy}
+
+The following statement is the standard Galerkin energy identity for a
+compliant output, written columnwise for the matrix-valued constitutive Schur
+map \cite{prudhomme2002reliable,quarteroni2011certified}.  Its use in
+homogenization and the associated energetic bounds are also classical
+\cite{boyaval2008homogenization,kerfriden2014cre}; reduced Schur complements
+and their error control also appear in static-condensation RB methods
+\cite{huynh2013scrbe,eftang2013port,smetana2015certification}.  We record the specialization
+because it exposes the six-output residual matrix used by the proposed
+compiler; the identity itself is not a novelty claim.
+
+For \(K(\boldsymbol{\xi})\) symmetric positive definite on the compatible
+fluctuation space and \(X_r\) the Ritz projection of
+\(X=K^{-1}B\) onto \(V_r\), the cited classical identity gives
+\begin{equation}
+\label{eq:ritz_schur_identity}
+\Delta C_r(\boldsymbol{\xi})
+:=\Cr(\boldsymbol{\xi})-\Cfom(\boldsymbol{\xi})
+=
+(X-X_r)^TK(X-X_r)
+=
+R^TK^{-1}R
+\succeq0.
+\end{equation}
+For nested spaces \(V_r\subset V_s\), the same classical variational
+restriction gives
+\begin{equation}
+\label{eq:loewner_hierarchy}
+\Cr(\boldsymbol{\xi})
+\succeq
+C_s^{\mathrm{eff}}(\boldsymbol{\xi})
+\succeq
+\Cfom(\boldsymbol{\xi}),
+\end{equation}
+a Loewner-monotone constitutive hierarchy.  This is stronger than scalar error
+decay: the reduced stiffnesses approach the full-order stiffness from the
+energy-upper side.
+
+\subsection{Beta-scaled bound and online reference selection}
+
+If the reference operator satisfies
+\begin{equation}
+K(\boldsymbol{\xi})\succeq
+\beta(\boldsymbol{\xi})M(\boldsymbol{\xi}),\qquad
+\beta(\boldsymbol{\xi})>0,
+\end{equation}
+then
+\begin{equation}
+\label{eq:matrix_bound}
+0\preceq
+\Delta C_r(\boldsymbol{\xi})
+\preceq
+U_r(\boldsymbol{\xi})
+:=
+\beta(\boldsymbol{\xi})^{-1}
+R(\boldsymbol{\xi})^TM(\boldsymbol{\xi})^{-1}R(\boldsymbol{\xi}),
+\end{equation}
+and
+\begin{equation}
+\label{eq:frobenius_bound}
+\|\Cr(\boldsymbol{\xi})-\Cfom(\boldsymbol{\xi})\|_F
+\le
+\eta_{\mathrm{cert}}(\boldsymbol{\xi})
+:=
+\|U_r(\boldsymbol{\xi})\|_F.
+\end{equation}
+The matrix inequality~\eqref{eq:matrix_bound} is the operator form of the
+standard coercivity-scaled RB residual bound
+\cite{prudhomme2002reliable,quarteroni2011certified};
+Eq.~\eqref{eq:frobenius_bound} is its scalar reporting form.  The contribution
+here is not the coercivity argument, but its simultaneous evaluation for all
+six constitutive outputs by the compiled two-kernel contractions.
+For validation only, its scalar effectivity index is
+\begin{equation}
+\label{eq:effectivity}
+\mathcal{I}_{\mathrm{eff}}
+=\frac{\eta_{\mathrm{cert}}}
+{\|\Cr-\Cfom\|_F},
+\end{equation}
+which is at least one for a valid upper bound.  It measures sharpness but is
+not used by the online stopping rule.
+
+The direct bound can be sharpened without changing its reference operator.
+For two nested Ritz spaces \(V_r\subset V_s\), define the exactly computable
+reduced Schur drop \(D_{r,s}=C_r^{\mathrm{eff}}-C_s^{\mathrm{eff}}\).  If
+\(U_s\) is any valid matrix upper bound for the enriched tail
+\(C_s^{\mathrm{eff}}-\Cfom\), then the hierarchy in
+Eq.~\eqref{eq:loewner_hierarchy} gives
+\begin{equation}
+\label{eq:hierarchical_bound}
+0\preceq D_{r,s}
+\preceq \Delta C_r
+=D_{r,s}+\Delta C_s
+\preceq D_{r,s}+U_s
+=:U_{r\leftarrow s}^{\mathrm{hier}}.
+\end{equation}
+Hierarchical reduced estimators based on two nested approximations are
+established in model reduction \cite{hain2019hierarchical}.  Here no saturation
+assumption is needed because the remaining enriched error is not discarded: it
+is bounded by the same coercivity-scaled two-kernel construction.  Evaluation
+requires two small reduced solves and the compiled estimator at level \(s\),
+but still contains no voxel field or online FFT.
+
+For a stopping criterion that remains meaningful when the observed error is
+very small, define the computable relative certificate width
+\begin{equation}
+\delta_r(\boldsymbol{\xi})
+=\frac{\|U_r(\boldsymbol{\xi})\|_F}{\|\Cr(\boldsymbol{\xi})\|_F}.
+\end{equation}
+Here \(U_r\) may be the direct matrix bound in
+Eq.~\eqref{eq:matrix_bound} or the hierarchical bound in
+Eq.~\eqref{eq:hierarchical_bound}.
+Because \(\|\Cfom\|_F\ge
+(1-\delta_r)\|\Cr\|_F\), every \(\delta_r<1\) gives
+\begin{equation}
+\label{eq:relative_certificate_conversion}
+\frac{\|\Cr-\Cfom\|_F}{\|\Cfom\|_F}
+\le \frac{\delta_r}{1-\delta_r}.
+\end{equation}
+Thus the discrete-ROM target \(10^{-4}\) is guaranteed whenever
+\(\delta_r\le10^{-4}/(1+10^{-4})\).  This rule uses no full-order validation
+error and is therefore also the causal stopping rule for auxiliary enrichment.
+Effectivity remains a sharpness diagnostic, but it is not used as a stopping
+quantity when its true-error denominator lies far below the adopted accuracy
+floor.
+
+For each material, 129 reproducible isotropic reference shapes are tested and
+the valid reference minimizing the Frobenius bound is selected.  The coercivity
+factor is the minimum generalized eigenvalue over the matrix and fiber local
+stiffnesses, with a conservative numerical margin; its derivation is given in
+Appendix~\ref{app:beta}.  The high-precision study in
+Section~\ref{sec:results_bound} compares the direct \(r=48\) bound with the
+hierarchical \(48\rightarrow168\) bound.  SCM coercivity surrogates
+\cite{huynh2007scm} and anisotropic reference operators are viable ways to
+tighten the residual tail, but the ablation shows that they are unnecessary to
+meet the target effectivity here.  The bound controls reduction error with
+respect to the discrete FFT problem, not voxel discretization or the continuum
+limit.
+
+\section{Constitutive sensitivities and tangential Hermite interpolation}
+\label{sec:sensitivities}
+
+Differentiating the reduced Schur map~\eqref{eq:reduced_transfer} gives the
+affine coefficient sensitivities
+\begin{equation}
+\label{eq:constitutive_sensitivity}
+\boxed{
+\frac{\partial \Cr}{\partial \gamma_q}
+=
+D_q
+-B_q^TX_r
+-X_r^TB_q
++X_r^TK_qX_r .
+}
+\end{equation}
+Physical derivatives with respect to
+\((E_m,\nu_m,E_L,E_T,G_{LT},\nu_{LT},\nu_{TT})\) follow by the chain rule
+through \(\boldsymbol{\gamma}(\boldsymbol{\xi})\); the coefficient map is
+listed explicitly in Appendix~\ref{app:affine}.  Sensitivities of homogenized
+elastic properties and reduced constitutive surrogates with parameter
+derivatives are established topics
+\cite{kaminski2003sensitivity,guo2021constitutive,lukes2026sensitivity}; neither sensitivity
+analysis nor its use in inverse problems is claimed here in isolation.
+
+Parameter-response and parameter-derivative matching under projection-space
+containment are established results in interpolatory parametric model
+reduction \cite{baur2011interpolatory}.  Applied to the static symmetric map
+\(D-B^TK^{-1}B\), the cited result states that if a material point
+\(\boldsymbol{\xi}^{(j)}\) has been used for tangential enrichment and the six
+full-order response columns \(X(\boldsymbol{\xi}^{(j)})\) are contained in
+\(V_r\), then
+
+\begin{equation}
+\label{eq:hermite_tensor}
+\Cr(\boldsymbol{\xi}^{(j)})
+=\Cfom(\boldsymbol{\xi}^{(j)}).
+\end{equation}
+Moreover, for every affine coefficient \(\gamma_q\),
+\begin{equation}
+\label{eq:hermite_sensitivity}
+\left.
+\frac{\partial \Cr}{\partial\gamma_q}
+\right|_{\boldsymbol{\xi}^{(j)}}
+=
+\left.
+\frac{\partial \Cfom}{\partial\gamma_q}
+\right|_{\boldsymbol{\xi}^{(j)}}.
+\end{equation}
+No derivative snapshots are required because the projection-space containment
+condition is already satisfied by the six physical response columns.
+
+Equations~\eqref{eq:hermite_tensor}--\eqref{eq:hermite_sensitivity} explain why
+the six-load snapshots are more than training
+vectors: they impose a local constitutive Hermite interpolation condition on
+the Schur-complement transfer map.  Sensitivity-aware enrichment can therefore
+be treated as a separate mode for inverse identification and optimization,
+where the target quantity is \((\Cfom,\nabla_{\xi}\Cfom)\), not only \(\Cfom\).
+
+For the causal comparison, let \([a_j,b_j]\) be the interval of parameter
+\(\xi_j\) and let \(\eta_C=\|U_r\|_F/\|\Cr\|_F\) denote the relative tensor
+score.  The sensitivity score and the mixed selection score are defined by
+\begin{equation}
+\label{eq:sensitivity_selection_score}
+\eta_{\nabla C}(\boldsymbol{\xi})
+=\max_j (b_j-a_j)
+\left\|\frac{\partial}{\partial\xi_j}
+\left(\frac{R^TM^{-1}R}{\|\Cr\|_F}\right)\right\|_F,
+\qquad
+\eta_{\mathrm{mix}}
+=\sqrt{\eta_C^2+\eta_{\nabla C}^2}.
+\end{equation}
+The optimized reference is used at each evaluation, and the derivative in
+Eq.~\eqref{eq:sensitivity_selection_score} is approximated by centered
+differences with relative step \(10^{-3}\), using only repeated dense
+evaluations of the compiled estimator.  The factor \(b_j-a_j\) removes the
+units of each physical coordinate.  Thus this rule targets rapid variation of
+the residual-energy matrix without candidate FOM sensitivities, voxel fields,
+or online FFTs.
+In the comparison below, standard energy greedy maximizes
+\(\|R^TM^{-1}R\|_F/\|\Cr\|_F\), QoI/Schur greedy maximizes \(\eta_C\), and the
+sensitivity-aware rule maximizes \(\eta_{\mathrm{mix}}\).
+
+\section{FFT implementation and numerical protocol}
+\label{sec:protocol}
+
+The full-order baseline is an FFTHomPy/CuPy periodic Fourier--Galerkin solve
+with six independent 3D macroscopic load cases.  Three principal,
+noninterchangeable profiles are used in the paper: truth computations use
+\texttt{float64} and relative tolerance \(10^{-10}\), the strict snapshot
+audit uses \texttt{float64} and \(10^{-8}\), and the economical production
+basis pass uses the timing profile with \texttt{float32} and \(10^{-5}\).  An
+additional \texttt{rom\_floor} profile (\texttt{float32}, \(10^{-4}\)) is
+reserved for rapid feasibility pilots and is not used for the final truth
+comparison.  The economical profiles are used only to construct the offline
+basis; their error is checked against independent truth solves and the strict
+snapshot profile remains available through
+\texttt{--basis-profile snapshot}.  Every solve must declare convergence and
+records the relative residual of each load, iteration count, symmetry defect,
+and minimum effective-tensor eigenvalue.  Failed, incomplete, non-SPD, or
+nonconverged solves abort the campaign.
+
+The implementation was checked on a homogeneous cell and an analytical 3D
+two-phase laminate, including Mandel energy equivalence, compatibility,
+projected equilibrium, periodicity, and Hill--Mandel consistency.  The
+homogeneous-cell relative error is \(4.63\times10^{-16}\).  All 16 independent
+truth solves used for the bound converged, with maximum relative residual
+\(9.96\times10^{-11}\) and at most 198 CG iterations.  A separate refinement
+uses the same continuous 96-fiber geometry at \(48^3,64^3,91^3,128^3\), and a
+geometry campaign varies the microstructure while keeping the box and
+\(91^3\) grid fixed.  Table~\ref{tab:geometry} summarizes the
+baseline discretization, while Figure~\ref{fig:geometry} connects the continuous
+periodic fibers to their voxelization and realized orientation statistics.
+
+\input{tables/geometry_summary.tex}
+
+\begin{figure*}
+\centering
+\includegraphics[width=0.98\textwidth]{cmame_fixed_rve_morphology.pdf}
+\caption{Traceable morphology of the fixed SAM short-fiber RVE.  (a) The 96
+continuous centerlines are wrapped through the periodic cell and colored by
+\(\lvert u_3\rvert\).  (b) Three orthogonal sections show the \(91^3\)
+rasterization used by the FFT solver.  (c) The realized axial orientation
+distribution and second-order orientation tensor are compared with the
+isotropic targets.  The same accepted geometry is reused for every material
+query in the fixed-geometry study.}
+\label{fig:geometry}
+\end{figure*}
+
+The validation metric is the relative Frobenius tensor error
+\begin{equation}
+\label{eq:relative_tensor_error}
+e_{\mathrm{rel}}
+=
+\frac{\|\Cr(\boldsymbol{\xi})-\Cfom(\boldsymbol{\xi})\|_F}
+{\|\Cfom(\boldsymbol{\xi})\|_F}.
+\end{equation}
+The present study uses \(10^{-4}\) in Eq.~\eqref{eq:relative_tensor_error} as
+the scientific reporting floor.  Values near \(10^{-7}\) or \(10^{-8}\) are
+retained as algebraic and solver diagnostics, but they do not trigger
+additional enrichment once the scientific target has been reached.  Campaign
+manifests and manuscript build commands are documented in
+Appendix~\ref{app:repro}.
+
+The equal-budget comparator is causal by construction.  A 4096-point Sobol
+candidate pool, 256 untouched validation materials, ten random schedules, and
+budgets of \(1,2,4,6,8,10,15,20\) materials are frozen before evaluation.
+Sobol+POD, random, standard energy greedy, QoI/Schur greedy, and a
+sensitivity-aware Schur rule each pay six full-order loads per selected
+material.  Candidate full-order errors are never available to a selection
+rule.  Mean, 95th-percentile, and maximum errors are evaluated on the same 256
+truth tensors and supplemented by paired bootstrap intervals.  As a
+nonintrusive control, an RBF predicts the 21 independent entries of the matrix
+logarithm of \(\Cfom\) in normalized seven-parameter coordinates.
+Gaussian, inverse-multiquadric, and inverse-quadratic kernels, five shape
+scales, and four smoothing levels are selected by leave-one-out error using
+only the available training tensors.  Exponentiation guarantees an SPD
+prediction; this is the classical log-Euclidean construction
+\cite{arsigny2007geometric}, not a claimed contribution.
+
+\section{Results and discussion}
+\label{sec:results}
+
+The numerical evidence follows the methodological construction.  We first
+establish transfer accuracy and the reliability of the Schur bound, then
+compare causal enrichment rules and assess constitutive sensitivities.
+Discretization and geometry checks delimit the claim before the compiled
+operator is used in three many-query applications.  Results and their
+interpretation are reported together in each subsection.
+
+\subsection{ROM convergence}
+
+Figure~\ref{fig:rom_convergence} shows the independent 32-point validation
+curve.  The \(r=66\) transfer operator reaches maximum relative tensor error
+\(3.65\times10^{-4}\).  Increasing the nested basis reduces the sampled error,
+and \(r=168\) reaches \(5.20\times10^{-6}\) on the same 32-point set.  A larger
+128-point validation gives mean \(3.87\times10^{-6}\), 95th percentile
+\(1.48\times10^{-5}\), and maximum \(4.15\times10^{-5}\).  This larger set is
+reported as the more conservative robustness assessment in
+Table~\ref{tab:validation}.  Because its maximum remains below the
+\(10^{-4}\) criterion in Eq.~\eqref{eq:relative_tensor_error}, it does not
+alter the stopping decision.
+
+\begin{figure}
+\centering
+\includegraphics[width=0.63\linewidth]{rom_convergence_32.pdf}
+\caption{Convergence of the fixed-geometry tangential Ritz operator on the
+32-point independent validation set.  The dashed line marks the adopted
+\(10^{-4}\) scientific reporting floor.}
+\label{fig:rom_convergence}
+\end{figure}
+
+\input{tables/validation_summary.tex}
+
+\subsection{Offline--online bound and Loewner hierarchy}
+\label{sec:results_bound}
+
+The dense two-kernel estimator and the direct Fourier implementation agree in
+\texttt{float64}.  Their maximum relative discrepancy is
+\(9.12\times10^{-12}\) at \(r=48\); at \(r=168\) it is
+\(2.17\times10^{-9}\) because the reference energy is much smaller, while the
+absolute discrepancy remains \(9.39\times10^{-14}\).  Both satisfy the
+\(10^{-8}\) algebraic diagnostic tolerance.
+For 16 independent high-precision materials, all error matrices
+\(C_{48}^{\mathrm{eff}}-\Cfom\) are positive definite; their minimum eigenvalue over
+the campaign is \(3.17\times10^{-4}\), confirming the hierarchy in
+Eq.~\eqref{eq:loewner_hierarchy}.  The optimized 129-reference bound has
+zero strict Loewner violations and minimum eigenvalue
+\(2.53\times10^{-3}\) for the direct gap
+\(U_{48}-(C_{48}^{\mathrm{eff}}-\Cfom)\).  Its scalar effectivity from
+Eq.~\eqref{eq:effectivity}
+ranges from 2.86 to 25.51, with median 8.94; optimizing convex combinations of
+the 129 valid references selects one active reference and does not improve that
+median.
+
+Equation~\eqref{eq:hierarchical_bound} changes the task from bounding the full
+\(r=48\) error to bounding only the enriched \(r=168\) tail.  That tail is a
+median 0.855\% of the \(r=48\) error norm.  Adding its valid two-kernel upper
+bound to the exact
+\(C_{48}^{\mathrm{eff}}-C_{168}^{\mathrm{eff}}\) drop gives zero strict violations, a
+minimum Loewner gap \(3.45\times10^{-5}\), and effectivity between 1.012 and
+1.411, with median 1.098 and 95th percentile 1.388.  Thus the median
+below five is met without SCM or an anisotropic reference.  With one BLAS
+thread, median tail-estimator time over the 16 strict rows is 1.90 ms.  A
+separate 4096-material benchmark of the complete two-ROM bounded query takes
+6.64 s in total, with median 1.53 ms and 95th percentile 1.95 ms.
+This sharp bridge controls the \(r=48\) output while using \(r=168\) as an
+auxiliary tail space.  A separate, predeclared test of the deployed \(r=168\)
+operator added 20 materials selected only by the computable certificate width,
+producing an \(r=288\) auxiliary space.  On 16 \texttt{float64},
+\(\mathrm{rtol}=10^{-12}\) truths, its upper gap has zero strict violations.
+Over 4096 candidates, 3988 implied relative bounds satisfy \(10^{-4}\), with
+median, 95th-percentile, and maximum values
+\(1.87\times10^{-5}\), \(7.36\times10^{-5}\), and
+\(4.09\times10^{-4}\).  The auxiliary level does not sharpen the final-level
+effectivity, whose median is 13.38, and tightening the truth solve does not
+remove lower-hierarchy sign changes at the \(10^{-5}\) error scale.  We
+therefore retain \(r=168\), already below the independent validation target,
+as the deployed operator and do not use ``Certified'' in the title.
+Figure~\ref{fig:bound_reliability} shows the direct ablation and hierarchical
+result together.  Figure~\ref{fig:loewner_hierarchy} resolves the six Loewner
+eigenvalues through the \(48\rightarrow168\) bridge for the most difficult
+material, while Table~\ref{tab:bound_cmame} summarizes the campaign.
+
+\begin{figure*}
+\centering
+\includegraphics[width=0.98\textwidth]{cmame_bound_reliability.pdf}
+\caption{Campaign-level audit of the Schur bound.  (a) Every hierarchical
+upper bound lies above the exact-limit diagonal.  (b) The direct residual
+bound has median effectivity 8.94, whereas the exact reduced drop plus bounded
+enriched tail lowers it to 1.10, below the target value 5.  (c) Positive
+minimum eigenvalues verify both \(\Cr-\Cfom\succeq0\) and
+\(U_{r\leftarrow s}^{\mathrm{hier}}-(\Cr-\Cfom)\succeq0\) for all
+16 high-precision materials.}
+\label{fig:bound_reliability}
+\end{figure*}
+
+\begin{figure}
+\centering
+\includegraphics[width=0.94\linewidth]{cmame_loewner_eigenvalues.pdf}
+\caption{Six eigenvalues of \(\Cr-\Cfom\) and of differences
+between consecutive nested levels for the most difficult high-precision
+material.  Positivity visualizes the Ritz/Schur Loewner hierarchy.}
+\label{fig:loewner_hierarchy}
+\end{figure}
+
+\begin{table}
+\centering
+\small
+\caption{High-precision direct and hierarchical bound study.}
+\label{tab:bound_cmame}
+\input{tables/cmame_bound_summary.tex}
+\end{table}
+
+\subsection{Adaptive Sobol+POD convergence}
+
+Instead of prescribing a fixed material budget, we build the goal-oriented 
+constitutive transfer operator by iteratively adding full-rank Sobol snapshots 
+until the relative tensor error falls below a target tolerance. This adaptive 
+procedure naturally sizes the reduced basis to the complexity of the geometry 
+without requiring candidate surrogate evaluations.
+
+Figure~\ref{fig:adaptive_convergence} shows the maximum relative Frobenius error 
+evaluated on the 256 high-precision truth tensors as materials are added to the 
+POD basis. The operator reaches the \(2\times10^{-5}\) target tolerance after 
+38 Sobol materials, producing a reduced basis of rank 228. Because the offline 
+snapshots are solved sequentially on the GPU, the procedure does not saturate 
+device memory. Crucially, the online dimension does not impact the constant 
+online evaluation cost due to the exact algebraic factorization.
+
+\begin{figure}
+\centering
+\includegraphics[width=0.6\linewidth]{cmame_adaptive_convergence.pdf}
+\caption{Adaptive full-rank Sobol+POD convergence on 256 untouched truth tensors. 
+The horizontal dashed line marks the \(2\times10^{-5}\) target tolerance.}
+\label{fig:adaptive_convergence}
+\end{figure}
+
+\subsection{Sensitivity checks}
+
+The analytic sensitivities in Eq.~\eqref{eq:constitutive_sensitivity} match
+internal finite differences of the ROM at near machine precision.  Against
+full-order finite differences, the \(r=66\)
+center-material check has mean relative sensitivity error \(4.35\times10^{-4}\)
+and maximum \(1.65\times10^{-3}\).  The same \(r=66\) operator is less accurate
+for a derivative-problematic validation material, with mean \(9.76\times10^{-3}\)
+and maximum \(2.91\times10^{-2}\), even though its tensor error is only
+\(3.65\times10^{-4}\).  Adding that material as one tangential block gives
+\(r=72\) and reduces the sensitivity errors to mean \(2.27\times10^{-4}\) and
+maximum \(4.57\times10^{-4}\).  Figure~\ref{fig:sensitivity} shows this
+targeted reduction, and Table~\ref{tab:sensitivity} reports the corresponding
+tensor and derivative errors.
+
+\begin{figure}
+\centering
+\includegraphics[width=0.64\linewidth]{sensitivity_enrichment.pdf}
+\caption{Full-order finite-difference sensitivity checks before and after
+targeted tangential enrichment.}
+\label{fig:sensitivity}
+\end{figure}
+
+\input{tables/sensitivity_summary.tex}
+
+\subsection{Discretization and geometry scope}
+
+\subsubsection{Voxel refinement on one continuous geometry}
+
+All 96 fibers of the baseline continuous geometry were rasterized without
+regeneration at \(48^3,64^3,91^3,128^3\).  Relative to the finest tensor, the
+discretization errors are \(4.58\times10^{-2}\), \(3.19\times10^{-2}\), and
+\(1.25\times10^{-2}\), respectively, as detailed in
+Figure~\ref{fig:voxel} and Table~\ref{tab:voxel}.  This separates voxel error from
+material-space ROM error: the \(10^{-4}\) ROM threshold controls the transfer
+operator on a fixed discretization and does not imply a \(10^{-4}\) continuum
+homogenization error.
+
+\begin{figure}
+\centering
+\includegraphics[width=0.88\linewidth]{cmame_voxel_scaling.pdf}
+\caption{Discretization error and high-precision solve cost for the same
+continuous 96-fiber geometry rasterized at four grids.}
+\label{fig:voxel}
+\end{figure}
+
+\begin{table}
+\centering
+\small
+\caption{Voxel-refinement truth solves on one continuous geometry.}
+\label{tab:voxel}
+\resizebox{\linewidth}{!}{\input{tables/cmame_voxel_scaling.tex}}
+\end{table}
+
+An independent spherical-inclusion benchmark uses isotropic phases at 10\%
+volume fraction and grids \(32^3,48^3,64^3,91^3\).  The relative tensor error
+against \(91^3\) falls from \(2.96\times10^{-3}\) to
+\(1.18\times10^{-4}\) at \(64^3\); the refinement curve and bound margins are
+reported in Figure~\ref{fig:inclusion} and Table~\ref{tab:inclusion}.
+Every tensor satisfies the full Mandel
+Voigt/Reuss Loewner bounds with positive margins, and the hydrostatic response
+lies inside the Hashin--Shtrikman bulk interval.  The periodic sphere array has
+cubic, not isotropic, effective symmetry; consequently an isotropic scalar
+Hashin--Shtrikman shear interval is reported only as a diagnostic and is not
+used as an acceptance criterion.
+
+\begin{figure}
+\centering
+\includegraphics[width=0.88\linewidth]{cmame_inclusion_benchmark.pdf}
+\caption{Spherical-inclusion refinement and Hashin--Shtrikman bulk interval.}
+\label{fig:inclusion}
+\end{figure}
+
+\begin{table}
+\centering
+\small
+\caption{Inclusion refinement and matrix-valued Voigt/Reuss margins.}
+\label{tab:inclusion}
+\resizebox{\linewidth}{!}{\input{tables/cmame_inclusion_benchmark.tex}}
+\end{table}
+
+\subsubsection{Ten distinct microstructures}
+
+A reproducible maximin design spans
+\(V_f\in[0.10,0.30]\), \(AR\in[8,25]\), diagonal orientation tensors, and
+clustering fraction in \([0,0.70]\).  Periodic Gaussian-mixture center
+proposals were added to SAM for the clustered cases.  All ten RVEs satisfy the
+volume, orientation, and overlap gates.  They also remain separated in the
+realized descriptor space formed from interface density, a Ripley statistic,
+discrepancy, fiber count, and \(A_2\); the minimum normalized realized distance
+is 0.758.  Figure~\ref{fig:geometries} compares target and realized
+descriptors, Figure~\ref{fig:geometry_slices} displays the accepted RVEs, and
+Table~\ref{tab:geometries} records their acceptance margins.  This campaign
+validates geometry generation and prevents one unusually reducible RVE from
+being presented as universal evidence.  Each accepted geometry defines a
+separate compiled operator; no transfer of one reduced basis between RVEs is
+assumed.
+
+\begin{figure*}
+\centering
+\includegraphics[width=0.92\textwidth]{cmame_geometry_descriptors.pdf}
+\caption{Target versus realized volume fraction, aspect ratio, orientation
+tensor components, and clustering response for ten accepted microstructures.}
+\label{fig:geometries}
+\end{figure*}
+
+\begin{figure*}
+\centering
+\includegraphics[width=0.92\textwidth]{cmame_geometry_slices.pdf}
+\caption{Central slices of the ten accepted \(91^3\) periodic RVEs.}
+\label{fig:geometry_slices}
+\end{figure*}
+
+\begin{table}
+\centering
+\small
+\caption{Acceptance and separation of the ten-geometry campaign.}
+\label{tab:geometries}
+\input{tables/cmame_geometry_summary.tex}
+\end{table}
+
+\subsection{Many-query applications}
+\label{sec:applications}
+
+The preceding subsections establish approximation, error control,
+selection behavior, sensitivity accuracy, and the discretization scope.  The screening,
+identification, and uncertainty-propagation applications test the other part of
+the research question: whether the compiled operator can replace new voxel
+solves once deployed inside a many-query workflow.  They use the final
+fixed-geometry operator and add no full-order information online.
+
+\subsubsection{ROM-only material screening}
+
+The \(r=168\) operator was used for ROM-only screening over 4096 Sobol
+candidates.  No full-order FFTHomPy solves were run during screening.  All
+4096 candidates were eligible under the prescribed constraints, and 64 were
+identified on the Pareto front.  The selected candidate maximizes the balanced
+gain over the effective Young and shear moduli relative to the center material
+while keeping the reduced response stable.  Median reduced query time is
+0.138 ms with one BLAS thread.  Figure~\ref{fig:screening} shows the screening
+cloud and Pareto set; Table~\ref{tab:screening_best} gives the selected
+material and its effective response.
+
+\begin{figure}
+\centering
+\includegraphics[width=0.66\linewidth]{screening_pareto.pdf}
+\caption{ROM-only material screening.  Gray points are eligible candidates,
+colored points are the Pareto front, and the star is the selected best
+balanced-gain candidate.}
+\label{fig:screening}
+\end{figure}
+
+\input{tables/screening_best.tex}
+
+\subsubsection{Inverse identification}
+
+The ROM sensitivities are first used as a rank-revealing diagnostic, following
+standard sensitivity-based practical-identifiability analysis
+\cite{brun2001practical}, rather than assuming that all seven material constants
+can be inferred from one homogenized tensor.  For validation material 94, the
+normalized \(21\times7\) Jacobian is algebraically full rank but has condition number
+\(4.58\times10^4\); its two weakest right-singular directions are dominated by
+the fiber Poisson ratios.  Consequently, the seven-unknown problem is not used
+as the application claim.  Its complete noise and regularization stress test
+is retained in Appendix~\ref{app:inverse_identifiability}.
+
+We instead pose a conditional identification problem in which matrix
+properties, \(G_{LT}\), and the two fiber Poisson ratios are characterized
+independently, while \(E_L\) and \(E_T\) are inferred from the effective
+tensor.  In normalized coordinates
+\(z_I=(z_{E_L},z_{E_T})\), the ROM-only problem is
+\begin{equation}
+\label{eq:conditional_inverse}
+\min_{z_I\in[0,1]^2}
+\frac{\|\Cr(z_I;z_{\mathrm{known}})-C^{\mathrm{obs}}\|_F^2}
+{\|C^{\mathrm{obs}}\|_F^2}.
+\end{equation}
+The corresponding Jacobian condition number is approximately 15, versus
+\(4.58\times10^4\) for seven unknowns.  Across ten independent symmetric
+perturbations at each noise level, the median normalized RMSE in
+\((E_L,E_T)\) is 0.0065, 0.0237, and 0.0508 for 0.1\%, 0.5\%, and 1\% tensor
+noise, respectively; the corresponding 95th percentiles are 0.0129, 0.0716,
+and 0.119.  All 30 four-start optimizations converge and require no new
+full-order solve.  Figure~\ref{fig:conditional_inverse} and
+Table~\ref{tab:conditional_inverse} report the recovery and conditioning.
+The result supports conditional identification of observable parameters, not
+unrestricted recovery of seven individual constants.
+
+\begin{figure}
+\centering
+\includegraphics[width=0.96\linewidth]{cmame_conditional_inverse.pdf}
+\caption{Sensitivity-guided inverse reformulation.  (a) Median and
+95th-percentile normalized recovery error when only \(E_L\) and \(E_T\) are
+unknown.  (b) Restricting the inverse problem to those observable directions
+reduces the Jacobian condition number by about three orders of magnitude.}
+\label{fig:conditional_inverse}
+\end{figure}
+
+\begin{table}
+\centering
+\small
+\caption{Conditional \((E_L,E_T)\) identification under tensor noise.}
+\label{tab:conditional_inverse}
+\input{tables/cmame_conditional_inverse_summary.tex}
+\end{table}
+
+\subsubsection{Uncertainty propagation}
+
+The final operator was queried for \(100\,000\) independent global-uniform materials
+and \(100\,000\) independent local truncated-normal materials.  The local law is
+centered at the midpoint of each of the seven physical intervals with
+\(\sigma=(b-a)/6\), truncated to the admissible box.  No predicted effective
+tensor lost positive definiteness.  The \(200\,000\) reduced solves take 46.2 s with
+one BLAS thread.  The local law preserves similar central values but reduces
+the standard deviations; for example, the standard deviation of \(E_3\) falls
+from 1.843 to 1.045 and that of \(G_{12}\) from 0.701 to 0.397.
+At \(50\,000\) samples, the largest mean change relative to the final \(100\,000\)-sample
+statistics is \(7.53\times10^{-4}\); the largest 5th/95th-percentile changes
+are \(5.54\times10^{-4}\) and \(2.71\times10^{-3}\), respectively.  The saved
+convergence table therefore checks both moments and distribution tails rather
+than treating \(100\,000\) as an unsupported sample count.
+Figure~\ref{fig:uq} compares the output distributions and
+Table~\ref{tab:uq} gives their selected moments.
+
+\begin{figure*}
+\centering
+\includegraphics[width=0.91\textwidth]{cmame_uq_distributions.pdf}
+\caption{Global-uniform and local truncated-normal uncertainty propagation for
+representative Young, shear, and Poisson outputs.}
+\label{fig:uq}
+\end{figure*}
+
+\begin{table}
+\centering
+\small
+\caption{Selected statistics from \(100\,000\) samples per input law.}
+\label{tab:uq}
+\input{tables/cmame_uq_summary.tex}
+\end{table}
+
+\subsection{Claim boundaries}
+
+The guarantee concerns ROM reduction relative to the discrete FFT problem.
+It does not absorb the separately measured voxel error or transfer one basis
+between different microstructures; each geometry is compiled independently.
+Likewise, the seven physical material inputs are retained although global
+elastic-scale homogeneity admits the six-dimensional quotient described in
+Appendix~\ref{app:scale}.
+
+The causal comparator supports no universal selector ranking, while the tuned
+black-box control isolates the value of the intrusive Schur construction in
+this data regime.  A cross-code FEM comparison is outside the present scope;
+solver credibility is instead established by the homogeneous, laminate,
+Mandel, equilibrium, compatibility, Hill--Mandel, voxel-refinement, and
+inclusion-refinement checks, including classical Voigt/Reuss and hydrostatic
+Hashin--Shtrikman bounds.
+
+\section{Conclusions}
+\label{sec:conclusions}
+
+We formulated a goal-oriented constitutive transfer framework for parametric
+computational homogenization.  It combines six-load physical tangential
+enrichment, constitutive Hermite interpolation, a Ritz/Schur error identity,
+and a transverse/longitudinal two-kernel estimator whose online complexity is
+independent of voxel count at fixed rank.  The FFTHomPy/CuPy study closes solver convergence,
+basic energetic identities, dense/direct estimator agreement, and a
+zero-violation discrete bound validation.  The screening, identification, and
+\(200\,000\)-query UQ studies in Section~\ref{sec:applications} demonstrate the
+intended many-query use.  Inversion is restricted by a rank-revealing
+sensitivity analysis to the conditionally observable pair \((E_L,E_T)\); the
+ill-conditioned seven-unknown case is retained as a negative control.  The
+bound is reliable and sharp after hierarchical
+tail correction; its guarantee remains relative to the discrete FFT truth
+problem.  The causal campaign and the time-matched Sobol controls reject
+universal material-selection dominance: fixed Sobol+POD can give lower raw
+tensor error when it receives the same offline time.  Selection is therefore
+an ablation, whereas the transferable contribution is the structure-aware
+operator, its Schur diagnostics, and its goal-oriented outputs.  The black-box
+control isolates the benefit of that intrusive construction.  Voxel error
+remains separate from ROM error, and every new geometry requires its own
+offline compilation.
+
+\appendix
+
+\section{Affine constitutive coefficients}
+\label{app:affine}
+
+For the isotropic matrix,
+\[
+\mu_m=\frac{E_m}{2(1+\nu_m)},\qquad
+\lambda_m=\frac{E_m\nu_m}{(1+\nu_m)(1-2\nu_m)}.
+\]
+The local transversely isotropic fiber stiffness is expressed in Mandel
+coordinates using five independent coefficients
+\((c_{TT},c_{TT}^{\times},c_{LT},c_{LL},g_{LT})\).  For a voxel whose local
+fiber direction is \(a(x)\), the local tensor basis is rotated into the global
+frame before being accumulated into \(K_q(\G)\), \(B_q(\G)\), and \(D_q(\G)\).
+The implementation uses Mandel shear normalization consistently in the
+full-order tensors, reduced tensors, residual indicators, and generalized
+eigenvalue calculations for \(\beta\).
+
+\section{Local coercivity factor and reference selection}
+\label{app:beta}
+
+Residual bounds obtained by comparing the energy operator with a coercive
+reference are standard in certified RB methodology
+\cite{prudhomme2002reliable,quarteroni2011certified}.  Here the argument is
+written in Loewner form because the output is the full effective tensor.
+
+If \(M\) is symmetric positive definite and
+\[
+K\succeq\beta M,\qquad \beta>0,
+\]
+then
+\[
+K^{-1}\preceq\beta^{-1}M^{-1}.
+\]
+Combining this with the classical identity~\eqref{eq:ritz_schur_identity} gives
+\[
+0\preceq
+\Cr-\Cfom
+\preceq
+\beta^{-1}R^TM^{-1}R.
+\]
+For the voxelwise elastic operator, it is sufficient to impose the local
+generalized eigenvalue condition
+\[
+C(x;\boldsymbol{\xi})\succeq
+\beta(\boldsymbol{\xi})C_0(\boldsymbol{\xi})
+\quad\text{for every voxel }x.
+\]
+With an isotropic reference \(C_0\),
+\[
+\beta(\boldsymbol{\xi})
+=
+\min\{\lambda_{\min}(C_m,C_0),\lambda_{\min}(C_f,C_0)\}.
+\]
+The implementation evaluates these generalized spectra for 129 reference
+shapes, multiplies \(\beta\) by \(1-10^{-10}\), and adds a conservative
+iterative-truth guard based on the recorded full-order relative residual.  This
+guard accounts for numerical comparison uncertainty; it is not a certificate
+of continuum discretization error.
+
+\section{Two-kernel offline--online factorization}
+\label{app:offlineonline}
+
+Let \(\widehat{\tau}(k)\) be the Fourier transform of an affine residual-stress
+atom and \(n=k/\|k\|\).  Its traction is
+\(t=\widehat{\tau}n\), with
+\(t_L=(t\cdot n)n\) and \(t_T=t-t_L\).  For an isotropic reference medium,
+Parseval's identity yields
+\[
+\langle r,M^{-1}r\rangle
+=\sum_{k\ne0}\left(
+\frac{\|t_T(k)\|^2}{\mu_0}
++\frac{\|t_L(k)\|^2}{\lambda_0+2\mu_0}
+\right).
+\]
+The isotropic Fourier Green operator and its transverse/longitudinal split are
+classical ingredients of FFT homogenization
+\cite{moulinec1998numerical,vondrejc2014fft}.
+
+\paragraph{Proof of Proposition~\ref{prop:two_kernel_compilation}.}
+For a fixed reduced coordinate matrix \(Y=Y_r(\boldsymbol{\xi})\), define the
+six-column affine residual atom
+\[
+S_p(Y)=B_p-K_pV_rY.
+\]
+Then \(R=\sum_p\gamma_pS_p(Y)\), and bilinearity gives, for
+\(\alpha\in\{T,L\}\),
+\begin{equation}
+\label{eq:appendix_pairwise_expansion}
+R^TP_\alpha R
+=\sum_{p,q}\gamma_p\gamma_q S_p(Y)^TP_\alpha S_q(Y).
+\end{equation}
+Because \(P_\alpha=P_\alpha^T\), expanding one summand yields
+\begin{align}
+S_p(Y)^TP_\alpha S_q(Y)
+={}&B_p^TP_\alpha B_q
+-B_p^TP_\alpha K_qV_rY \notag\\
+&-Y^TV_r^TK_p^TP_\alpha B_q
++Y^TV_r^TK_p^TP_\alpha K_qV_rY \notag\\
+={}&BB^\alpha_{pq}-BK^\alpha_{pq}Y
+-Y^T(BK^\alpha_{qp})^T+Y^TKK^\alpha_{pq}Y.
+\label{eq:appendix_atom_expansion}
+\end{align}
+Substitution of Eq.~\eqref{eq:appendix_atom_expansion} into
+Eq.~\eqref{eq:appendix_pairwise_expansion} gives
+Eq.~\eqref{eq:kernel_contraction}; substitution of the classical orthogonal
+split~\eqref{eq:two_kernel_inverse} gives
+Eq.~\eqref{eq:kernel_recombination}.  Thus the dense and direct-Fourier forms
+are algebraically identical.
+
+Each \(BB\), \(BK\), and \(KK\) block contains only \(n_g\times n_g\),
+\(n_g\times r\), and \(r\times r\) arrays, respectively.  Once those blocks
+have been compiled, the pairwise contractions require
+\(O(Q^2r^2+Q^2rn_g)\) arithmetic for fixed \(n_g=6\) and
+\(O(Q^2r^2)\) storage.  Every FFT and voxel sum occurs in the construction of
+the blocks, so neither online quantity contains \(N_{\mathrm{vox}}\).
+\hfill\(\square\)
+
+\section{Seven-parameter identifiability stress test}
+\label{app:inverse_identifiability}
+
+For completeness, all seven normalized material coordinates were first treated
+as unknowns in
+\[
+\min_{z\in[0,1]^7}
+\frac{\|\Cr(z)-C^{\mathrm{obs}}\|_F^2}
+{\|C^{\mathrm{obs}}\|_F^2}
++\lambda_{\mathrm{reg}}\|z-\tfrac12\boldsymbol{1}\|_2^2,
+\qquad
+\lambda_{\mathrm{reg}}\in\{0,10^{-6},10^{-4},10^{-2}\}.
+\]
+Ten independent symmetric perturbations were used at each of the 0.1\%, 0.5\%,
+and 1\% tensor-noise levels.  All 120 optimizations converged, but the best
+median normalized seven-parameter RMSE values were 0.183, 0.227, and 0.239,
+respectively.  At 0.1\% noise, for example, the recovered-tensor error remained
+only \(4.44\times10^{-4}\).  Small output residuals therefore do not imply
+stable recovery along weak Jacobian directions.  This negative control
+motivates the conditional problem
+in Eq.~\eqref{eq:conditional_inverse}; it is not counted as a successful
+seven-parameter identification result.  The complete 120-run table is retained
+in the supplementary campaign archive.
+
+\section{Elastic-scale homogeneity}
+\label{app:scale}
+
+If every constituent stiffness is multiplied by \(s>0\), then
+\(K,B,D\), \(\Cfom\), and \(\Ceff\) scale by \(s\), while the fluctuation response
+\(K^{-1}B\) is invariant.  Hence one physical modulus could be factored out
+and the shape of the transfer map represented by six nondimensional ratios.
+This study deliberately retains the seven physical inputs because its
+sampling, validation, inverse problem, and user-facing material interface were
+defined in those variables.  No dimensionality-reduction novelty is claimed.
+
+\section{Reproducibility}
+\label{app:repro}
+
+The CMAME figures and tables are generated from campaign manifests with
+\[
+\text{\path{python scripts/cmame_generate_paper_assets.py}}.
+\]
+The source campaigns are under \texttt{results/cmame\_method}; generated files
+and hashes are recorded in \texttt{paper/cmame\_assets\_manifest.json}.  The
+manuscript is compiled from \(\text{\path{paper}}\) using:
+\begin{center}
+\small
+\path{pdflatex -interaction=nonstopmode main.tex}\\
+\path{bibtex main}\\
+\path{pdflatex -interaction=nonstopmode main.tex}\\
+\path{pdflatex -interaction=nonstopmode main.tex}
+\end{center}
+
+\section*{Declaration of competing interest}
+The authors declare that they have no known competing financial interests or
+personal relationships that could have appeared to influence the work reported
+in this paper.
+
+\section*{Data and code availability}
+The source code, campaign manifests, and derived data needed to reproduce every
+reported table and figure are provided in the accompanying supplementary
+archive.  Baseline artifacts are separated from the new methodological
+campaigns, and each generated manuscript asset is recorded with its source path
+and SHA-256 hash.
+
+\printcredits
+
+\bibliographystyle{cas-model2-names}
+\bibliography{references}
+
+\end{document}

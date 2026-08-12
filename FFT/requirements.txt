@@ -1,0 +1,8 @@
+cupy-cuda13x==13.6.0
+numba
+numpy>=1.26,<1.28
+openpyxl
+pandas
+scipy
+tqdm
+threadpoolctl

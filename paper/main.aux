@@ -1,0 +1,226 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\orcidauthor{0009-0006-8667-4525}{Kevin Vidal}
+\csgdef{mark@corau1}{1}
+\emailauthor{kevin.vidal@epn.edu.ec}{Kevin Vidal}
+\creditauthor{Conceptualization, Methodology, Software, Formal analysis, Investigation, Data curation, Visualization, Writing -- original draft}{Kevin Vidal}
+\orcidauthor{0000-0001-7351-5281}{Victor Alulema}
+\creditauthor{Conceptualization, Methodology, Validation, Formal analysis, Investigation, Writing -- review and editing}{Victor Alulema}
+\orcidauthor{0009-0005-8405-6208}{Victor Berrazueta}
+\creditauthor{Validation, Resources, Writing -- review and editing}{Victor Berrazueta}
+\orcidauthor{0000-0002-7106-8024}{Patrick Vandewalle}
+\creditauthor{Methodology, Supervision, Resources, Writing -- review and editing}{Patrick Vandewalle}
+\orcidauthor{0000-0002-6496-9908}{Esteban Valencia}
+\creditauthor{Supervision, Project administration, Resources, Writing -- review and editing}{Esteban Valencia}
+\citation{yvonnet2007r3m,fritzen2013hybrid,hernandez2014highperformance,kunc2019finite,kochmann2019sparsefft,pham2024rbhm}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\citation{prudhomme2002reliable,quarteroni2011certified,boyaval2008homogenization}
+\citation{yvonnet2007r3m,fritzen2013hybrid,hernandez2014highperformance,kunc2019finite,michel2016variational,pham2024rbhm}
+\citation{huynh2013scrbe,eftang2013port,smetana2015certification}
+\citation{baur2011interpolatory}
+\citation{kerfriden2014cre,vondrejc2015bounds}
+\citation{prudhomme2002reliable}
+\citation{quarteroni2011certified}
+\citation{boyaval2008homogenization}
+\citation{yvonnet2007r3m}
+\citation{fritzen2013hybrid}
+\citation{hernandez2014highperformance}
+\citation{michel2016variational}
+\citation{kunc2019finite}
+\citation{baur2011interpolatory}
+\citation{kaminski2003sensitivity}
+\citation{guo2021constitutive}
+\citation{lukes2026sensitivity}
+\citation{huynh2013scrbe}
+\citation{eftang2013port}
+\citation{smetana2015certification}
+\citation{huynh2007scm}
+\citation{hain2019hierarchical}
+\citation{kerfriden2014cre}
+\citation{hoang2016twofield}
+\citation{moulinec1998numerical}
+\citation{vondrejc2014fft,vondrejc2015bounds}
+\citation{kochmann2019sparsefft}
+\citation{vondrejc2020lowrank}
+\citation{hauck2026sfft}
+\citation{pham2024rbhm}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Periodic homogenization and constitutive transfer}{3}{section.2}\protected@file@percent }
+\newlabel{sec:homogenization}{{2}{3}{Periodic homogenization and constitutive transfer}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Periodic cell problem and effective response}{3}{subsection.2.1}\protected@file@percent }
+\newlabel{eq:cell_problem}{{1}{3}{Periodic cell problem and effective response}{equation.1}{}}
+\newlabel{eq:effective_response}{{2}{3}{Periodic cell problem and effective response}{equation.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Proposition-level positioning against direct methodological antecedents. The middle column identifies what is inherited; the last column states the remaining boundary of the present contribution.}}{4}{table.caption.1}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{tab:literature}{{1}{4}{Proposition-level positioning against direct methodological antecedents. The middle column identifies what is inherited; the last column states the remaining boundary of the present contribution}{table.caption.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Discrete Schur-complement transfer representation}{5}{subsection.2.2}\protected@file@percent }
+\newlabel{eq:discrete_energy}{{3}{5}{Discrete Schur-complement transfer representation}{equation.3}{}}
+\newlabel{eq:fom_response}{{4}{5}{Discrete Schur-complement transfer representation}{equation.4}{}}
+\newlabel{eq:schur_transfer}{{5}{5}{Discrete Schur-complement transfer representation}{equation.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Material parameters and geometry-affine separation}{5}{subsection.2.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Admissible constituent-property box for the fixed-geometry transfer operator.}}{6}{table.caption.2}\protected@file@percent }
+\newlabel{tab:material_domain}{{2}{6}{Admissible constituent-property box for the fixed-geometry transfer operator}{table.caption.2}{}}
+\newlabel{eq:affine_operators}{{6}{6}{Material parameters and geometry-affine separation}{equation.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Goal-oriented constitutive transfer reduction}{6}{section.3}\protected@file@percent }
+\newlabel{sec:transfer}{{3}{6}{Goal-oriented constitutive transfer reduction}{section.3}{}}
+\newlabel{eq:offline_online_flow}{{7}{6}{Goal-oriented constitutive transfer reduction}{equation.7}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Data flow of the implemented constitutive-transfer method. The upper band contains the voxel-dependent offline operations and the actual dimensions of the two-kernel contractions. The lower band contains the online query, which assembles and solves only a \(168\times 168\) dense system and returns the effective tensor, its material sensitivities, and the Schur bound.}}{7}{figure.caption.3}\protected@file@percent }
+\newlabel{fig:offline_online_architecture}{{1}{7}{Data flow of the implemented constitutive-transfer method. The upper band contains the voxel-dependent offline operations and the actual dimensions of the two-kernel contractions. The lower band contains the online query, which assembles and solves only a \(168\times 168\) dense system and returns the effective tensor, its material sensitivities, and the Schur bound}{figure.caption.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Ritz projection and six-load tangential enrichment}{7}{subsection.3.1}\protected@file@percent }
+\newlabel{eq:reduced_transfer}{{8}{7}{Ritz projection and six-load tangential enrichment}{equation.8}{}}
+\citation{moulinec1998numerical,vondrejc2014fft}
+\citation{prudhomme2002reliable,quarteroni2011certified}
+\newlabel{eq:tangential_enrichment}{{9}{8}{Ritz projection and six-load tangential enrichment}{equation.9}{}}
+\newlabel{eq:adaptive_selection}{{10}{8}{Ritz projection and six-load tangential enrichment}{equation.10}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Offline--online Schur error estimation}{8}{section.4}\protected@file@percent }
+\newlabel{sec:estimator}{{4}{8}{Offline--online Schur error estimation}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Residual energy and two-kernel factorization}{8}{subsection.4.1}\protected@file@percent }
+\newlabel{eq:residual}{{11}{8}{Residual energy and two-kernel factorization}{equation.11}{}}
+\newlabel{eq:two_kernel_inverse}{{12}{8}{Residual energy and two-kernel factorization}{equation.12}{}}
+\citation{prudhomme2002reliable,quarteroni2011certified}
+\citation{boyaval2008homogenization,kerfriden2014cre}
+\citation{huynh2013scrbe,eftang2013port,smetana2015certification}
+\newlabel{eq:compiled_contractions}{{13}{9}{Residual energy and two-kernel factorization}{equation.13}{}}
+\newlabel{eq:kernel_contraction}{{14}{9}{Residual energy and two-kernel factorization}{equation.14}{}}
+\newlabel{eq:kernel_recombination}{{15}{9}{Residual energy and two-kernel factorization}{equation.15}{}}
+\newlabel{prop:two_kernel_compilation}{{1}{9}{Residual energy and two-kernel factorization}{equation.15}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Ritz/Schur identity and Loewner hierarchy}{9}{subsection.4.2}\protected@file@percent }
+\newlabel{eq:ritz_schur_identity}{{16}{9}{Ritz/Schur identity and Loewner hierarchy}{equation.16}{}}
+\newlabel{eq:loewner_hierarchy}{{17}{9}{Ritz/Schur identity and Loewner hierarchy}{equation.17}{}}
+\citation{prudhomme2002reliable,quarteroni2011certified}
+\citation{hain2019hierarchical}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Beta-scaled bound and online reference selection}{10}{subsection.4.3}\protected@file@percent }
+\newlabel{eq:matrix_bound}{{19}{10}{Beta-scaled bound and online reference selection}{equation.19}{}}
+\newlabel{eq:frobenius_bound}{{20}{10}{Beta-scaled bound and online reference selection}{equation.20}{}}
+\newlabel{eq:effectivity}{{21}{10}{Beta-scaled bound and online reference selection}{equation.21}{}}
+\newlabel{eq:hierarchical_bound}{{22}{10}{Beta-scaled bound and online reference selection}{equation.22}{}}
+\citation{huynh2007scm}
+\citation{kaminski2003sensitivity,guo2021constitutive,lukes2026sensitivity}
+\citation{baur2011interpolatory}
+\newlabel{eq:relative_certificate_conversion}{{24}{11}{Beta-scaled bound and online reference selection}{equation.24}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Constitutive sensitivities and tangential Hermite interpolation}{11}{section.5}\protected@file@percent }
+\newlabel{sec:sensitivities}{{5}{11}{Constitutive sensitivities and tangential Hermite interpolation}{section.5}{}}
+\newlabel{eq:constitutive_sensitivity}{{25}{11}{Constitutive sensitivities and tangential Hermite interpolation}{equation.25}{}}
+\newlabel{eq:hermite_tensor}{{26}{12}{Constitutive sensitivities and tangential Hermite interpolation}{equation.26}{}}
+\newlabel{eq:hermite_sensitivity}{{27}{12}{Constitutive sensitivities and tangential Hermite interpolation}{equation.27}{}}
+\newlabel{eq:sensitivity_selection_score}{{28}{12}{Constitutive sensitivities and tangential Hermite interpolation}{equation.28}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}FFT implementation and numerical protocol}{12}{section.6}\protected@file@percent }
+\newlabel{sec:protocol}{{6}{12}{FFT implementation and numerical protocol}{section.6}{}}
+\citation{arsigny2007geometric}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Fixed short-fiber RVE used throughout the fixed-geometry study.}}{13}{table.caption.4}\protected@file@percent }
+\newlabel{tab:geometry}{{3}{13}{Fixed short-fiber RVE used throughout the fixed-geometry study}{table.caption.4}{}}
+\newlabel{eq:relative_tensor_error}{{29}{13}{FFT implementation and numerical protocol}{equation.29}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Traceable morphology of the fixed SAM short-fiber RVE. (a) The 96 continuous centerlines are wrapped through the periodic cell and colored by \(\lvert u_3\rvert \). (b) Three orthogonal sections show the \(91^3\) rasterization used by the FFT solver. (c) The realized axial orientation distribution and second-order orientation tensor are compared with the isotropic targets. The same accepted geometry is reused for every material query in the fixed-geometry study.}}{14}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:geometry}{{2}{14}{Traceable morphology of the fixed SAM short-fiber RVE. (a) The 96 continuous centerlines are wrapped through the periodic cell and colored by \(\lvert u_3\rvert \). (b) Three orthogonal sections show the \(91^3\) rasterization used by the FFT solver. (c) The realized axial orientation distribution and second-order orientation tensor are compared with the isotropic targets. The same accepted geometry is reused for every material query in the fixed-geometry study}{figure.caption.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Results and discussion}{14}{section.7}\protected@file@percent }
+\newlabel{sec:results}{{7}{14}{Results and discussion}{section.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}ROM convergence}{14}{subsection.7.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Convergence of the fixed-geometry tangential Ritz operator on the 32-point independent validation set. The dashed line marks the adopted \(10^{-4}\) scientific reporting floor.}}{15}{figure.caption.6}\protected@file@percent }
+\newlabel{fig:rom_convergence}{{3}{15}{Convergence of the fixed-geometry tangential Ritz operator on the 32-point independent validation set. The dashed line marks the adopted \(10^{-4}\) scientific reporting floor}{figure.caption.6}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Independent tensor-validation errors for the fixed geometry.}}{15}{table.caption.7}\protected@file@percent }
+\newlabel{tab:validation}{{4}{15}{Independent tensor-validation errors for the fixed geometry}{table.caption.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Offline--online bound and Loewner hierarchy}{15}{subsection.7.2}\protected@file@percent }
+\newlabel{sec:results_bound}{{7.2}{15}{Offline--online bound and Loewner hierarchy}{subsection.7.2}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Campaign-level audit of the Schur bound. (a) Every hierarchical upper bound lies above the exact-limit diagonal. (b) The direct residual bound has median effectivity 8.94, whereas the exact reduced drop plus bounded enriched tail lowers it to 1.10, below the target value 5. (c) Positive minimum eigenvalues verify both \(C^{\mathrm  {eff}}_r-C^{\mathrm  {eff}}_{\mathrm  {FOM}}\succeq 0\) and \(U_{r\leftarrow s}^{\mathrm  {hier}}-(C^{\mathrm  {eff}}_r-C^{\mathrm  {eff}}_{\mathrm  {FOM}})\succeq 0\) for all 16 high-precision materials.}}{16}{figure.caption.8}\protected@file@percent }
+\newlabel{fig:bound_reliability}{{4}{16}{Campaign-level audit of the Schur bound. (a) Every hierarchical upper bound lies above the exact-limit diagonal. (b) The direct residual bound has median effectivity 8.94, whereas the exact reduced drop plus bounded enriched tail lowers it to 1.10, below the target value 5. (c) Positive minimum eigenvalues verify both \(\Cr -\Cfom \succeq 0\) and \(U_{r\leftarrow s}^{\mathrm {hier}}-(\Cr -\Cfom )\succeq 0\) for all 16 high-precision materials}{figure.caption.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Adaptive Sobol+POD convergence}{16}{subsection.7.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Six eigenvalues of \(C^{\mathrm  {eff}}_r-C^{\mathrm  {eff}}_{\mathrm  {FOM}}\) and of differences between consecutive nested levels for the most difficult high-precision material. Positivity visualizes the Ritz/Schur Loewner hierarchy.}}{17}{figure.caption.9}\protected@file@percent }
+\newlabel{fig:loewner_hierarchy}{{5}{17}{Six eigenvalues of \(\Cr -\Cfom \) and of differences between consecutive nested levels for the most difficult high-precision material. Positivity visualizes the Ritz/Schur Loewner hierarchy}{figure.caption.9}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces High-precision direct and hierarchical bound study.}}{17}{table.caption.10}\protected@file@percent }
+\newlabel{tab:bound_cmame}{{5}{17}{High-precision direct and hierarchical bound study}{table.caption.10}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}Sensitivity checks}{17}{subsection.7.4}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces Adaptive full-rank Sobol+POD convergence on 256 untouched truth tensors. The horizontal dashed line marks the \(2\times 10^{-5}\) target tolerance.}}{18}{figure.caption.11}\protected@file@percent }
+\newlabel{fig:adaptive_convergence}{{6}{18}{Adaptive full-rank Sobol+POD convergence on 256 untouched truth tensors. The horizontal dashed line marks the \(2\times 10^{-5}\) target tolerance}{figure.caption.11}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces Full-order finite-difference sensitivity checks before and after targeted tangential enrichment.}}{18}{figure.caption.12}\protected@file@percent }
+\newlabel{fig:sensitivity}{{7}{18}{Full-order finite-difference sensitivity checks before and after targeted tangential enrichment}{figure.caption.12}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Discretization and geometry scope}{18}{subsection.7.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.5.1}Voxel refinement on one continuous geometry}{18}{subsubsection.7.5.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Reduced analytic sensitivity checks against full-order finite differences.}}{19}{table.caption.13}\protected@file@percent }
+\newlabel{tab:sensitivity}{{6}{19}{Reduced analytic sensitivity checks against full-order finite differences}{table.caption.13}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {8}{\ignorespaces Discretization error and high-precision solve cost for the same continuous 96-fiber geometry rasterized at four grids.}}{19}{figure.caption.14}\protected@file@percent }
+\newlabel{fig:voxel}{{8}{19}{Discretization error and high-precision solve cost for the same continuous 96-fiber geometry rasterized at four grids}{figure.caption.14}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces Voxel-refinement truth solves on one continuous geometry.}}{19}{table.caption.15}\protected@file@percent }
+\newlabel{tab:voxel}{{7}{19}{Voxel-refinement truth solves on one continuous geometry}{table.caption.15}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {9}{\ignorespaces Spherical-inclusion refinement and Hashin--Shtrikman bulk interval.}}{20}{figure.caption.16}\protected@file@percent }
+\newlabel{fig:inclusion}{{9}{20}{Spherical-inclusion refinement and Hashin--Shtrikman bulk interval}{figure.caption.16}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {8}{\ignorespaces Inclusion refinement and matrix-valued Voigt/Reuss margins.}}{20}{table.caption.17}\protected@file@percent }
+\newlabel{tab:inclusion}{{8}{20}{Inclusion refinement and matrix-valued Voigt/Reuss margins}{table.caption.17}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {9}{\ignorespaces Acceptance and separation of the ten-geometry campaign.}}{20}{table.caption.20}\protected@file@percent }
+\newlabel{tab:geometries}{{9}{20}{Acceptance and separation of the ten-geometry campaign}{table.caption.20}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.5.2}Ten distinct microstructures}{20}{subsubsection.7.5.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {10}{\ignorespaces Target versus realized volume fraction, aspect ratio, orientation tensor components, and clustering response for ten accepted microstructures.}}{21}{figure.caption.18}\protected@file@percent }
+\newlabel{fig:geometries}{{10}{21}{Target versus realized volume fraction, aspect ratio, orientation tensor components, and clustering response for ten accepted microstructures}{figure.caption.18}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {11}{\ignorespaces Central slices of the ten accepted \(91^3\) periodic RVEs.}}{21}{figure.caption.19}\protected@file@percent }
+\newlabel{fig:geometry_slices}{{11}{21}{Central slices of the ten accepted \(91^3\) periodic RVEs}{figure.caption.19}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Many-query applications}{21}{subsection.7.6}\protected@file@percent }
+\newlabel{sec:applications}{{7.6}{21}{Many-query applications}{subsection.7.6}{}}
+\citation{brun2001practical}
+\@writefile{lof}{\contentsline {figure}{\numberline {12}{\ignorespaces ROM-only material screening. Gray points are eligible candidates, colored points are the Pareto front, and the star is the selected best balanced-gain candidate.}}{22}{figure.caption.21}\protected@file@percent }
+\newlabel{fig:screening}{{12}{22}{ROM-only material screening. Gray points are eligible candidates, colored points are the Pareto front, and the star is the selected best balanced-gain candidate}{figure.caption.21}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {10}{\ignorespaces Best reduced-model candidate in the 4096-point material-screening study.}}{22}{table.caption.22}\protected@file@percent }
+\newlabel{tab:screening_best}{{10}{22}{Best reduced-model candidate in the 4096-point material-screening study}{table.caption.22}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.6.1}ROM-only material screening}{22}{subsubsection.7.6.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {13}{\ignorespaces Sensitivity-guided inverse reformulation. (a) Median and 95th-percentile normalized recovery error when only \(E_L\) and \(E_T\) are unknown. (b) Restricting the inverse problem to those observable directions reduces the Jacobian condition number by about three orders of magnitude.}}{23}{figure.caption.23}\protected@file@percent }
+\newlabel{fig:conditional_inverse}{{13}{23}{Sensitivity-guided inverse reformulation. (a) Median and 95th-percentile normalized recovery error when only \(E_L\) and \(E_T\) are unknown. (b) Restricting the inverse problem to those observable directions reduces the Jacobian condition number by about three orders of magnitude}{figure.caption.23}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.6.2}Inverse identification}{23}{subsubsection.7.6.2}\protected@file@percent }
+\newlabel{eq:conditional_inverse}{{30}{23}{Inverse identification}{equation.30}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {11}{\ignorespaces Conditional \((E_L,E_T)\) identification under tensor noise.}}{24}{table.caption.24}\protected@file@percent }
+\newlabel{tab:conditional_inverse}{{11}{24}{Conditional \((E_L,E_T)\) identification under tensor noise}{table.caption.24}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {14}{\ignorespaces Global-uniform and local truncated-normal uncertainty propagation for representative Young, shear, and Poisson outputs.}}{24}{figure.caption.25}\protected@file@percent }
+\newlabel{fig:uq}{{14}{24}{Global-uniform and local truncated-normal uncertainty propagation for representative Young, shear, and Poisson outputs}{figure.caption.25}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {12}{\ignorespaces Selected statistics from \(100\,000\) samples per input law.}}{24}{table.caption.26}\protected@file@percent }
+\newlabel{tab:uq}{{12}{24}{Selected statistics from \(100\,000\) samples per input law}{table.caption.26}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.6.3}Uncertainty propagation}{24}{subsubsection.7.6.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.7}Claim boundaries}{25}{subsection.7.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Conclusions}{25}{section.8}\protected@file@percent }
+\newlabel{sec:conclusions}{{8}{25}{Conclusions}{section.8}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {A}Affine constitutive coefficients}{25}{appendix.A}\protected@file@percent }
+\newlabel{app:affine}{{A}{25}{Affine constitutive coefficients}{appendix.A}{}}
+\citation{prudhomme2002reliable,quarteroni2011certified}
+\@writefile{toc}{\contentsline {section}{\numberline {B}Local coercivity factor and reference selection}{26}{appendix.B}\protected@file@percent }
+\newlabel{app:beta}{{B}{26}{Local coercivity factor and reference selection}{appendix.B}{}}
+\citation{moulinec1998numerical,vondrejc2014fft}
+\@writefile{toc}{\contentsline {section}{\numberline {C}Two-kernel offline--online factorization}{27}{appendix.C}\protected@file@percent }
+\newlabel{app:offlineonline}{{C}{27}{Two-kernel offline--online factorization}{appendix.C}{}}
+\@writefile{toc}{\contentsline {paragraph}{Proof of Proposition~\ref {prop:two_kernel_compilation}.}{27}{section*.27}\protected@file@percent }
+\newlabel{eq:appendix_pairwise_expansion}{{31}{27}{Proof of Proposition~\ref {prop:two_kernel_compilation}}{equation.31}{}}
+\newlabel{eq:appendix_atom_expansion}{{32}{27}{Proof of Proposition~\ref {prop:two_kernel_compilation}}{equation.32}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {D}Seven-parameter identifiability stress test}{27}{appendix.D}\protected@file@percent }
+\newlabel{app:inverse_identifiability}{{D}{27}{Seven-parameter identifiability stress test}{appendix.D}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {E}Elastic-scale homogeneity}{28}{appendix.E}\protected@file@percent }
+\newlabel{app:scale}{{E}{28}{Elastic-scale homogeneity}{appendix.E}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {F}Reproducibility}{28}{appendix.F}\protected@file@percent }
+\newlabel{app:repro}{{F}{28}{Reproducibility}{appendix.F}{}}
+\bibstyle{cas-model2-names}
+\bibdata{references}
+\bibcite{arsigny2007geometric}{{1}{2007}{{Arsigny et~al.}}{{Arsigny, Fillard, Pennec and Ayache}}}
+\bibcite{baur2011interpolatory}{{2}{2011}{{Baur et~al.}}{{Baur, Beattie, Benner and Gugercin}}}
+\bibcite{boyaval2008homogenization}{{3}{2008}{{Boyaval}}{{}}}
+\bibcite{brun2001practical}{{4}{2001}{{Brun et~al.}}{{Brun, Reichert and Kunsch}}}
+\bibcite{eftang2013port}{{5}{2013}{{Eftang and Patera}}{{}}}
+\bibcite{fritzen2013hybrid}{{6}{2013}{{Fritzen and Leuschner}}{{}}}
+\bibcite{guo2021constitutive}{{7}{2021}{{Guo et~al.}}{{Guo, Roko{\v {s}} and Veroy}}}
+\bibcite{hain2019hierarchical}{{8}{2019}{{Hain et~al.}}{{Hain, Ohlberger, Radic and Urban}}}
+\bibcite{hauck2026sfft}{{9}{2026}{{Hauck et~al.}}{{Hauck, Kabel, Ali and Gauger}}}
+\bibcite{hernandez2014highperformance}{{10}{2014}{{Hern{\'a}ndez et~al.}}{{Hern{\'a}ndez, Oliver, Huespe, Caicedo and Cante}}}
+\bibcite{hoang2016twofield}{{11}{2016}{{Hoang et~al.}}{{Hoang, Kerfriden and Bordas}}}
+\bibcite{huynh2013scrbe}{{12}{2013}{{Huynh et~al.}}{{Huynh, Knezevic and Patera}}}
+\bibcite{huynh2007scm}{{13}{2007}{{Huynh et~al.}}{{Huynh, Rozza, Sen and Patera}}}
+\bibcite{kaminski2003sensitivity}{{14}{2003}{{Kami{\'n}ski}}{{}}}
+\bibcite{kerfriden2014cre}{{15}{2014}{{Kerfriden et~al.}}{{Kerfriden, R{\'o}denas and Bordas}}}
+\bibcite{kochmann2019sparsefft}{{16}{2019}{{Kochmann et~al.}}{{Kochmann, Manjunatha, Gierden, Wulfinghoff, Svendsen and Reese}}}
+\bibcite{kunc2019finite}{{17}{2019}{{Kunc and Fritzen}}{{}}}
+\bibcite{lukes2026sensitivity}{{18}{2026}{{Luke{\v {s}} and Rohan}}{{}}}
+\bibcite{michel2016variational}{{19}{2016}{{Michel and Suquet}}{{}}}
+\bibcite{moulinec1998numerical}{{20}{1998}{{Moulinec and Suquet}}{{}}}
+\bibcite{pham2024rbhm}{{21}{2025}{{Pham and Lee}}{{}}}
+\bibcite{prudhomme2002reliable}{{22}{2002}{{Prud'homme et~al.}}{{Prud'homme, Rovas, Veroy and Patera}}}
+\bibcite{quarteroni2011certified}{{23}{2011}{{Quarteroni et~al.}}{{Quarteroni, Rozza and Manzoni}}}
+\bibcite{smetana2015certification}{{24}{2015}{{Smetana}}{{}}}
+\bibcite{vondrejc2020lowrank}{{25}{2020}{{Vond{\v {r}}ejc et~al.}}{{Vond{\v {r}}ejc, Liu, Ladeck{\'y} and Matthies}}}
+\bibcite{vondrejc2014fft}{{26}{2014}{{Vond{\v {r}}ejc et~al.}}{{Vond{\v {r}}ejc, Zeman and Marek}}}
+\bibcite{vondrejc2015bounds}{{27}{2015}{{Vond{\v {r}}ejc et~al.}}{{Vond{\v {r}}ejc, Zeman and Marek}}}
+\bibcite{yvonnet2007r3m}{{28}{2007}{{Yvonnet and He}}{{}}}
+\csxdef{lastpage}{31}
+\gdef \@abspage@last{32}

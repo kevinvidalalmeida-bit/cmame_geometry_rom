@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+*.log
+.~lock.*
+~$*
+.venv/
+.venv_gpu/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.DS_Store
+.vscode/
+
+# Las campañas contienen Excel y campos NPY grandes. No se versionan.
+results/
+RESULTADOS/
+IMAGENES/
+codigo_ipynb_paper/salidas/
+
+# Los estudios de independencia se mantienen fuera de este repositorio.
+studies/
+
+# Pruebas y copias locales de depuracion.
+test_run_design_16/
+test_design_16.py
+test_global_manager.py
+test_manager_design.py
+profile_pipeline.py
+patch_sobol_gpu.py
+missing_functions.py
+ffthompy_original/
+resume.sh

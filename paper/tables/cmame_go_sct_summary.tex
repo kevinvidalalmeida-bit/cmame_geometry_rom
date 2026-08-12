@@ -1,0 +1,10 @@
+\begin{tabular}{lrrrrrr}
+\toprule
+Method & Pool & Offline [s] & Selection [s] & Mean & P95 & Max \\
+\midrule
+GO-SCT: Sobol-10 + Tail-Schur (1024) & 1024 & 250.7 & 0.41 & 1.41e-05 & 5.17e-05 & 1.18e-04 \\
+Sobol + POD (4096) & 4096 & 172.4 & 0.00 & 1.93e-05 & 6.99e-05 & 2.48e-04 \\
+energy greedy (4096) & 4096 & 634.8 & 109.90 & 3.05e-05 & 7.55e-05 & 1.50e-04 \\
+Random (median) & 4096 & 167.4 & 0.00 & 3.16e-05 & 1.40e-04 & 5.20e-04 \\
+\bottomrule
+\end{tabular}
