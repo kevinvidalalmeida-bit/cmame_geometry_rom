@@ -11,7 +11,7 @@ import time
 
 import numpy as np
 import pandas as pd
-from scipy.stats import truncnorm
+
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -22,11 +22,6 @@ for path in (ROOT / "scripts", ROOT / "FFT"):
 import fft_homogenization_solver as sweep
 
 
-RUN = ROOT / "results" / "fixed_geometry_ffthompy" / "fixed_geometry_ar15_vf20_sobol8_center_fields"
-ROM_DEFAULT = RUN / (
-    "rom_tangential_r168_center_m1_m2_m3_m5_m7_v13_v3_v15_qoi64_m1_"
-    "v1_v6_v7_v8_v9_v10_v11_v12_v13_v14_v16_v17_v22_v23_v24_v25_v30_v31_basis"
-)
 OUT_DEFAULT = ROOT / "results" / "cmame_method" / "uq"
 PARAMETER_NAMES = tuple(sweep.MATERIAL_BOUNDS)
 OUTPUT_NAMES = (
@@ -115,21 +110,7 @@ def _samples(kind: str, count: int, seed: int) -> np.ndarray:
     rng = np.random.default_rng(int(seed))
     if kind == "global_uniform":
         return rng.uniform(lower, upper, size=(count, len(PARAMETER_NAMES)))
-    mean = 0.5 * (lower + upper)
-    sigma = (upper - lower) / 6.0
-    standardized_lower = (lower - mean) / sigma
-    standardized_upper = (upper - mean) / sigma
-    values = np.empty((count, len(PARAMETER_NAMES)), dtype=np.float64)
-    for index in range(len(PARAMETER_NAMES)):
-        values[:, index] = truncnorm.rvs(
-            standardized_lower[index],
-            standardized_upper[index],
-            loc=mean[index],
-            scale=sigma[index],
-            size=count,
-            random_state=rng,
-        )
-    return values
+    raise ValueError(f"Unknown distribution kind: {kind}")
 
 
 def _summaries(kind: str, outputs: np.ndarray) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -196,7 +177,7 @@ def _summaries(kind: str, outputs: np.ndarray) -> tuple[pd.DataFrame, pd.DataFra
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rom-dir", type=Path, default=ROM_DEFAULT)
+    parser.add_argument("--rom-path", type=Path, required=True, help="Path to reduced_operators.npz")
     parser.add_argument("--out-dir", type=Path, default=OUT_DEFAULT)
     parser.add_argument("--samples", type=int, default=100000)
     parser.add_argument("--seed", type=int, default=20260811)
@@ -209,21 +190,21 @@ def main() -> int:
     args = parse_args()
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    with np.load(args.rom_dir.resolve() / "reduced_operators.npz") as payload:
+    with np.load(args.rom_path.resolve()) as payload:
         Kq = np.asarray(payload["Kq"], dtype=np.float64)
         Bq = np.asarray(payload["Bq"], dtype=np.float64)
         Dq = np.asarray(payload["Dq"], dtype=np.float64)
     summary_frames = []
     convergence_frames = []
     manifest = {
-        "rom_dir": str(args.rom_dir.resolve()),
+        "rom_path": str(args.rom_path.resolve()),
         "basis_rank": int(Kq.shape[1]),
         "physical_dimension": 7,
         "sample_count_each": int(args.samples),
         "local_sigma_rule": "(upper-lower)/6",
         "distributions": {},
     }
-    for offset, kind in enumerate(("global_uniform", "local_truncated_normal")):
+    for offset, kind in enumerate(["global_uniform"]):
         artifact = out_dir / f"{kind}_samples.npz"
         if artifact.is_file() and not args.overwrite:
             with np.load(artifact) as payload:

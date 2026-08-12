@@ -320,8 +320,9 @@ def main() -> int:
 
     out_dir = _make_out_dir(run_dir, str(args.out_name), overwrite=bool(args.overwrite))
     results_df = pd.read_csv(validation_csv)
-    phase = np.load(run_dir / "_fixed_geometry" / "phase.npy").astype(np.uint8)
-    ori = np.load(run_dir / "_fixed_geometry" / "ori.npy").astype(np.float64)
+    geometry = common.load_fixed_geometry(run_dir)
+    phase = geometry.phase.astype(np.uint8)
+    ori = geometry.ori.astype(np.float64)
 
     final_manifest = _load_json(final_rom_dir / "rom_manifest.json")
     snapshot_ids = (
