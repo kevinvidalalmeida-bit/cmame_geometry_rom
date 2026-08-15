@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.linalg import blas as scipy_blas
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,17 +89,31 @@ def configure_runtime(
     *,
     geometry_backend: str = "numba",
     generator_cores: int = 2,
+    solver_tol: float | None = None,
+    fft_backend: str = "gpu",
 ) -> dict[str, Any]:
+    runtime_tol = (
+        float(SOLVER_PROFILES["snapshot"]["solver_rtol"])
+        if solver_tol is None
+        else float(solver_tol)
+    )
     args = argparse.Namespace(
         geometry_backend=str(geometry_backend),
         generator_cores=int(generator_cores),
         compute_rve_metrics=False,
-        solver_tol=SOLVER_PROFILES["snapshot"]["solver_rtol"],
+        solver_tol=runtime_tol,
     )
     runtime = sweep._configure_fft_runtime(args)
     sobol_gpu = runtime["sobol_gpu"]
-    sobol_gpu.check_cupy_gpu()
-    sobol_gpu.warmup_gpu_once()
+    backend = str(fft_backend).lower()
+    if backend not in {"cpu", "gpu"}:
+        raise ValueError("fft_backend must be cpu or gpu.")
+    solver_backend = "cupy" if backend == "gpu" else "scipy"
+    sobol_gpu.FFT_BACKEND = solver_backend
+    runtime["config"]["fft_backend"] = solver_backend
+    if backend == "gpu":
+        sobol_gpu.check_cupy_gpu()
+        sobol_gpu.warmup_gpu_once()
     return runtime
 
 
@@ -123,6 +138,149 @@ def configure_blas_threads(count: int = 8) -> tuple[Any, list[dict[str, Any]]]:
     return controller, info
 
 
+def available_memory_bytes() -> int:
+    """Return currently available host memory without an optional dependency."""
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+    return page_size * available_pages
+
+
+def full_rank_memory_plan(
+    *,
+    nvox: int,
+    max_rank: int,
+    basis_dtype: str | np.dtype,
+    pod_batch_max_gib: float,
+    affine_stress_max_gib: float,
+    memory_safety_fraction: float,
+    max_material_batch: int | None = None,
+    available_bytes: int | None = None,
+) -> dict[str, int | float]:
+    """Plan bounded workspaces and estimate the exact full-rank peak memory."""
+    voxel_count = int(nvox)
+    rank = int(max_rank)
+    dtype = np.dtype(basis_dtype)
+    fraction = float(memory_safety_fraction)
+    if voxel_count < 1 or rank < 1:
+        raise ValueError("nvox and max_rank must be positive.")
+    if dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+        raise ValueError("basis_dtype must be float32 or float64.")
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("memory_safety_fraction must be in (0, 1].")
+
+    gib = 1024**3
+    pod_cap = int(float(pod_batch_max_gib) * gib)
+    stress_cap = int(float(affine_stress_max_gib) * gib)
+    if pod_cap < 1 or stress_cap < 1:
+        raise ValueError("POD and affine stress memory limits must be positive.")
+
+    field_bytes = 6 * voxel_count * dtype.itemsize
+    material_snapshot_bytes = 6 * field_bytes
+    stress_coefficient_bytes = 6 * field_bytes
+    basis_bytes = rank * field_bytes
+    geometry_bytes = voxel_count * (np.dtype(np.uint8).itemsize + 3 * np.dtype(np.float32).itemsize)
+    available = int(available_bytes or available_memory_bytes())
+    safe_bytes = int(available * fraction)
+    workspace_budget = max(0, safe_bytes - basis_bytes - geometry_bytes)
+
+    memory_limited_materials = max(1, pod_cap // material_snapshot_bytes)
+    requested_materials = (
+        memory_limited_materials
+        if max_material_batch is None
+        else max(1, int(max_material_batch))
+    )
+    rank_limited_materials = max(
+        1, workspace_budget // material_snapshot_bytes - 1
+    )
+    pod_material_limit = min(
+        memory_limited_materials,
+        requested_materials,
+        rank_limited_materials,
+    )
+    configured_q_block_size = min(
+        7, max(1, stress_cap // stress_coefficient_bytes)
+    )
+    rank_limited_q_block_size = max(
+        1, workspace_budget // stress_coefficient_bytes
+    )
+    affine_q_block_size = min(
+        configured_q_block_size, rank_limited_q_block_size
+    )
+    pod_workspace_bytes = pod_material_limit * material_snapshot_bytes
+    projection_row_block_size = min(6, 6 * pod_material_limit)
+    projection_workspace_bytes = projection_row_block_size * field_bytes
+    stress_workspace_bytes = affine_q_block_size * stress_coefficient_bytes
+    nonbasis_peak_bytes = geometry_bytes + max(
+        pod_workspace_bytes
+        + max(material_snapshot_bytes, projection_workspace_bytes),
+        stress_workspace_bytes,
+    )
+    estimated_peak = basis_bytes + nonbasis_peak_bytes
+    minimum_workspace_bytes = geometry_bytes + max(
+        2 * material_snapshot_bytes,
+        stress_coefficient_bytes,
+    )
+    max_safe_rank = max(
+        0, (safe_bytes - minimum_workspace_bytes) // field_bytes
+    )
+    return {
+        "available_memory_bytes": available,
+        "safe_memory_bytes": safe_bytes,
+        "estimated_peak_bytes": estimated_peak,
+        "nonbasis_peak_bytes": nonbasis_peak_bytes,
+        "max_safe_rank": max_safe_rank,
+        "basis_bytes": basis_bytes,
+        "field_bytes": field_bytes,
+        "material_snapshot_bytes": material_snapshot_bytes,
+        "pod_workspace_bytes": pod_workspace_bytes,
+        "pod_projection_workspace_bytes": projection_workspace_bytes,
+        "stress_workspace_bytes": stress_workspace_bytes,
+        "pod_batch_material_limit": pod_material_limit,
+        "pod_requested_material_batch": requested_materials,
+        "pod_memory_limited_material_batch": memory_limited_materials,
+        "pod_rank_limited_material_batch": rank_limited_materials,
+        "pod_projection_row_block_size": projection_row_block_size,
+        "affine_q_block_size": affine_q_block_size,
+        "affine_configured_q_block_size": configured_q_block_size,
+        "affine_rank_limited_q_block_size": rank_limited_q_block_size,
+        "workspace_budget_after_basis_bytes": workspace_budget,
+        "memory_safety_fraction": fraction,
+    }
+
+
+def rom_chunk_memory_plan(
+    *,
+    rank: int,
+    requested_chunk_size: int,
+    memory_max_gib: float,
+) -> dict[str, int | float]:
+    """Bound batched dense ROM workspaces, whose memory grows as O(chunk*r^2)."""
+    reduced_rank = int(rank)
+    requested = int(requested_chunk_size)
+    max_bytes = int(float(memory_max_gib) * 1024**3)
+    if reduced_rank < 1 or requested < 1 or max_bytes < 1:
+        raise ValueError("rank, chunk size, and ROM memory limit must be positive.")
+    bytes_per_query = 8 * (
+        4 * reduced_rank * reduced_rank + 12 * reduced_rank + 72
+    )
+    memory_limited_chunk = max(1, max_bytes // bytes_per_query)
+    effective_chunk = min(requested, memory_limited_chunk)
+    return {
+        "requested_chunk_size": requested,
+        "effective_chunk_size": effective_chunk,
+        "memory_limited_chunk_size": memory_limited_chunk,
+        "bytes_per_query_estimate": bytes_per_query,
+        "workspace_bytes_estimate": effective_chunk * bytes_per_query,
+        "memory_max_gib": float(memory_max_gib),
+    }
+
+
 @dataclass
 class GeometryData:
     source_run_dir: Path
@@ -137,7 +295,7 @@ def load_fixed_geometry(source_run_dir: Path) -> GeometryData:
     source_run_dir = Path(source_run_dir).resolve()
     geometry_dir = source_run_dir / "_fixed_geometry"
     manifest_path = geometry_dir / "geometry_manifest.json"
-    
+
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         design = manifest.get("design")
@@ -299,14 +457,21 @@ def solve_material(
     return record
 
 
-def load_snapshot_fields(material_dir: Path) -> list[np.ndarray]:
+def load_snapshot_fields(
+    material_dir: Path,
+    *,
+    dtype: str | np.dtype = np.float64,
+) -> list[np.ndarray]:
     material_dir = Path(material_dir)
+    field_dtype = np.dtype(dtype)
+    if field_dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+        raise ValueError("snapshot dtype must be float32 or float64.")
     field_dir = material_dir / "solution_fields"
     if field_dir.is_dir():
         return [
             np.asarray(
                 np.load(field_dir / f"fluctuation_load{load_id}.npy", mmap_mode="r"),
-                dtype=np.float64,
+                dtype=field_dtype,
             )
             for load_id in range(6)
         ]
@@ -314,7 +479,151 @@ def load_snapshot_fields(material_dir: Path) -> list[np.ndarray]:
     if not path.is_file():
         raise FileNotFoundError(f"No existe snapshot: {path} ni {field_dir}.")
     with np.load(path) as payload:
-        return [np.asarray(payload[f"fluctuation_load{load_id}"], dtype=np.float64) for load_id in range(6)]
+        return [
+            np.asarray(payload[f"fluctuation_load{load_id}"], dtype=field_dtype)
+            for load_id in range(6)
+        ]
+
+
+class ContiguousBasis:
+    """Preallocated full-rank POD storage without repeated basis copies."""
+
+    def __init__(
+        self,
+        capacity: int,
+        field_shape: tuple[int, ...],
+        *,
+        dtype: str | np.dtype = np.float32,
+        projection_row_block_size: int = 6,
+    ) -> None:
+        if int(capacity) < 1:
+            raise ValueError("basis capacity must be positive.")
+        self.field_shape = tuple(int(value) for value in field_shape)
+        self.dimension = int(np.prod(self.field_shape))
+        self.dtype = np.dtype(dtype)
+        if self.dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+            raise ValueError("basis dtype must be float32 or float64.")
+        if int(projection_row_block_size) < 1:
+            raise ValueError("projection_row_block_size must be positive.")
+        self.projection_row_block_size = int(projection_row_block_size)
+        self.last_projection_backend = "not_used"
+        self._values = np.empty((int(capacity), self.dimension), dtype=self.dtype)
+        self.rank = 0
+
+    def __len__(self) -> int:
+        return int(self.rank)
+
+    @property
+    def capacity(self) -> int:
+        return int(self._values.shape[0])
+
+    @property
+    def active_flat(self) -> np.ndarray:
+        return self._values[: self.rank]
+
+    @property
+    def active_fields(self) -> np.ndarray:
+        return self.active_flat.reshape((self.rank,) + self.field_shape)
+
+    def _project(self, values: np.ndarray, count: float) -> None:
+        basis = self.active_flat
+        coefficients = (values @ basis.T) / count
+        gemm = scipy_blas.sgemm if self.dtype == np.dtype(np.float32) else scipy_blas.dgemm
+        updated = gemm(
+            -1.0,
+            basis.T,
+            coefficients.T,
+            beta=1.0,
+            c=values.T,
+            overwrite_c=1,
+        )
+        if np.shares_memory(updated, values):
+            self.last_projection_backend = "scipy_blas_gemm_in_place"
+            return
+
+        # Unusual BLAS wrappers may copy the Fortran-contiguous transpose.
+        # Fall back to a bounded row workspace instead of retaining that copy.
+        del updated
+        self.last_projection_backend = "blocked_numpy_fallback"
+        block_size = min(self.projection_row_block_size, len(values))
+        workspace = np.empty((block_size, self.dimension), dtype=self.dtype)
+        for start in range(0, len(values), block_size):
+            end = min(start + block_size, len(values))
+            active_workspace = workspace[: end - start]
+            np.matmul(coefficients[start:end], basis, out=active_workspace)
+            values[start:end] -= active_workspace
+
+    def _append_values(self, values: np.ndarray, *, tolerance: float) -> np.ndarray:
+        values = np.asarray(values, dtype=self.dtype).reshape(-1, self.dimension)
+        count = float(self.dimension)
+        if self.rank:
+            self._project(values, count)
+        else:
+            self.last_projection_backend = "initial_block_no_projection"
+
+        gram = np.asarray((values @ values.T) / count, dtype=np.float64)
+        gram = 0.5 * (gram + gram.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(gram)
+        keep = eigenvalues > float(tolerance) ** 2
+        if not np.any(keep):
+            return self.active_fields[0:0]
+
+        indices = np.flatnonzero(keep)[::-1]
+        appended_count = int(len(indices))
+        if self.rank + appended_count > self.capacity:
+            raise MemoryError(
+                f"basis capacity {self.capacity} is smaller than requested rank "
+                f"{self.rank + appended_count}."
+            )
+        transform = (
+            eigenvectors[:, indices] / np.sqrt(eigenvalues[indices])
+        ).T.astype(self.dtype, copy=False)
+        start = self.rank
+        np.matmul(transform, values, out=self._values[start : start + appended_count])
+        self.rank += appended_count
+        return self.active_fields[start : self.rank]
+
+    def append_preordered(
+        self,
+        fields: np.ndarray,
+        *,
+        tolerance: float,
+    ) -> np.ndarray:
+        """Consume a contiguous block that already uses the basis voxel order."""
+        values = np.asarray(fields)
+        expected = (len(values),) + self.field_shape
+        if values.dtype != self.dtype or values.shape != expected or not values.flags.c_contiguous:
+            raise ValueError(
+                "preordered fields must be C-contiguous with the basis dtype and shape."
+            )
+        return self._append_values(values, tolerance=float(tolerance))
+
+    def append(
+        self,
+        fields: Any,
+        *,
+        tolerance: float,
+        voxel_order: np.ndarray | None = None,
+    ) -> np.ndarray:
+        incoming = [np.asarray(field, dtype=self.dtype) for field in fields]
+        if not incoming:
+            return self.active_fields[0:0]
+        if any(int(field.size) != self.dimension for field in incoming):
+            raise ValueError("incoming snapshot fields have incompatible sizes.")
+
+        if voxel_order is None:
+            if any(tuple(field.shape) != self.field_shape for field in incoming):
+                raise ValueError("incoming snapshot fields have incompatible shapes.")
+            values = np.stack(incoming, axis=0).reshape(len(incoming), self.dimension)
+        else:
+            order = np.asarray(voxel_order)
+            nvox = int(order.size)
+            if self.field_shape != (6, nvox):
+                raise ValueError("ordered basis storage must have shape (6, nvox).")
+            values = np.empty((len(incoming), 6, nvox), dtype=self.dtype)
+            for index, field in enumerate(incoming):
+                np.take(field.reshape(6, nvox), order, axis=1, out=values[index])
+        return self._append_values(values, tolerance=float(tolerance))
 
 
 def snapshot_dir(out_dir: Path, candidate_id: int) -> Path:
@@ -381,6 +690,66 @@ def ensure_snapshot(
 _ensure_snapshot = ensure_snapshot
 
 
+def _project_against_basis_blocks(
+    vector: np.ndarray,
+    basis: list[np.ndarray],
+    *,
+    basis_block_size: int,
+) -> None:
+    if not basis:
+        return
+    flat = vector.reshape(-1)
+    count = float(flat.size)
+    # A wider block turns many memory-bound level-2 products into one BLAS-3
+    # projection. Campaign machines have ample host RAM; cap the temporary so
+    # very high ranks still stream in bounded chunks.
+    max_block_bytes = 2 * 1024 * 1024 * 1024
+    bytes_per_field = max(int(flat.nbytes), 1)
+    block_size = max(
+        1,
+        min(int(basis_block_size), max(1, max_block_bytes // bytes_per_field)),
+    )
+    for start in range(0, len(basis), block_size):
+        block = np.stack(
+            [
+                np.asarray(base, dtype=np.float64).reshape(-1)
+                for base in basis[start : start + block_size]
+            ],
+            axis=0,
+        )
+        coefficients = block @ flat / count
+        flat -= coefficients @ block
+
+
+def _project_matrix_against_basis_blocks(
+    values: np.ndarray,
+    basis: list[np.ndarray],
+    *,
+    basis_block_size: int,
+) -> None:
+    """Project several snapshot fields in one pass over each basis block."""
+    if not basis:
+        return
+    flat = np.asarray(values, dtype=np.float64).reshape(len(values), -1)
+    count = float(flat.shape[1])
+    max_block_bytes = 2 * 1024 * 1024 * 1024
+    bytes_per_field = max(int(flat.shape[1] * flat.dtype.itemsize), 1)
+    block_size = max(
+        1,
+        min(int(basis_block_size), max(1, max_block_bytes // bytes_per_field)),
+    )
+    for start in range(0, len(basis), block_size):
+        block = np.stack(
+            [
+                np.asarray(base, dtype=np.float64).reshape(-1)
+                for base in basis[start : start + block_size]
+            ],
+            axis=0,
+        )
+        coefficients = flat @ block.T / count
+        flat -= coefficients @ block
+
+
 def append_orthonormal(
     basis: list[np.ndarray],
     fields: Any,
@@ -388,23 +757,102 @@ def append_orthonormal(
     tolerance: float,
     basis_block_size: int = 12,
 ) -> list[np.ndarray]:
-    appended: list[np.ndarray] = []
-    for field in fields:
-        vector = np.asarray(field, dtype=np.float64).copy()
-        for block in (basis, appended, basis, appended):
-            for base in block:
-                proj = float(np.mean(base * vector))
-                vector -= proj * base
-        norm = float(np.sqrt(max(np.mean(vector * vector), 0.0)))
-        if norm > float(tolerance):
-            vec_norm = vector / norm
-            appended.append(vec_norm)
-            basis.append(vec_norm)
+    incoming = [np.asarray(field, dtype=np.float64) for field in fields]
+    if not incoming:
+        return []
+
+    # Block modified Gram-Schmidt: project all six load snapshots together,
+    # then orthonormalize their tiny Gram matrix. This preserves the incoming
+    # snapshot subspace while avoiding a full basis sweep for every load.
+    values = np.stack(incoming, axis=0)
+    for _ in range(2):
+        _project_matrix_against_basis_blocks(
+            values,
+            basis,
+            basis_block_size=int(basis_block_size),
+        )
+    flat = values.reshape(len(values), -1)
+    count = float(flat.shape[1])
+    gram = (flat @ flat.T) / count
+    gram = 0.5 * (gram + gram.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(gram)
+    keep = eigenvalues > float(tolerance) ** 2
+    if not np.any(keep):
+        return []
+
+    # Eigenvectors are ordered from the smallest eigenvalue upward. Reversing
+    # them keeps the best-conditioned directions first and makes the retained
+    # block deterministic for a fixed snapshot set.
+    indices = np.flatnonzero(keep)[::-1]
+    transform = (eigenvectors[:, indices] / np.sqrt(eigenvalues[indices])).T
+    orthonormal = transform @ flat
+    appended = [
+        row.reshape(incoming[0].shape)
+        for row in orthonormal
+    ]
+    basis.extend(appended)
     return appended
 
 
 _append_orthonormal = append_orthonormal
 
+
+def save_basis_block(method_dir: Path, start_index: int, fields: list[np.ndarray]) -> None:
+    basis_dir = Path(method_dir) / "basis_fields"
+    basis_dir.mkdir(parents=True, exist_ok=True)
+    for offset, field in enumerate(fields):
+        np.save(basis_dir / f"basis_{int(start_index) + offset:04d}.npy", np.asarray(field))
+
+
+_save_basis_block = save_basis_block
+
+
+
+def load_operators(path: Path) -> dict[str, np.ndarray]:
+    with np.load(Path(path)) as payload:
+        return {
+            "Kq": np.asarray(payload["Kq"], dtype=np.float64),
+            "Bq": np.asarray(payload["Bq"], dtype=np.float64),
+            "Dq": np.asarray(payload["Dq"], dtype=np.float64),
+        }
+
+
+_load_operators = load_operators
+
+
+def update_reduced_operators(
+    *,
+    phase: np.ndarray,
+    ori: np.ndarray,
+    basis: np.ndarray | list[np.ndarray],
+    existing: dict[str, np.ndarray] | None,
+    new_fields: np.ndarray | list[np.ndarray],
+    affine_stress_batch: Any,
+    affine_q_block_size: int | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    import rom_reduced_operator as reduced
+
+    if existing is None:
+        Kq, Bq, Dq, metadata = reduced._assemble_reduced_operators(
+            phase=phase,
+            ori=ori,
+            basis=basis,
+            affine_stress_batch=affine_stress_batch,
+            affine_q_block_size=affine_q_block_size,
+        )
+    else:
+        old_basis = basis[: -len(new_fields)]
+        Kq, Bq, Dq, metadata = reduced._extend_reduced_operators(
+            existing=existing,
+            old_basis=old_basis,
+            new_basis=new_fields,
+            affine_stress_batch=affine_stress_batch,
+            affine_q_block_size=affine_q_block_size,
+        )
+    return {"Kq": Kq, "Bq": Bq, "Dq": Dq}, metadata
+
+
+_update_reduced_operators = update_reduced_operators
 
 
 def error_stats(frame: pd.DataFrame) -> dict[str, Any]:
@@ -426,4 +874,110 @@ def error_stats(frame: pd.DataFrame) -> dict[str, Any]:
 _error_stats = error_stats
 
 
+def update_consecutive_stopping(
+    error_max: float,
+    target_error: float,
+    previous_streak: int,
+) -> tuple[bool, int]:
+    """Update a stable threshold-crossing counter."""
+    passes = bool(float(error_max) <= float(target_error))
+    return passes, int(previous_streak) + 1 if passes else 0
 
+
+RANK_THRESHOLDS = (1.0e-2, 1.0e-3, 1.0e-4)
+RANK_DESCRIPTORS = (
+    "Vf_realized",
+    "aspect_ratio",
+    "A2_anisotropy",
+    "cluster_fraction_target",
+    "interface_density",
+    "Ripley_peak",
+    "D_star",
+    "n_fibers",
+)
+
+
+def threshold_tag(threshold: float) -> str:
+    exponent = int(round(-math.log10(float(threshold))))
+    return f"1e-{exponent}"
+
+
+def required_rank(curve: pd.DataFrame, threshold: float) -> dict[str, Any]:
+    ordered = curve.sort_values("rank").reset_index(drop=True)
+    errors = ordered["error_max"].to_numpy(dtype=float)
+    ranks = ordered["rank"].to_numpy(dtype=int)
+    suffix_max = np.maximum.accumulate(errors[::-1])[::-1]
+    first = np.flatnonzero(errors <= float(threshold))
+    stable = np.flatnonzero(suffix_max <= float(threshold))
+    return {
+        "first_rank": int(ranks[first[0]]) if len(first) else None,
+        "stable_rank": int(ranks[stable[0]]) if len(stable) else None,
+        "achieved": bool(len(stable)),
+        "max_tested_rank": int(ranks[-1]),
+        "error_at_max_rank": float(errors[-1]),
+    }
+
+
+def descriptor_correlations(summary: pd.DataFrame) -> pd.DataFrame:
+    from scipy.stats import pearsonr, spearmanr
+
+    geometry = summary.loc[summary["case_kind"] == "geometry"].copy()
+    rows: list[dict[str, Any]] = []
+    for threshold in RANK_THRESHOLDS:
+        rank_column = f"r_{threshold_tag(threshold)}"
+        if rank_column not in geometry:
+            continue
+        for descriptor in RANK_DESCRIPTORS:
+            if descriptor not in geometry:
+                continue
+            subset = geometry[[descriptor, rank_column]].dropna()
+            x = subset[descriptor].to_numpy(dtype=float)
+            y = subset[rank_column].to_numpy(dtype=float)
+            if len(subset) >= 3 and np.ptp(x) > 0.0 and np.ptp(y) > 0.0:
+                pearson = pearsonr(x, y)
+                spearman = spearmanr(x, y)
+                pearson_r = float(pearson.statistic)
+                pearson_p = float(pearson.pvalue)
+                spearman_rho = float(spearman.statistic)
+                spearman_p = float(spearman.pvalue)
+            else:
+                pearson_r = pearson_p = spearman_rho = spearman_p = np.nan
+            rows.append(
+                {
+                    "threshold": threshold,
+                    "rank_column": rank_column,
+                    "descriptor": descriptor,
+                    "geometry_count": int(len(subset)),
+                    "censored_count": int(len(geometry) - len(subset)),
+                    "pearson_r": pearson_r,
+                    "pearson_p": pearson_p,
+                    "spearman_rho": spearman_rho,
+                    "spearman_p": spearman_p,
+                    "interpretation": "exploratory_n10_not_universal_law",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def isotropic_moduli(E: float, nu: float) -> tuple[float, float]:
+    return E / (3.0 * (1.0 - 2.0 * nu)), E / (2.0 * (1.0 + nu))
+
+
+def hashin_shtrikman_bounds(
+    K1: float,
+    G1: float,
+    K2: float,
+    G2: float,
+    volume_fraction_2: float,
+) -> tuple[float, float, float, float]:
+    if not (K2 > K1 > 0.0 and G2 > G1 > 0.0):
+        raise ValueError("Phase 2 must be strictly stiffer than phase 1.")
+    vf = float(volume_fraction_2)
+    vm = 1.0 - vf
+    zeta1 = G1 * (9.0 * K1 + 8.0 * G1) / (6.0 * (K1 + 2.0 * G1))
+    zeta2 = G2 * (9.0 * K2 + 8.0 * G2) / (6.0 * (K2 + 2.0 * G2))
+    K_lower = K1 + vf / (1.0 / (K2 - K1) + vm / (K1 + 4.0 * G1 / 3.0))
+    K_upper = K2 + vm / (1.0 / (K1 - K2) + vf / (K2 + 4.0 * G2 / 3.0))
+    G_lower = G1 + vf / (1.0 / (G2 - G1) + vm / (G1 + zeta1))
+    G_upper = G2 + vm / (1.0 / (G1 - G2) + vf / (G2 + zeta2))
+    return K_lower, K_upper, G_lower, G_upper

@@ -12,7 +12,56 @@ for path in (ROOT / "FFT", ROOT / "scripts"):
         sys.path.insert(0, str(path))
 
 from pipeline.fft_solver import solve_homogenization
-import schur_energy_indicators as qoi
+
+
+MANDEL_PAIRS = ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1))
+MANDEL_FACTORS = np.array((1.0, 1.0, 1.0, np.sqrt(2.0), np.sqrt(2.0), np.sqrt(2.0)))
+
+
+def _frequency_unit_vectors(shape: tuple[int, int, int]) -> tuple[np.ndarray, np.ndarray]:
+    grids = np.meshgrid(*[np.fft.fftfreq(size) for size in shape], indexing="ij")
+    frequency = np.asarray(grids, dtype=float)
+    norm = np.sqrt(np.sum(frequency * frequency, axis=0))
+    nonzero = norm > 0.0
+    unit = np.zeros_like(frequency)
+    unit[:, nonzero] = frequency[:, nonzero] / norm[nonzero]
+    return unit, nonzero
+
+
+def _mandel_to_tensor(field: np.ndarray, shape: tuple[int, int, int]) -> np.ndarray:
+    values = np.asarray(field).reshape(6, *shape)
+    tensor = np.empty((3, 3, *shape), dtype=values.dtype)
+    for component, (ii, jj) in enumerate(MANDEL_PAIRS):
+        tensor[ii, jj] = values[component] / MANDEL_FACTORS[component]
+        tensor[jj, ii] = tensor[ii, jj]
+    return tensor
+
+
+def _tensor_to_mandel(tensor: np.ndarray) -> np.ndarray:
+    shape = tensor.shape[2:]
+    values = np.empty((6, int(np.prod(shape))), dtype=tensor.dtype)
+    for component, (ii, jj) in enumerate(MANDEL_PAIRS):
+        values[component] = (MANDEL_FACTORS[component] * tensor[ii, jj]).reshape(-1)
+    return values
+
+
+def _project_compatible(
+    field: np.ndarray,
+    *,
+    shape: tuple[int, int, int],
+    unit: np.ndarray,
+    nonzero: np.ndarray,
+) -> np.ndarray:
+    fourier = np.fft.fftn(_mandel_to_tensor(field, shape), axes=(2, 3, 4))
+    traction = np.einsum("ijxyz,jxyz->ixyz", fourier, unit, optimize=True)
+    parallel = unit * np.einsum("ixyz,ixyz->xyz", traction, unit, optimize=True)[None]
+    displacement = 2.0 * (traction - parallel) + parallel
+    projected = 0.5 * (
+        np.einsum("ixyz,jxyz->ijxyz", unit, displacement, optimize=True)
+        + np.einsum("ixyz,jxyz->ijxyz", displacement, unit, optimize=True)
+    )
+    projected[:, :, ~nonzero] = 0.0
+    return _tensor_to_mandel(np.fft.ifftn(projected, axes=(2, 3, 4)).real)
 
 
 def isotropic_mandel(E: float, nu: float) -> np.ndarray:
@@ -107,9 +156,9 @@ def test_compatibility_equilibrium_and_hill_mandel(tmp_path: Path):
     fluctuation = np.einsum("l,lcxyz->cxyz", macro, fluctuations, optimize=True)
     assert np.linalg.norm(fluctuation.mean(axis=(1, 2, 3))) < 1.0e-12
     shape = tuple(int(value) for value in phase.shape)
-    nvec, nonzero = qoi._frequency_unit_vectors(shape)
-    compatible = qoi._project_compatible(
-        fluctuation.reshape(6, -1), shape=shape, nvec=nvec, nonzero=nonzero
+    nvec, nonzero = _frequency_unit_vectors(shape)
+    compatible = _project_compatible(
+        fluctuation.reshape(6, -1), shape=shape, unit=nvec, nonzero=nonzero
     ).reshape(fluctuation.shape)
     compatibility_error = np.linalg.norm(fluctuation - compatible) / np.linalg.norm(fluctuation)
     assert compatibility_error < 2.0e-9
@@ -120,8 +169,8 @@ def test_compatibility_equilibrium_and_hill_mandel(tmp_path: Path):
     fiber = ~matrix
     stress[:, matrix] = C0 @ total_strain[:, matrix]
     stress[:, fiber] = C1 @ total_strain[:, fiber]
-    residual = qoi._project_compatible(
-        stress.reshape(6, -1), shape=shape, nvec=nvec, nonzero=nonzero
+    residual = _project_compatible(
+        stress.reshape(6, -1), shape=shape, unit=nvec, nonzero=nonzero
     )
     equilibrium_error = np.linalg.norm(residual) / np.linalg.norm(stress)
     assert equilibrium_error < 2.0e-9
