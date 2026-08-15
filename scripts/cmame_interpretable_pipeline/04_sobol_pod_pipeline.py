@@ -14,6 +14,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from env_bootstrap import ensure_configured_venv
+from validation_reporting import empirical_coverage
 
 
 ensure_configured_venv(CONFIG_DEFAULT)
@@ -325,10 +326,15 @@ def solve_truth_pool(
     return pd.DataFrame(rows)
 
 
-def error_stats(frame: pd.DataFrame, *, id_column: str) -> dict[str, Any]:
+def error_stats(
+    frame: pd.DataFrame,
+    *,
+    id_column: str,
+    report_threshold: float | None = None,
+) -> dict[str, Any]:
     errors = frame["relative_frobenius_error"].to_numpy(dtype=float)
     worst = int(np.argmax(errors))
-    return {
+    stats = {
         "count": int(len(frame)),
         "error_mean": float(np.mean(errors)),
         "error_median": float(np.median(errors)),
@@ -338,6 +344,9 @@ def error_stats(frame: pd.DataFrame, *, id_column: str) -> dict[str, Any]:
         "rom_online_mean_s": float(frame["rom_online_s"].mean()),
         "rom_online_p95_s": float(frame["rom_online_s"].quantile(0.95)),
     }
+    if report_threshold is not None:
+        stats.update(empirical_coverage(errors, report_threshold))
+    return stats
 
 
 def candidate_rom_cloud(
@@ -483,6 +492,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--basis-profile", choices=tuple(common.SOLVER_PROFILES), default=str(pipeline.get("basis_profile", "snapshot")))
     parser.add_argument("--truth-profile", choices=tuple(common.SOLVER_PROFILES), default=str(pipeline.get("truth_profile", "snapshot")))
     parser.add_argument("--target-error", type=float, default=float(pipeline.get("target_error", 1.0e-4)))
+    parser.add_argument(
+        "--validation-report-threshold",
+        type=float,
+        default=float(pipeline.get("validation_report_threshold", 1.0e-4)),
+    )
     parser.add_argument("--basis-tolerance", type=float, default=float(pipeline.get("basis_tolerance", 1.0e-12)))
     parser.add_argument(
         "--basis-dtype",
@@ -545,6 +559,15 @@ def main() -> int:
             raise ValueError("start_materials must be positive.")
         if int(args.stopping_consecutive) < 1:
             raise ValueError("stopping_consecutive must be positive.")
+        if not np.isfinite(float(args.target_error)) or float(args.target_error) <= 0.0:
+            raise ValueError("target_error must be finite and positive.")
+        if (
+            not np.isfinite(float(args.validation_report_threshold))
+            or float(args.validation_report_threshold) <= 0.0
+        ):
+            raise ValueError(
+                "validation_report_threshold must be finite and positive."
+            )
         if len({int(args.candidate_seed), int(args.monitor_seed), int(args.final_validation_seed)}) != 3:
             raise ValueError(
                 "candidate_seed, monitor_seed, and final_validation_seed must be distinct."
@@ -928,11 +951,20 @@ def main() -> int:
         )
         final_validation_rom.insert(1, "training_materials", int(stop_materials))
         final_validation_rom.insert(2, "pod_rank", int(final_basis_rank))
+        final_validation_rom["relative_frobenius_error_percent"] = (
+            100.0 * final_validation_rom["relative_frobenius_error"]
+        )
+        final_validation_rom["below_report_threshold"] = (
+            final_validation_rom["relative_frobenius_error"]
+            <= float(args.validation_report_threshold)
+        )
         final_validation_rom.to_csv(
             run_dir / "final_validation_rom_results.csv", index=False
         )
         final_stats = error_stats(
-            final_validation_rom, id_column="final_validation_id"
+            final_validation_rom,
+            id_column="final_validation_id",
+            report_threshold=float(args.validation_report_threshold),
         )
         validation_stage_wall_s = float(time.perf_counter() - validation_started)
 
@@ -1026,7 +1058,24 @@ def main() -> int:
             "final_validation_passes_target": bool(
                 final_stats["error_max"] <= float(args.target_error)
             ),
+            "final_validation_passes_stop_target": bool(
+                final_stats["error_max"] <= float(args.target_error)
+            ),
+            "final_validation_all_below_report_threshold": bool(
+                final_stats["observed_above_threshold_count"] == 0
+            ),
+            "final_validation_below_report_threshold_count": int(
+                final_stats["observed_below_threshold_count"]
+            ),
+            "final_validation_above_report_threshold_count": int(
+                final_stats["observed_above_threshold_count"]
+            ),
+            "final_validation_below_report_threshold_percent": float(
+                final_stats["observed_below_threshold_percent"]
+            ),
             "target_error": float(args.target_error),
+            "training_stop_target_error": float(args.target_error),
+            "validation_report_threshold": float(args.validation_report_threshold),
             "snapshot_total_solve_wall_s": float(pd.DataFrame(snapshot_rows)["solve_wall_s"].sum()),
             "snapshot_total_step_wall_s": float(pd.DataFrame(snapshot_rows)["snapshot_step_wall_s"].sum()),
             "basis_update_total_wall_s": float(pd.DataFrame(snapshot_rows)["basis_update_wall_s"].sum()),

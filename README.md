@@ -31,6 +31,10 @@ affine kernels, and keeps the small reduced algebra in `float64`. Online
 material batches use vectorized maps and CUDA when available. A fixed
 16-material FFT monitor set controls adaptive stopping; a second independent
 16-material FFT set validates the frozen ROM and never controls construction.
+The internal stopping target is `1e-5`; the independent validation reports the
+observed count and percentage below `1e-4`, equivalent to `0.01%` relative
+Frobenius error. This percentage is empirical and is not presented as coverage
+of the entire continuous material domain.
 
 The next campaign uses odd grids (`61`, `151`, and `241` per side) in a new
 output root so it cannot be mixed with the completed even-grid runs. The

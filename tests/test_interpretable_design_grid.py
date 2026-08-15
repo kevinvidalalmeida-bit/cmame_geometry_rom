@@ -12,6 +12,7 @@ if str(PIPELINE) not in sys.path:
     sys.path.insert(0, str(PIPELINE))
 
 from design_grid import rounded_grid_size
+from validation_reporting import empirical_coverage
 
 
 @pytest.mark.parametrize(
@@ -37,3 +38,12 @@ def test_any_parity_preserves_existing_rounding() -> None:
 def test_odd_grid_rejects_even_multiple() -> None:
     with pytest.raises(ValueError, match="odd grid"):
         rounded_grid_size(60.0, multiple=2, parity="odd_up")
+
+
+def test_empirical_coverage_reports_counts_and_percent_units() -> None:
+    summary = empirical_coverage([1.0e-5, 1.0e-4, 2.0e-4], 1.0e-4)
+    assert summary["observed_count"] == 3
+    assert summary["observed_below_threshold_count"] == 2
+    assert summary["observed_above_threshold_count"] == 1
+    assert summary["observed_below_threshold_percent"] == pytest.approx(200.0 / 3.0)
+    assert summary["report_threshold_percent"] == pytest.approx(0.01)

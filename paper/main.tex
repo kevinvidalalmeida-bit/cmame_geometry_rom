@@ -968,14 +968,30 @@ on \(\Xi_M\) after every newly appended material. Enrichment stops when
 \(\max_j e_{M,j}\leq\varepsilon_{\mathrm{ROM}}\) for two consecutive Sobol
 prefixes. The consecutive requirement prevents a single nonmonotone crossing
 from terminating the process. The training sequence remains Sobol ordered;
-the monitor set determines only when its prefix is long enough.
+the monitor set determines only when its prefix is long enough. For the
+elasticity campaign, the internal stopping value is
+\(\varepsilon_{\mathrm{ROM}}=10^{-5}\), one order of magnitude below the
+reported accuracy threshold.
 
 After stopping, the reduced operators are frozen. Only then are the
 \(N_V=16\) final-validation materials solved with the full-order model and
 evaluated once with the ROM. The reported final statistics are the mean,
-median, 95th percentile, and maximum of \(e_{V,j}\). Because \(\Xi_V\) is not
-examined during enrichment, it provides an assessment distinct from the
-monitor-driven stopping decision.
+median, 95th percentile, and maximum of \(e_{V,j}\). In addition, for
+\(\varepsilon_{\mathrm{rep}}=10^{-4}\), the reported empirical coverage is
+\begin{equation}
+\label{eq:validation_coverage}
+N_{\mathrm{pass}}
+=
+\sum_{j=1}^{N_V}
+\mathbf{1}\!\left[e_{V,j}\leq\varepsilon_{\mathrm{rep}}\right],
+\qquad
+\widehat p_{\mathrm{pass}}=\frac{N_{\mathrm{pass}}}{N_V}.
+\end{equation}
+The threshold \(10^{-4}\) corresponds to \(0.01\%\) relative Frobenius error
+in Eq.~\eqref{eq:validation_error}. It is a tensor-norm criterion, not a
+componentwise bound. Because \(\Xi_V\) is finite and is not examined during
+enrichment, \(\widehat p_{\mathrm{pass}}\) is an independent empirical result,
+not a certificate over the continuous parameter domain.
 
 \subsection{Offline--online summary}
 \label{subsec:offline_online}
@@ -1007,7 +1023,8 @@ operators.
 \item Freeze the final reduced operators and discard the microscopic snapshots
       and POD basis.
 \item Solve the \(N_V=16\) final-validation materials once, evaluate
-      Eq.~\eqref{eq:validation_error}, and report the final error statistics.
+      Eq.~\eqref{eq:validation_error}, and report the final error statistics
+      together with the observed count and percentage below \(10^{-4}\).
 \item \textbf{Online material query.}
 \item Given \(\boldsymbol\xi^\star\), evaluate
       \(\boldsymbol\gamma(\boldsymbol\xi^\star)\).

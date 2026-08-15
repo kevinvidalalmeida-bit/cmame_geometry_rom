@@ -22,6 +22,8 @@ ensure_configured_venv(CONFIG_DEFAULT)
 
 import pandas as pd
 
+from validation_reporting import empirical_coverage
+
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/cmame-matplotlib")
 
@@ -179,6 +181,8 @@ def command_for_geometry(
         str(pipe.get("truth_profile", "snapshot")),
         "--target-error",
         str(float(pipe.get("target_error", 1.0e-4))),
+        "--validation-report-threshold",
+        str(float(pipe.get("validation_report_threshold", 1.0e-4))),
         "--basis-tolerance",
         str(float(pipe.get("basis_tolerance", 1.0e-12))),
         "--basis-dtype",
@@ -277,7 +281,13 @@ def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) ->
                 markersize=3.8,
                 label=f"g{int(geometry_id):02d}",
             )
-        ax.axhline(float(target_error), color="black", linestyle="--", linewidth=1.0, label="1e-4 target")
+        ax.axhline(
+            float(target_error),
+            color="black",
+            linestyle="--",
+            linewidth=1.0,
+            label=f"{target_error:.0e} stop target",
+        )
         ax.set_xlabel("Sobol training materials used for POD")
         ax.set_ylabel("maximum relative error on the FFT monitor set")
         ax.grid(True, which="both", alpha=0.25)
@@ -287,6 +297,47 @@ def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) ->
         plt.close(fig)
     except Exception as exc:  # pragma: no cover - paper artifact only
         print(f"[STEP3] summary plot skipped: {exc}", flush=True)
+
+
+def validation_coverage_tables(
+    summaries: list[dict[str, Any]], report_threshold: float
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    frames: list[pd.DataFrame] = []
+    coverage_rows: list[dict[str, Any]] = []
+    for summary in summaries:
+        path = Path(str(summary.get("final_validation_rom_csv", "")))
+        frame = read_csv_if_exists(path)
+        if frame.empty or "relative_frobenius_error" not in frame:
+            continue
+        geometry_id = int(summary["geometry_id"])
+        frame.insert(0, "geometry_id", geometry_id)
+        frame["relative_frobenius_error_percent"] = (
+            100.0 * frame["relative_frobenius_error"]
+        )
+        frame["below_report_threshold"] = (
+            frame["relative_frobenius_error"] <= float(report_threshold)
+        )
+        frames.append(frame)
+        coverage_rows.append(
+            {
+                "scope": f"geometry_{geometry_id:02d}",
+                **empirical_coverage(
+                    frame["relative_frobenius_error"], report_threshold
+                ),
+            }
+        )
+
+    details = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not details.empty:
+        coverage_rows.append(
+            {
+                "scope": "all_geometry_material_pairs",
+                **empirical_coverage(
+                    details["relative_frobenius_error"], report_threshold
+                ),
+            }
+        )
+    return details, pd.DataFrame(coverage_rows)
 
 
 def write_campaign_summary(
@@ -303,9 +354,23 @@ def write_campaign_summary(
     curve = pd.concat(curves, ignore_index=True) if curves else pd.DataFrame()
     summary = pd.DataFrame(summaries)
     commands = pd.DataFrame(command_rows)
+    report_threshold = float(
+        config.get("sobol_pod_pipeline", {}).get(
+            "validation_report_threshold", 1.0e-4
+        )
+    )
+    validation, validation_coverage = validation_coverage_tables(
+        summaries, report_threshold
+    )
     curve.to_csv(summary_dir / "sobol_pod_multigeometry_curve.csv", index=False)
     summary.to_csv(summary_dir / "sobol_pod_multigeometry_summary.csv", index=False)
     commands.to_csv(summary_dir / "execution_commands.csv", index=False)
+    validation.to_csv(
+        summary_dir / "sobol_pod_multigeometry_validation.csv", index=False
+    )
+    validation_coverage.to_csv(
+        summary_dir / "sobol_pod_validation_coverage.csv", index=False
+    )
     target_error = float(
         config.get("sobol_pod_pipeline", {}).get("target_error", 1.0e-4)
     )
@@ -318,6 +383,8 @@ def write_campaign_summary(
     with pd.ExcelWriter(summary_dir / "sobol_pod_multigeometry_tables.xlsx") as writer:
         summary.to_excel(writer, sheet_name="summary", index=False)
         curve.to_excel(writer, sheet_name="error_curve", index=False)
+        validation.to_excel(writer, sheet_name="final_validation", index=False)
+        validation_coverage.to_excel(writer, sheet_name="validation_coverage", index=False)
         commands.to_excel(writer, sheet_name="commands", index=False)
     (summary_dir / "campaign_config_snapshot.json").write_text(
         json.dumps(config, indent=2, sort_keys=True),

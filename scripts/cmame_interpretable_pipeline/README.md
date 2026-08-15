@@ -46,10 +46,17 @@ Default choices:
 - FFT precision: training, monitoring, and final validation use `float64` with
   `rtol=1e-8`. Snapshot/POD storage and contractions remain contiguous
   `float32`; reduced operators and online solves remain `float64`.
-- Adaptive stop: solve `16` independent FFT monitor materials once, evaluate from training material 2 onward, and stop after the maximum monitor error is below `1e-4` twice consecutively.
+- Adaptive stop: solve `16` independent FFT monitor materials once, evaluate
+  from training material 2 onward, and stop after the maximum monitor error is
+  below `1e-5` twice consecutively. This stricter internal target provides one
+  order of magnitude of margin for the reported `1e-4` accuracy threshold.
 - Final validation: after freezing the ROM, solve a new independent set of
   `16` FFT materials exactly once with `truth_profile=snapshot` (`float64`,
-  `rtol=1e-8`). These final points never control training.
+  `rtol=1e-8`). These final points never control training. The output reports
+  the count and percentage with relative Frobenius error at or below `1e-4`.
+  Since `100 * 1e-4 = 0.01`, that threshold means `0.01%` relative tensor-norm
+  error on each observed geometry-material pair; it is not a global-domain
+  guarantee or a componentwise error bound.
 - Training limit: `0` means continue until convergence, bounded only by the 1024-candidate pool and the exact full-rank memory preflight.
 - Online timing: evaluate the final ROM at `10000` independent material points.
 - Memory controls: POD and affine-stress workspaces are capped at `8 GiB`, ROM
