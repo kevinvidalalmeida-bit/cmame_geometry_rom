@@ -874,16 +874,6 @@ def error_stats(frame: pd.DataFrame) -> dict[str, Any]:
 _error_stats = error_stats
 
 
-def update_consecutive_stopping(
-    error_max: float,
-    target_error: float,
-    previous_streak: int,
-) -> tuple[bool, int]:
-    """Update a stable threshold-crossing counter."""
-    passes = bool(float(error_max) <= float(target_error))
-    return passes, int(previous_streak) + 1 if passes else 0
-
-
 RANK_THRESHOLDS = (1.0e-2, 1.0e-3, 1.0e-4)
 RANK_DESCRIPTORS = (
     "Vf_realized",

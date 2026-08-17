@@ -978,13 +978,13 @@ After stopping, the reduced operators are frozen. Only then are the
 \(N_V=16\) final-validation materials solved with the full-order model and
 evaluated once with the ROM. The reported final statistics are the mean,
 median, 95th percentile, and maximum of \(e_{V,j}\). In addition, for
-\(\varepsilon_{\mathrm{rep}}=10^{-4}\), the reported empirical coverage is
+the same \(\varepsilon_{\mathrm{ROM}}=10^{-4}\), the reported empirical coverage is
 \begin{equation}
 \label{eq:validation_coverage}
 N_{\mathrm{pass}}
 =
 \sum_{j=1}^{N_V}
-\mathbf{1}\!\left[e_{V,j}\leq\varepsilon_{\mathrm{rep}}\right],
+\mathbf{1}\!\left[e_{V,j}\leq\varepsilon_{\mathrm{ROM}}\right],
 \qquad
 \widehat p_{\mathrm{pass}}=\frac{N_{\mathrm{pass}}}{N_V}.
 \end{equation}

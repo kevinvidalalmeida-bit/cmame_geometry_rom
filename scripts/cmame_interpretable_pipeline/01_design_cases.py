@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from env_bootstrap import ensure_configured_venv
-from design_grid import rounded_grid_size
 
 
 HERE = Path(__file__).resolve().parent
@@ -85,7 +84,6 @@ def design_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
     box_factor = float(design_space["box_factor"])
     target_resolution = float(design_space["resolution_vox_per_um"])
     nvox_multiple = int(design_space["nvox_multiple"])
-    grid_parity = str(design_space.get("grid_parity", "any"))
     campaign_id = str(config["campaign_id"])
 
     rows: list[dict[str, Any]] = []
@@ -96,10 +94,10 @@ def design_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
         a11, a22, a33 = (float(value) for value in case["A2"])
         length_um = ar * diameter_um
         box_um = box_factor * length_um
-        nominal_grid_size, grid_size = rounded_grid_size(
-            box_um * target_resolution,
-            nvox_multiple,
-            grid_parity,
+        grid_size = max(
+            8,
+            int(round(box_um * target_resolution / nvox_multiple))
+            * nvox_multiple,
         )
         resolution = grid_size / box_um
         fiber_count = nominal_fiber_count(vf, box_um, length_um, diameter_um)
@@ -127,9 +125,6 @@ def design_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
                 "fiber_length_um": length_um,
                 "box_um": box_um,
                 "grid_size": grid_size,
-                "grid_size_nominal": nominal_grid_size,
-                "grid_parity": grid_parity,
-                "grid_parity_adjustment": grid_size - nominal_grid_size,
                 "resolution_vox_per_um": resolution,
                 "df_voxel": diameter_um * resolution,
                 "Lf_Ldom": length_um / box_um,

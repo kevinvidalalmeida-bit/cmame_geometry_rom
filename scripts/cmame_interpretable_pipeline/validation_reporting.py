@@ -22,13 +22,13 @@ def empirical_coverage(errors: Iterable[float], threshold: float) -> dict[str, f
     count = int(values.size)
     fraction = passed / count
     return {
-        "report_threshold": threshold,
-        "report_threshold_percent": 100.0 * threshold,
+        "target_error": threshold,
+        "target_error_percent": 100.0 * threshold,
         "observed_count": count,
-        "observed_below_threshold_count": passed,
-        "observed_above_threshold_count": count - passed,
-        "observed_below_threshold_fraction": fraction,
-        "observed_below_threshold_percent": 100.0 * fraction,
+        "below_target_count": passed,
+        "above_target_count": count - passed,
+        "below_target_fraction": fraction,
+        "below_target_percent": 100.0 * fraction,
         "observed_error_max": float(np.max(values)),
         "observed_error_max_percent": 100.0 * float(np.max(values)),
     }

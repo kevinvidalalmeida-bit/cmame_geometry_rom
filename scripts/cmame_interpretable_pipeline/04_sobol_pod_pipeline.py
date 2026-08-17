@@ -330,7 +330,7 @@ def error_stats(
     frame: pd.DataFrame,
     *,
     id_column: str,
-    report_threshold: float | None = None,
+    threshold: float | None = None,
 ) -> dict[str, Any]:
     errors = frame["relative_frobenius_error"].to_numpy(dtype=float)
     worst = int(np.argmax(errors))
@@ -344,8 +344,8 @@ def error_stats(
         "rom_online_mean_s": float(frame["rom_online_s"].mean()),
         "rom_online_p95_s": float(frame["rom_online_s"].quantile(0.95)),
     }
-    if report_threshold is not None:
-        stats.update(empirical_coverage(errors, report_threshold))
+    if threshold is not None:
+        stats.update(empirical_coverage(errors, threshold))
     return stats
 
 
@@ -481,7 +481,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional operational cap; zero uses the memory-safe candidate limit.",
     )
     parser.add_argument("--monitor-count", type=int, default=int(pipeline.get("monitor_count", 16)))
-    parser.add_argument("--stopping-consecutive", type=int, default=int(pipeline.get("stopping_consecutive", 1)))
     parser.add_argument("--final-validation-count", type=int, default=int(pipeline.get("final_validation_count", 16)))
     parser.add_argument("--candidate-seed", type=int, default=int(pipeline.get("candidate_seed", 20260821)))
     parser.add_argument("--monitor-seed", type=int, default=int(pipeline.get("monitor_seed", 20260822)))
@@ -492,11 +491,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--basis-profile", choices=tuple(common.SOLVER_PROFILES), default=str(pipeline.get("basis_profile", "snapshot")))
     parser.add_argument("--truth-profile", choices=tuple(common.SOLVER_PROFILES), default=str(pipeline.get("truth_profile", "snapshot")))
     parser.add_argument("--target-error", type=float, default=float(pipeline.get("target_error", 1.0e-4)))
-    parser.add_argument(
-        "--validation-report-threshold",
-        type=float,
-        default=float(pipeline.get("validation_report_threshold", 1.0e-4)),
-    )
     parser.add_argument("--basis-tolerance", type=float, default=float(pipeline.get("basis_tolerance", 1.0e-12)))
     parser.add_argument(
         "--basis-dtype",
@@ -557,17 +551,8 @@ def main() -> int:
     try:
         if int(args.start_materials) < 1:
             raise ValueError("start_materials must be positive.")
-        if int(args.stopping_consecutive) < 1:
-            raise ValueError("stopping_consecutive must be positive.")
         if not np.isfinite(float(args.target_error)) or float(args.target_error) <= 0.0:
             raise ValueError("target_error must be finite and positive.")
-        if (
-            not np.isfinite(float(args.validation_report_threshold))
-            or float(args.validation_report_threshold) <= 0.0
-        ):
-            raise ValueError(
-                "validation_report_threshold must be finite and positive."
-            )
         if len({int(args.candidate_seed), int(args.monitor_seed), int(args.final_validation_seed)}) != 3:
             raise ValueError(
                 "candidate_seed, monitor_seed, and final_validation_seed must be distinct."
@@ -639,11 +624,11 @@ def main() -> int:
                 f"memory-safe limit of {safe_material_limit} materials."
             )
         training_limit = requested_limit or safe_material_limit
-        minimum_required = int(args.start_materials) + int(args.stopping_consecutive) - 1
+        minimum_required = int(args.start_materials)
         if training_limit < minimum_required:
             raise MemoryError(
                 f"Only {training_limit} materials fit, but at least {minimum_required} "
-                "are required to evaluate the stable stopping rule."
+                "are required to evaluate the stopping rule."
             )
         memory_plan = common.full_rank_memory_plan(
             nvox=int(geometry.phase.size),
@@ -698,7 +683,6 @@ def main() -> int:
                 "monitor_count": int(len(monitor)),
                 "monitor_seed": int(args.monitor_seed),
                 "monitor_start_materials": int(args.start_materials),
-                "stopping_consecutive": int(args.stopping_consecutive),
                 "final_validation_policy": "new_independent_fft_pool_after_freeze",
                 "final_validation_count": int(args.final_validation_count),
                 "final_validation_seed": int(args.final_validation_seed),
@@ -764,8 +748,6 @@ def main() -> int:
         curve_rows: list[dict[str, Any]] = []
         monitor_frames: list[pd.DataFrame] = []
         candidate_ids = sequence["candidate_id"].astype(int).tolist()
-        stopping_streak = 0
-        first_monitor_pass: int | None = None
         stop_materials: int | None = None
         last_monitor_stats: dict[str, Any] | None = None
         monitor_rom_total_wall_s = 0.0
@@ -829,12 +811,7 @@ def main() -> int:
             frame.insert(1, "training_materials", int(training_materials))
             frame.insert(2, "pod_rank", int(len(basis)))
             stats = error_stats(frame, id_column="monitor_id")
-            passes, stopping_streak = common.update_consecutive_stopping(
-                stats["error_max"], float(args.target_error), stopping_streak
-            )
-            if passes and first_monitor_pass is None:
-                first_monitor_pass = int(training_materials)
-            stop_triggered = stopping_streak >= int(args.stopping_consecutive)
+            passes = bool(stats["error_max"] <= float(args.target_error))
             last_monitor_stats = stats
             monitor_frames.append(frame)
             curve_rows.append(
@@ -854,8 +831,7 @@ def main() -> int:
                     "monitor_error_p95": stats["error_p95"],
                     "monitor_error_max": stats["error_max"],
                     "passes_target_max": passes,
-                    "consecutive_passes": int(stopping_streak),
-                    "stop_triggered": bool(stop_triggered),
+                    "stop_triggered": passes,
                     "rom_online_mean_s": stats["rom_online_mean_s"],
                     "worst_monitor_id": stats["worst_monitor_id"],
                 }
@@ -869,10 +845,10 @@ def main() -> int:
             print(
                 f"[SOBOL-POD] monitor materials={training_materials} | "
                 f"rank={len(basis)} | error_max={stats['error_max']:.3e} | "
-                f"streak={stopping_streak}/{int(args.stopping_consecutive)}",
+                f"target={float(args.target_error):.1e}",
                 flush=True,
             )
-            if stop_triggered:
+            if passes:
                 stop_materials = int(training_materials)
                 break
         training_stage_wall_s = float(time.perf_counter() - training_started)
@@ -954,9 +930,9 @@ def main() -> int:
         final_validation_rom["relative_frobenius_error_percent"] = (
             100.0 * final_validation_rom["relative_frobenius_error"]
         )
-        final_validation_rom["below_report_threshold"] = (
+        final_validation_rom["below_target"] = (
             final_validation_rom["relative_frobenius_error"]
-            <= float(args.validation_report_threshold)
+            <= float(args.target_error)
         )
         final_validation_rom.to_csv(
             run_dir / "final_validation_rom_results.csv", index=False
@@ -964,7 +940,7 @@ def main() -> int:
         final_stats = error_stats(
             final_validation_rom,
             id_column="final_validation_id",
-            report_threshold=float(args.validation_report_threshold),
+            threshold=float(args.target_error),
         )
         validation_stage_wall_s = float(time.perf_counter() - validation_started)
 
@@ -1049,8 +1025,6 @@ def main() -> int:
             "monitor_count": int(len(monitor)),
             "monitor_seed": int(args.monitor_seed),
             "monitor_start_materials": int(args.start_materials),
-            "stopping_consecutive": int(args.stopping_consecutive),
-            "first_monitor_pass": first_monitor_pass,
             "stop_materials": int(stop_materials),
             "monitor_summary_at_stop": last_monitor_stats,
             "final_validation_count": int(len(final_validation)),
@@ -1058,24 +1032,16 @@ def main() -> int:
             "final_validation_passes_target": bool(
                 final_stats["error_max"] <= float(args.target_error)
             ),
-            "final_validation_passes_stop_target": bool(
-                final_stats["error_max"] <= float(args.target_error)
+            "final_validation_below_target_count": int(
+                final_stats["below_target_count"]
             ),
-            "final_validation_all_below_report_threshold": bool(
-                final_stats["observed_above_threshold_count"] == 0
+            "final_validation_above_target_count": int(
+                final_stats["above_target_count"]
             ),
-            "final_validation_below_report_threshold_count": int(
-                final_stats["observed_below_threshold_count"]
-            ),
-            "final_validation_above_report_threshold_count": int(
-                final_stats["observed_above_threshold_count"]
-            ),
-            "final_validation_below_report_threshold_percent": float(
-                final_stats["observed_below_threshold_percent"]
+            "final_validation_below_target_percent": float(
+                final_stats["below_target_percent"]
             ),
             "target_error": float(args.target_error),
-            "training_stop_target_error": float(args.target_error),
-            "validation_report_threshold": float(args.validation_report_threshold),
             "snapshot_total_solve_wall_s": float(pd.DataFrame(snapshot_rows)["solve_wall_s"].sum()),
             "snapshot_total_step_wall_s": float(pd.DataFrame(snapshot_rows)["snapshot_step_wall_s"].sum()),
             "basis_update_total_wall_s": float(pd.DataFrame(snapshot_rows)["basis_update_wall_s"].sum()),

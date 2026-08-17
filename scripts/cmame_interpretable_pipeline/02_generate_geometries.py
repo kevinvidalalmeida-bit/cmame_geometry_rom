@@ -178,7 +178,6 @@ def descriptor_from_payload(row: pd.Series, payload: dict[str, Any]) -> dict[str
     return {
         "geometry_id": int(row["geometry_id"]),
         "grid_size": int(row["grid_size"]),
-        "grid_parity": str(row.get("grid_parity", "any")),
         "Vf_realized": float(payload.get("Vf", np.nan)),
         "aspect_ratio": float(row["aspect_ratio"]),
         "A2_11_realized": float(payload.get("sam_voxel_A2_11", payload.get("sam_A2_11", np.nan))),
@@ -322,7 +321,6 @@ def run(config: dict[str, Any], destination: Path, selected_ids: set[int] | None
                 "geometry_id": int(row["geometry_id"]),
                 "geometry_label": str(row["geometry_label"]),
                 "grid_size": int(row["grid_size"]),
-                "grid_parity": str(row.get("grid_parity", "any")),
                 "accepted_local": bool(payload.get("accepted_local", False)),
                 "Vf_realized": float(payload.get("Vf", np.nan)),
                 "n_fibers": int(payload.get("n_fibers", -1)),

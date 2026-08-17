@@ -169,8 +169,6 @@ def command_for_geometry(
         str(int(pipe.get("monitor_count", 16))),
         "--monitor-seed",
         str(int(pipe.get("monitor_seed", 20260822))),
-        "--stopping-consecutive",
-        str(int(pipe.get("stopping_consecutive", 1))),
         "--final-validation-count",
         str(int(pipe.get("final_validation_count", 16))),
         "--final-validation-seed",
@@ -181,8 +179,6 @@ def command_for_geometry(
         str(pipe.get("truth_profile", "snapshot")),
         "--target-error",
         str(float(pipe.get("target_error", 1.0e-4))),
-        "--validation-report-threshold",
-        str(float(pipe.get("validation_report_threshold", 1.0e-4))),
         "--basis-tolerance",
         str(float(pipe.get("basis_tolerance", 1.0e-12))),
         "--basis-dtype",
@@ -294,6 +290,109 @@ def first_threshold_crossing_curve(
     return pd.concat(groups, ignore_index=True)
 
 
+def one_pass_timing_table(
+    summary: pd.DataFrame,
+    full_curve: pd.DataFrame,
+    first_crossing_curve: pd.DataFrame,
+    rom_query_count: int,
+) -> pd.DataFrame:
+    """Build per-geometry wall-time rows for first-crossing stopping."""
+    columns = [
+        "geometry_id",
+        "geometry_label",
+        "stop_materials",
+        "pod_rank",
+        "monitor_error_max",
+        "geometry_affine_setup_s",
+        "monitor_count",
+        "monitor_fft_once_s",
+        "adaptive_training_s",
+        "final_validation_count",
+        "final_validation_s",
+        "rom_query_count",
+        "rom_timing_s",
+        "other_pipeline_io_s",
+        "one_pass_pipeline_total_s",
+        "one_pass_pipeline_total_min",
+        "recorded_pipeline_total_s",
+        "removed_confirmation_s",
+        "timing_basis",
+    ]
+    if summary.empty or first_crossing_curve.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, Any]] = []
+    for record in summary.to_dict(orient="records"):
+        geometry_id = int(record["geometry_id"])
+        full_group = full_curve[full_curve["geometry_id"] == geometry_id].sort_values(
+            "training_materials"
+        )
+        first_group = first_crossing_curve[
+            first_crossing_curve["geometry_id"] == geometry_id
+        ].sort_values("training_materials")
+        if full_group.empty or first_group.empty:
+            continue
+
+        full_stop = full_group.iloc[-1]
+        first_stop = first_group.iloc[-1]
+        recorded_training_s = float(record["training_stage_wall_s"])
+        training_overhead_s = max(
+            recorded_training_s - float(full_stop["snapshot_step_wall_s"]), 0.0
+        )
+        adaptive_training_s = (
+            float(first_stop["snapshot_step_wall_s"]) + training_overhead_s
+        )
+        removed_confirmation_s = max(
+            float(full_stop["snapshot_step_wall_s"])
+            - float(first_stop["snapshot_step_wall_s"]),
+            0.0,
+        )
+        recorded_total_s = float(record["wrapper_wall_s"])
+        historical_stop_materials = int(record["stop_materials"])
+        stop_materials = int(first_stop["training_materials"])
+        was_one_pass = historical_stop_materials == stop_materials
+        one_pass_total_s = recorded_total_s - removed_confirmation_s
+        timing_basis = "measured" if was_one_pass else "retrospective_cumulative_estimate"
+
+        geometry_setup_s = float(record["geometry_load_wall_s"]) + float(
+            record["affine_setup_wall_s"]
+        )
+        monitor_s = float(record["monitor_fft_stage_wall_s"])
+        validation_s = float(record["final_validation_stage_wall_s"])
+        rom_s = float(record["rom_timing_stage_wall_s"])
+        other_s = one_pass_total_s - (
+            geometry_setup_s
+            + monitor_s
+            + adaptive_training_s
+            + validation_s
+            + rom_s
+        )
+        rows.append(
+            {
+                "geometry_id": geometry_id,
+                "geometry_label": str(record["geometry_label"]),
+                "stop_materials": stop_materials,
+                "pod_rank": int(first_stop["pod_rank"]),
+                "monitor_error_max": float(first_stop["monitor_error_max"]),
+                "geometry_affine_setup_s": geometry_setup_s,
+                "monitor_count": int(record["monitor_count"]),
+                "monitor_fft_once_s": monitor_s,
+                "adaptive_training_s": adaptive_training_s,
+                "final_validation_count": int(record["final_validation_count"]),
+                "final_validation_s": validation_s,
+                "rom_query_count": int(rom_query_count),
+                "rom_timing_s": rom_s,
+                "other_pipeline_io_s": other_s,
+                "one_pass_pipeline_total_s": one_pass_total_s,
+                "one_pass_pipeline_total_min": one_pass_total_s / 60.0,
+                "recorded_pipeline_total_s": recorded_total_s,
+                "removed_confirmation_s": removed_confirmation_s,
+                "timing_basis": timing_basis,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
 def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) -> None:
     if curve.empty:
         return
@@ -348,7 +447,7 @@ def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) ->
 
 
 def validation_coverage_tables(
-    summaries: list[dict[str, Any]], report_threshold: float
+    summaries: list[dict[str, Any]], target_error: float
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     frames: list[pd.DataFrame] = []
     coverage_rows: list[dict[str, Any]] = []
@@ -362,15 +461,15 @@ def validation_coverage_tables(
         frame["relative_frobenius_error_percent"] = (
             100.0 * frame["relative_frobenius_error"]
         )
-        frame["below_report_threshold"] = (
-            frame["relative_frobenius_error"] <= float(report_threshold)
+        frame["below_target"] = (
+            frame["relative_frobenius_error"] <= float(target_error)
         )
         frames.append(frame)
         coverage_rows.append(
             {
                 "scope": f"geometry_{geometry_id:02d}",
                 **empirical_coverage(
-                    frame["relative_frobenius_error"], report_threshold
+                    frame["relative_frobenius_error"], target_error
                 ),
             }
         )
@@ -381,7 +480,7 @@ def validation_coverage_tables(
             {
                 "scope": "all_geometry_material_pairs",
                 **empirical_coverage(
-                    details["relative_frobenius_error"], report_threshold
+                    details["relative_frobenius_error"], target_error
                 ),
             }
         )
@@ -402,23 +501,27 @@ def write_campaign_summary(
     curve = pd.concat(curves, ignore_index=True) if curves else pd.DataFrame()
     summary = pd.DataFrame(summaries)
     commands = pd.DataFrame(command_rows)
-    report_threshold = float(
-        config.get("sobol_pod_pipeline", {}).get(
-            "validation_report_threshold", 1.0e-4
-        )
-    )
-    validation, validation_coverage = validation_coverage_tables(
-        summaries, report_threshold
-    )
     target_error = float(
         config.get("sobol_pod_pipeline", {}).get("target_error", 1.0e-4)
     )
+    validation, validation_coverage = validation_coverage_tables(
+        summaries, target_error
+    )
     first_crossing_curve = first_threshold_crossing_curve(curve, target_error)
+    timing = one_pass_timing_table(
+        summary,
+        curve,
+        first_crossing_curve,
+        int(config.get("sobol_pod_pipeline", {}).get("rom_timing_count", 10000)),
+    )
     curve.to_csv(summary_dir / "sobol_pod_multigeometry_curve.csv", index=False)
     first_crossing_curve.to_csv(
         summary_dir / "sobol_pod_multigeometry_curve_first_crossing.csv", index=False
     )
     summary.to_csv(summary_dir / "sobol_pod_multigeometry_summary.csv", index=False)
+    timing.to_csv(
+        summary_dir / "sobol_pod_multigeometry_timing_one_pass.csv", index=False
+    )
     commands.to_csv(summary_dir / "execution_commands.csv", index=False)
     validation.to_csv(
         summary_dir / "sobol_pod_multigeometry_validation.csv", index=False
@@ -438,6 +541,7 @@ def write_campaign_summary(
         first_crossing_curve.to_excel(
             writer, sheet_name="first_crossing_curve", index=False
         )
+        timing.to_excel(writer, sheet_name="one_pass_timing", index=False)
         validation.to_excel(writer, sheet_name="final_validation", index=False)
         validation_coverage.to_excel(writer, sheet_name="validation_coverage", index=False)
         commands.to_excel(writer, sheet_name="commands", index=False)

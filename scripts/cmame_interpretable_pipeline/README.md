@@ -39,9 +39,8 @@ Default choices:
 
 - Geometry space: `Vf_target` from `0.05` to `0.25`, aspect ratio from `5` to `20`.
 - Ten manual interpretable cases: baseline, low/high `Vf`, short/long `AR`, planar xy, aligned x, biased triaxial, dilute-short, dense-long.
-- Geometry resolution: at least `6` voxels per fiber diameter on odd grids,
-  giving `61`, `151`, and `241` voxels per side for the current cases. Binary
-  voxelization is retained.
+- Geometry resolution: `6` voxels per fiber diameter, giving `60`, `150`, and
+  `240` voxels per side for the current cases. Binary voxelization is retained.
 - ROM campaign: sequential Sobol + numerical full-rank POD, adding one material at a time.
 - FFT precision: training, monitoring, and final validation use `float64` with
   `rtol=1e-8`. Snapshot/POD storage and contractions remain contiguous
@@ -88,21 +87,6 @@ Smoke test:
 python scripts/cmame_interpretable_pipeline/main.py --stage all --smoke
 ```
 
-Primal-dual CRE pilot:
-
-```bash
-python scripts/cmame_interpretable_pipeline/05_primal_dual_cre_pilot.py
-```
-
-The `cre_pilot` block in `campaign_config.json` controls this experiment. It
-builds float64 compatible-strain and equilibrated-stress POD spaces, evaluates
-a two-sided GaNi discrete bracket on a finite configured Sobol pool, and runs
-the independent FFT validation only after the reduced model is frozen. This is
-an experimental validation path, not a global certification of the continuous
-material domain. See `CRE_VALIDATION_STATUS.md` before using its results in the
-paper. Odd grids avoid the extra Nyquist modes present on even grids, although
-they do not by themselves establish a continuous-problem guarantee.
-
 After a smoke test, run the full geometry stage again before the real pipeline:
 
 ```bash
@@ -112,9 +96,9 @@ python scripts/cmame_interpretable_pipeline/main.py --stage pipeline
 
 Outputs:
 
-- `results/cmame_method/interpretable_vf05_25_ar5_20_odd/design/`
-- `results/cmame_method/interpretable_vf05_25_ar5_20_odd/geometries/`
-- `results/cmame_method/interpretable_vf05_25_ar5_20_odd/runs/run_YYYYMMDD_HHMMSS/`
+- `results/cmame_method/interpretable_vf05_25_ar5_20/design/`
+- `results/cmame_method/interpretable_vf05_25_ar5_20/geometries/`
+- `results/cmame_method/interpretable_vf05_25_ar5_20/runs/run_YYYYMMDD_HHMMSS/`
 
 Named run:
 
@@ -125,5 +109,5 @@ python scripts/cmame_interpretable_pipeline/main.py --stage pipeline --run-name 
 Move the campaign results to the desktop trash for a fresh restart:
 
 ```bash
-gio trash results/cmame_method/interpretable_vf05_25_ar5_20_odd
+gio trash results/cmame_method/interpretable_vf05_25_ar5_20
 ```

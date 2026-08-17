@@ -7,7 +7,7 @@ The active workflow is intentionally small:
 
 1. generate the interpretable geometry design;
 2. generate the ten fixed voxel geometries;
-3. solve a Sobol material sequence with FFTHomPy until the monitor criterion is stable;
+3. solve a Sobol material sequence with FFTHomPy until the monitor criterion first passes;
 4. retain the full numerical snapshot span;
 5. compile the affine reduced operators `Kq`, `Bq`, and `Dq` in mixed precision;
 6. evaluate the resulting ROM over large material sets.
@@ -37,11 +37,10 @@ that same threshold, equivalent to `0.01%` relative Frobenius error. This
 percentage is empirical and is not presented as coverage of the entire
 continuous material domain.
 
-The next campaign uses odd grids (`61`, `151`, and `241` per side) in a new
-output root so it cannot be mixed with the completed even-grid runs. The
-primal-dual CRE code remains an experimental discrete-bracket pilot: neither a
-finite Sobol pass nor the odd-grid choice is described as global certification
-of the continuous material domain.
+The active configuration points to the completed `60`, `150`, and `240` voxel
+geometries. The monitor and final validation sets provide finite empirical
+error evidence; the workflow makes no global certification claim over the
+continuous material domain.
 
 For exact full-rank operation, basis memory grows as `O(Nvox*r)`, offline POD
 and K/B/D work as `O(Nvox*r^2)`, and dense online solves as `O(r^3)`. The active

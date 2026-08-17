@@ -17,22 +17,6 @@ import cmame_campaign_common as common
 import rom_reduced_operator as reduced
 
 
-def test_consecutive_stopping_requires_stable_threshold_crossing():
-    streak = 0
-    history = []
-    for error in (2.0e-4, 9.0e-5, 1.1e-4, 8.0e-5, 7.0e-5):
-        passes, streak = common.update_consecutive_stopping(error, 1.0e-4, streak)
-        history.append((passes, streak))
-
-    assert history == [
-        (False, 0),
-        (True, 1),
-        (False, 0),
-        (True, 1),
-        (True, 2),
-    ]
-
-
 def _scalar_cgs2(
     basis: list[np.ndarray], fields: list[np.ndarray], tolerance: float
 ) -> list[np.ndarray]:
