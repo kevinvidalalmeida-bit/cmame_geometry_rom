@@ -264,6 +264,36 @@ def collect_run_summary(
     return curve, summary
 
 
+def first_threshold_crossing_curve(
+    curve: pd.DataFrame, target_error: float
+) -> pd.DataFrame:
+    """Keep each geometry history through its first accepted monitor pass."""
+    if curve.empty:
+        result = curve.copy()
+        result["one_pass_stop"] = pd.Series(dtype=bool)
+        return result
+
+    required = {"geometry_id", "training_materials", "monitor_error_max"}
+    missing = sorted(required.difference(curve.columns))
+    if missing:
+        raise ValueError(f"Error curve is missing required columns: {missing}")
+
+    groups: list[pd.DataFrame] = []
+    for _, group in curve.groupby("geometry_id", sort=True):
+        group = group.sort_values("training_materials").copy()
+        accepted = (
+            group["monitor_error_max"].to_numpy(dtype=float) <= float(target_error)
+        )
+        crossing_positions = accepted.nonzero()[0]
+        if crossing_positions.size:
+            group = group.iloc[: int(crossing_positions[0]) + 1].copy()
+        group["one_pass_stop"] = False
+        if crossing_positions.size:
+            group.iloc[-1, group.columns.get_loc("one_pass_stop")] = True
+        groups.append(group)
+    return pd.concat(groups, ignore_index=True)
+
+
 def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) -> None:
     if curve.empty:
         return
@@ -271,9 +301,10 @@ def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) ->
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(8.8, 5.2))
+        stop_markers: list[tuple[pd.DataFrame, str]] = []
         for geometry_id, group in curve.groupby("geometry_id", sort=True):
             group = group.sort_values("training_materials")
-            ax.semilogy(
+            (line,) = ax.semilogy(
                 group["training_materials"].to_numpy(dtype=int),
                 group["monitor_error_max"].to_numpy(dtype=float),
                 marker="o",
@@ -281,6 +312,10 @@ def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) ->
                 markersize=3.8,
                 label=f"g{int(geometry_id):02d}",
             )
+            if "one_pass_stop" in group:
+                stop = group[group["one_pass_stop"].astype(bool)]
+                if not stop.empty:
+                    stop_markers.append((stop, line.get_color()))
         ax.axhline(
             float(target_error),
             color="black",
@@ -288,8 +323,21 @@ def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) ->
             linewidth=1.0,
             label=f"{target_error:.0e} stop target",
         )
+        for marker_index, (stop, color) in enumerate(stop_markers):
+            ax.scatter(
+                stop["training_materials"].to_numpy(dtype=int),
+                stop["monitor_error_max"].to_numpy(dtype=float),
+                marker="X",
+                s=48,
+                color=color,
+                edgecolors="black",
+                linewidths=0.6,
+                zorder=3,
+                label="first accepted pass" if marker_index == 0 else None,
+            )
         ax.set_xlabel("Sobol training materials used for POD")
         ax.set_ylabel("maximum relative error on the FFT monitor set")
+        ax.set_title("One-pass stopping at the first tolerance crossing")
         ax.grid(True, which="both", alpha=0.25)
         ax.legend(ncol=2, fontsize=8)
         fig.tight_layout()
@@ -362,7 +410,14 @@ def write_campaign_summary(
     validation, validation_coverage = validation_coverage_tables(
         summaries, report_threshold
     )
+    target_error = float(
+        config.get("sobol_pod_pipeline", {}).get("target_error", 1.0e-4)
+    )
+    first_crossing_curve = first_threshold_crossing_curve(curve, target_error)
     curve.to_csv(summary_dir / "sobol_pod_multigeometry_curve.csv", index=False)
+    first_crossing_curve.to_csv(
+        summary_dir / "sobol_pod_multigeometry_curve_first_crossing.csv", index=False
+    )
     summary.to_csv(summary_dir / "sobol_pod_multigeometry_summary.csv", index=False)
     commands.to_csv(summary_dir / "execution_commands.csv", index=False)
     validation.to_csv(
@@ -371,18 +426,18 @@ def write_campaign_summary(
     validation_coverage.to_csv(
         summary_dir / "sobol_pod_validation_coverage.csv", index=False
     )
-    target_error = float(
-        config.get("sobol_pod_pipeline", {}).get("target_error", 1.0e-4)
-    )
     if bool(config.get("sobol_pod_pipeline", {}).get("write_summary_plot", True)):
         write_campaign_plot(
-            curve,
+            first_crossing_curve,
             summary_dir / "sobol_pod_multigeometry_error_curves.png",
             target_error,
         )
     with pd.ExcelWriter(summary_dir / "sobol_pod_multigeometry_tables.xlsx") as writer:
         summary.to_excel(writer, sheet_name="summary", index=False)
         curve.to_excel(writer, sheet_name="error_curve", index=False)
+        first_crossing_curve.to_excel(
+            writer, sheet_name="first_crossing_curve", index=False
+        )
         validation.to_excel(writer, sheet_name="final_validation", index=False)
         validation_coverage.to_excel(writer, sheet_name="validation_coverage", index=False)
         commands.to_excel(writer, sheet_name="commands", index=False)
