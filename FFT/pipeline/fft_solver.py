@@ -214,11 +214,13 @@ def _save_solution_fields_if_requested(
     p: Dict[str, Any],
 ) -> Dict[str, Any]:
     out_path_raw = p.get("solution_field_out_path")
-    if not out_path_raw:
+    return_in_memory = bool(p.get("solution_field_return_in_memory", False))
+    if not out_path_raw and not return_in_memory:
         return {}
 
-    out_path = Path(str(out_path_raw))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path = Path(str(out_path_raw)) if out_path_raw else None
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
     load_ids = [int(value) for value in p.get("solution_field_load_ids", list(range(6)))]
     solutions = prob.output.get("sol_primal")
@@ -262,6 +264,18 @@ def _save_solution_fields_if_requested(
         "dtype": str(field_dtype),
         "load_description": "load0..load5 = E11,E22,E33,E23,E13,E12 unitarios en notacion Mandel",
     }
+    if return_in_memory:
+        p["_solution_fields_result"] = tuple(
+            arrays[f"fluctuation_load{load_id}"] for load_id in saved_load_ids
+        )
+        return {
+            "solution_field_path": "",
+            "solution_field_format": "memory",
+            **metadata,
+        }
+
+    if out_path is None:
+        raise RuntimeError("Falta solution_field_out_path para guardar los campos.")
     field_format = str(p.get("solution_field_format", "npy_dir")).strip().lower()
     if field_format == "npz_compressed":
         arrays["metadata_json"] = np.array(json.dumps(metadata, ensure_ascii=True))
@@ -720,7 +734,10 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
     cupy_residual_check_every = max(1, int(p.get('cupy_residual_check_every', 1)))
     fast_macro_add = bool(p.get('fast_macro_add', True))
     check_macro_mean = bool(p.get('check_macro_mean', False))
-    solution_field_requested = bool(p.get("solution_field_out_path"))
+    solution_field_requested = bool(
+        p.get("solution_field_out_path")
+        or p.get("solution_field_return_in_memory", False)
+    )
     stress_slice_requested = bool(p.get("stress_slice_out_path"))
     stress_volume_requested = bool(p.get("stress_volume_out_path"))
     store_solution_fields = bool(

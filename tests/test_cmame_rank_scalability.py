@@ -151,3 +151,29 @@ def test_memory_plan_uses_actual_checkpoint_increment() -> None:
     assert plan["pod_batch_material_limit"] == 2
     assert plan["pod_requested_material_batch"] == 2
     assert plan["pod_workspace_bytes"] == 2 * plan["material_snapshot_bytes"]
+
+
+def test_runtime_affine_block_uses_current_workspace_budget() -> None:
+    gib = 1024**3
+    block_size = rank_scaling.runtime_affine_q_block_size(
+        appended_fields_bytes=2 * gib,
+        coefficient_count=7,
+        memory_max_gib=8.0,
+        memory_safety_fraction=0.8,
+        available_bytes=100 * gib,
+    )
+
+    assert block_size == 4
+
+
+def test_runtime_affine_block_respects_current_available_memory() -> None:
+    gib = 1024**3
+    block_size = rank_scaling.runtime_affine_q_block_size(
+        appended_fields_bytes=2 * gib,
+        coefficient_count=7,
+        memory_max_gib=8.0,
+        memory_safety_fraction=0.5,
+        available_bytes=10 * gib,
+    )
+
+    assert block_size == 2

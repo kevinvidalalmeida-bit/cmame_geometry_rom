@@ -152,7 +152,7 @@
     "basis_tolerance": 1e-12,
     "basis_dtype": "float32",
     "pod_batch_max_gib": 8.0,
-    "affine_stress_max_gib": 8.0,
+    "affine_stress_max_gib": 16.0,
     "rom_batch_max_gib": 1.0,
     "rom_backend": "gpu",
     "fft_backend": "gpu",

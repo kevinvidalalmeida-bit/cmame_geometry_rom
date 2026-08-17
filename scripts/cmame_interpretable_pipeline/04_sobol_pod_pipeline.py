@@ -182,7 +182,8 @@ def append_sobol_batch(
     operator_ori: np.ndarray,
     operators: dict[str, np.ndarray] | None,
     affine_stress_batch: Any,
-    affine_q_block_size: int,
+    affine_stress_max_gib: float,
+    memory_safety_fraction: float,
     basis_tolerance: float,
     cleanup_snapshot_fields: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, np.ndarray] | None]:
@@ -206,11 +207,15 @@ def append_sobol_batch(
                 seed=int(seed),
                 profile=str(profile),
                 persistent_gpu_cache=False,
+                return_solution_fields=True,
+                solution_field_dtype=basis.dtype,
             )
-        fields = common.load_snapshot_fields(
-            common.snapshot_dir(run_dir, candidate_id),
-            dtype=basis.dtype,
-        )
+        fields = record.pop("_solution_fields_result", None)
+        if fields is None:
+            fields = common.load_snapshot_fields(
+                common.snapshot_dir(run_dir, candidate_id),
+                dtype=basis.dtype,
+            )
         offset = 6 * material_index
         for load_id, field in enumerate(fields):
             np.take(
@@ -232,6 +237,18 @@ def append_sobol_batch(
     )
     basis_wall_s = float(time.perf_counter() - basis_started)
     del ordered_fields
+    affine_q_block_size = 0
+    if len(new_fields):
+        affine_q_block_size = common.runtime_affine_q_block_size(
+            appended_fields_bytes=int(np.asarray(new_fields).nbytes),
+            coefficient_count=len(
+                getattr(
+                    affine_stress_batch, "coefficient_names", reduced.COEFF_NAMES
+                )
+            ),
+            memory_max_gib=float(affine_stress_max_gib),
+            memory_safety_fraction=float(memory_safety_fraction),
+        )
     assembly_totals = {
         "assembly_wall_s": 0.0,
         "affine_stress_wall_s": 0.0,
@@ -642,8 +659,6 @@ def main() -> int:
         )
         if int(memory_plan["estimated_peak_bytes"]) > int(memory_plan["safe_memory_bytes"]):
             raise MemoryError("The derived exact full-rank training limit is not memory-safe.")
-        affine_q_block_size = int(memory_plan["affine_q_block_size"])
-
         candidates.to_csv(run_dir / "candidate_pool_used.csv", index=False)
         if not pool_hash:
             pool_hash = sha256(run_dir / "candidate_pool_used.csv")
@@ -696,11 +711,15 @@ def main() -> int:
                 "basis_storage": "preallocated_contiguous",
                 "basis_projection_passes": 1,
                 "basis_projection_backend": "scipy_blas_gemm_in_place",
+                "snapshot_field_transport": f"in_memory_{np.dtype(args.basis_dtype).name}",
                 "pod_batching": "one_material_exact_prefix",
                 "pod_batch_max_gib": float(args.pod_batch_max_gib),
                 "pod_batch_material_limit": 1,
                 "affine_stress_max_gib": float(args.affine_stress_max_gib),
-                "affine_q_block_size": affine_q_block_size,
+                "affine_q_block_size_policy": "runtime_memory_bounded",
+                "affine_q_block_size_at_max_rank": int(
+                    memory_plan["affine_q_block_size"]
+                ),
                 "rom_batch_max_gib": float(args.rom_batch_max_gib),
                 "rom_backend": str(args.rom_backend),
                 "memory_plan": memory_plan,
@@ -777,7 +796,8 @@ def main() -> int:
                 operator_ori=operator_ori,
                 operators=operators,
                 affine_stress_batch=affine,
-                affine_q_block_size=affine_q_block_size,
+                affine_stress_max_gib=float(args.affine_stress_max_gib),
+                memory_safety_fraction=float(args.memory_safety_fraction),
                 basis_tolerance=float(args.basis_tolerance),
                 cleanup_snapshot_fields=bool(args.cleanup_snapshot_fields),
             )
@@ -980,6 +1000,11 @@ def main() -> int:
         timing["final_validation_fft_total_wall_s"] = float(
             final_validation_truth["solve_wall_s"].sum()
         )
+        snapshot_timing = pd.DataFrame(snapshot_rows)
+        active_q_blocks = snapshot_timing.loc[
+            snapshot_timing["affine_q_block_size"] > 0,
+            "affine_q_block_size",
+        ]
         stage_timing = pd.DataFrame(
             [
                 {"stage": "geometry_load", "wall_s": geometry_load_wall_s},
@@ -1015,10 +1040,14 @@ def main() -> int:
             "final_selected_materials": int(stop_materials),
             "basis_rank": final_basis_rank,
             "basis_dtype": str(args.basis_dtype),
+            "snapshot_field_transport": f"in_memory_{np.dtype(args.basis_dtype).name}",
             "pod_batch_max_gib": float(args.pod_batch_max_gib),
             "pod_batch_material_limit": 1,
             "affine_stress_max_gib": float(args.affine_stress_max_gib),
-            "affine_q_block_size": affine_q_block_size,
+            "affine_q_block_size_min": int(active_q_blocks.min()),
+            "affine_q_block_size_max": int(
+                snapshot_timing["affine_q_block_size"].max()
+            ),
             "rom_batch_max_gib": float(args.rom_batch_max_gib),
             "rom_backend": str(rom_timing["actual_backend"]),
             "memory_plan": memory_plan,
@@ -1042,17 +1071,15 @@ def main() -> int:
                 final_stats["below_target_percent"]
             ),
             "target_error": float(args.target_error),
-            "snapshot_total_solve_wall_s": float(pd.DataFrame(snapshot_rows)["solve_wall_s"].sum()),
-            "snapshot_total_step_wall_s": float(pd.DataFrame(snapshot_rows)["snapshot_step_wall_s"].sum()),
-            "basis_update_total_wall_s": float(pd.DataFrame(snapshot_rows)["basis_update_wall_s"].sum()),
-            "operator_assembly_total_wall_s": float(pd.DataFrame(snapshot_rows)["operator_assembly_wall_s"].sum()),
+            "snapshot_total_solve_wall_s": float(snapshot_timing["solve_wall_s"].sum()),
+            "snapshot_total_step_wall_s": float(snapshot_timing["snapshot_step_wall_s"].sum()),
+            "basis_update_total_wall_s": float(snapshot_timing["basis_update_wall_s"].sum()),
+            "operator_assembly_total_wall_s": float(snapshot_timing["operator_assembly_wall_s"].sum()),
             "operator_stress_workspace_peak_bytes": int(
-                pd.DataFrame(snapshot_rows)[
-                    "operator_stress_workspace_peak_bytes"
-                ].max()
+                snapshot_timing["operator_stress_workspace_peak_bytes"].max()
             ),
-            "affine_stress_total_wall_s": float(pd.DataFrame(snapshot_rows)["affine_stress_wall_s"].sum()),
-            "ritz_contraction_total_wall_s": float(pd.DataFrame(snapshot_rows)["ritz_contraction_wall_s"].sum()),
+            "affine_stress_total_wall_s": float(snapshot_timing["affine_stress_wall_s"].sum()),
+            "ritz_contraction_total_wall_s": float(snapshot_timing["ritz_contraction_wall_s"].sum()),
             "geometry_load_wall_s": geometry_load_wall_s,
             "affine_setup_wall_s": affine_setup_wall_s,
             "monitor_fft_total_wall_s": float(monitor_truth["solve_wall_s"].sum()),

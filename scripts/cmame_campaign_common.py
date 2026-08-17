@@ -254,6 +254,36 @@ def full_rank_memory_plan(
     }
 
 
+def runtime_affine_q_block_size(
+    *,
+    appended_fields_bytes: int,
+    coefficient_count: int,
+    memory_max_gib: float,
+    memory_safety_fraction: float,
+    available_bytes: int | None = None,
+) -> int:
+    """Choose the widest safe affine block for the current basis update."""
+    bytes_per_coefficient = int(appended_fields_bytes)
+    count = int(coefficient_count)
+    fraction = float(memory_safety_fraction)
+    if bytes_per_coefficient < 1 or count < 1:
+        raise ValueError("Appended-field bytes and coefficient count must be positive.")
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("memory_safety_fraction must be in (0, 1].")
+
+    configured_budget = int(float(memory_max_gib) * 1024**3)
+    current_budget = int(
+        (available_memory_bytes() if available_bytes is None else available_bytes)
+        * fraction
+    )
+    workspace_budget = min(configured_budget, current_budget)
+    if workspace_budget < bytes_per_coefficient:
+        raise MemoryError(
+            "Insufficient available memory for one affine stress coefficient block."
+        )
+    return min(count, workspace_budget // bytes_per_coefficient)
+
+
 def rom_chunk_memory_plan(
     *,
     rank: int,
@@ -354,13 +384,17 @@ def solve_material(
     seed: int,
     save_solution_fields: bool,
     persistent_gpu_cache: bool = False,
+    return_solution_fields: bool = False,
+    solution_field_dtype: str | np.dtype | None = None,
 ) -> dict[str, Any]:
     """Solve one material or return a validated campaign-owned cache entry."""
     if profile not in SOLVER_PROFILES:
         raise ValueError(f"Perfil desconocido: {profile}")
+    if return_solution_fields and not save_solution_fields:
+        raise ValueError("return_solution_fields requires save_solution_fields=True.")
     material_dir = Path(material_dir)
     material_dir.mkdir(parents=True, exist_ok=True)
-    if _cached_record_is_valid(
+    if not return_solution_fields and _cached_record_is_valid(
         material_dir, profile=profile, require_fields=save_solution_fields
     ):
         return json.loads((material_dir / "solve_record.json").read_text(encoding="utf-8"))
@@ -394,9 +428,15 @@ def solve_material(
             "free_gpu_memory_after_solve": not bool(persistent_gpu_cache),
         }
     )
+    if return_solution_fields:
+        params.pop("solution_field_out_path", None)
+        params["solution_field_return_in_memory"] = True
+    if solution_field_dtype is not None:
+        params["solution_field_dtype"] = str(np.dtype(solution_field_dtype))
     started = time.perf_counter()
     ceff = np.asarray(sobol_gpu.solve_homogenization(params), dtype=np.float64)
     solve_wall_s = float(time.perf_counter() - started)
+    solution_fields = params.pop("_solution_fields_result", None)
     np.save(material_dir / "Ceff.npy", ceff)
 
     timing_path = material_dir / "solver_timing.json"
@@ -417,8 +457,18 @@ def solve_material(
         raise RuntimeError(f"Tensor incompleto o no finito en {material_dir}.")
     if float(eigenvalues.min()) <= 0.0:
         raise RuntimeError(f"Tensor efectivo no SPD en {material_dir}.")
-    if save_solution_fields and not _snapshot_fields_available(material_dir):
-        raise RuntimeError(f"Faltan campos snapshot en {material_dir}.")
+    if save_solution_fields:
+        if return_solution_fields:
+            if solution_fields is None or len(solution_fields) != 6:
+                raise RuntimeError(
+                    f"El solver no devolvio los seis campos snapshot en {material_dir}."
+                )
+        elif not _snapshot_fields_available(material_dir):
+            raise RuntimeError(f"Faltan campos snapshot en {material_dir}.")
+
+    solution_field_transport = "none"
+    if save_solution_fields:
+        solution_field_transport = "memory" if return_solution_fields else "disk"
 
     record: dict[str, Any] = {
         **material_row,
@@ -429,8 +479,9 @@ def solve_material(
             if (material_dir / "solution_fields").is_dir()
             else str(material_dir / "solution_fields.npz")
         )
-        if save_solution_fields
+        if save_solution_fields and not return_solution_fields
         else "",
+        "solution_field_transport": solution_field_transport,
         "solver_timing_path": str(timing_path),
         "solver_profile": profile,
         "solver_real_dtype": settings["solver_real_dtype"],
@@ -454,6 +505,8 @@ def solve_material(
         for jj in range(6):
             record[f"Ceff_{ii + 1}{jj + 1}"] = float(ceff[ii, jj])
     write_json(material_dir / "solve_record.json", record)
+    if solution_fields is not None:
+        record["_solution_fields_result"] = solution_fields
     return record
 
 
@@ -668,6 +721,8 @@ def ensure_snapshot(
     seed: int,
     profile: str = "snapshot",
     persistent_gpu_cache: bool = False,
+    return_solution_fields: bool = False,
+    solution_field_dtype: str | np.dtype | None = None,
 ) -> dict[str, Any]:
     selected = candidates.loc[candidates["candidate_id"] == int(candidate_id)]
     if len(selected) != 1:
@@ -684,6 +739,8 @@ def ensure_snapshot(
         seed=int(seed) + int(candidate_id),
         save_solution_fields=True,
         persistent_gpu_cache=bool(persistent_gpu_cache),
+        return_solution_fields=bool(return_solution_fields),
+        solution_field_dtype=solution_field_dtype,
     )
 
 

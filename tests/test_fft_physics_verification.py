@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -11,11 +12,40 @@ for path in (ROOT / "FFT", ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from pipeline.fft_solver import solve_homogenization
+from pipeline.fft_solver import _save_solution_fields_if_requested, solve_homogenization
 
 
 MANDEL_PAIRS = ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1))
 MANDEL_FACTORS = np.array((1.0, 1.0, 1.0, np.sqrt(2.0), np.sqrt(2.0), np.sqrt(2.0)))
+
+
+def test_solution_fields_can_return_in_memory_without_disk(tmp_path: Path):
+    solutions = []
+    expected = []
+    for load_id in range(6):
+        fluctuation = np.full((6, 2, 2, 2), 0.01 * (load_id + 1))
+        total = fluctuation.copy()
+        total[load_id] += 1.0
+        solutions.append(SimpleNamespace(val=total))
+        expected.append(fluctuation.astype(np.float32))
+
+    params = {
+        "solution_field_return_in_memory": True,
+        "solution_field_dtype": "float32",
+    }
+    metadata = _save_solution_fields_if_requested(
+        prob=SimpleNamespace(output={"sol_primal": solutions}),
+        Ngrid=np.array((2, 2, 2)),
+        p=params,
+    )
+
+    assert metadata["solution_field_format"] == "memory"
+    assert not list(tmp_path.iterdir())
+    actual = params["_solution_fields_result"]
+    assert len(actual) == 6
+    for actual_field, expected_field in zip(actual, expected, strict=True):
+        assert actual_field.dtype == np.float32
+        np.testing.assert_allclose(actual_field, expected_field, rtol=2.0e-6)
 
 
 def _frequency_unit_vectors(shape: tuple[int, int, int]) -> tuple[np.ndarray, np.ndarray]:
