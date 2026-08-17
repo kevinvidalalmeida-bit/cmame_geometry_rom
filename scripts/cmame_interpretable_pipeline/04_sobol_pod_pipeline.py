@@ -197,6 +197,16 @@ def append_sobol_batch(
     )
     records: list[dict[str, Any]] = []
     for material_index, candidate_id in enumerate(candidate_ids):
+        offset = 6 * material_index
+
+        def consume_field(load_id: int, field: np.ndarray) -> None:
+            np.take(
+                field.reshape(6, nvox),
+                voxel_order,
+                axis=1,
+                out=ordered_fields[offset + int(load_id)],
+            )
+
         with quiet_solver_output(bool(quiet_solver)):
             record = common.ensure_snapshot(
                 candidate_id=int(candidate_id),
@@ -207,24 +217,9 @@ def append_sobol_batch(
                 seed=int(seed),
                 profile=str(profile),
                 persistent_gpu_cache=False,
-                return_solution_fields=True,
                 solution_field_dtype=basis.dtype,
+                solution_field_consumer=consume_field,
             )
-        fields = record.pop("_solution_fields_result", None)
-        if fields is None:
-            fields = common.load_snapshot_fields(
-                common.snapshot_dir(run_dir, candidate_id),
-                dtype=basis.dtype,
-            )
-        offset = 6 * material_index
-        for load_id, field in enumerate(fields):
-            np.take(
-                field.reshape(6, nvox),
-                voxel_order,
-                axis=1,
-                out=ordered_fields[offset + load_id],
-            )
-        del field, fields
         if cleanup_snapshot_fields:
             shutil.rmtree(common.snapshot_dir(run_dir, candidate_id), ignore_errors=True)
         records.append(record)
@@ -239,6 +234,7 @@ def append_sobol_batch(
     del ordered_fields
     affine_q_block_size = 0
     if len(new_fields):
+        fiber_fraction = float(np.count_nonzero(operator_phase)) / float(nvox)
         affine_q_block_size = common.runtime_affine_q_block_size(
             appended_fields_bytes=int(np.asarray(new_fields).nbytes),
             coefficient_count=len(
@@ -248,6 +244,10 @@ def append_sobol_batch(
             ),
             memory_max_gib=float(affine_stress_max_gib),
             memory_safety_fraction=float(memory_safety_fraction),
+            coefficient_supports=(
+                (2, 1.0 - fiber_fraction),
+                (5, fiber_fraction),
+            ),
         )
     assembly_totals = {
         "assembly_wall_s": 0.0,
@@ -255,6 +255,9 @@ def append_sobol_batch(
         "ritz_contraction_wall_s": 0.0,
     }
     stress_workspace_peak_bytes = 0
+    contraction_workspace_peak_bytes = 0
+    full_volume_equivalent_passes = 0.0
+    contraction_modes: set[str] = set()
     for start in range(0, len(new_fields), 6):
         end = min(start + 6, len(new_fields))
         absolute_end = rank_before + end
@@ -273,6 +276,17 @@ def append_sobol_batch(
             stress_workspace_peak_bytes,
             int(assembly.get("stress_workspace_peak_bytes", 0)),
         )
+        contraction_workspace_peak_bytes = max(
+            contraction_workspace_peak_bytes,
+            int(assembly.get("contraction_workspace_peak_bytes", 0)),
+        )
+        full_volume_equivalent_passes = max(
+            full_volume_equivalent_passes,
+            float(assembly.get("full_volume_equivalent_passes", 0.0)),
+        )
+        contraction_modes.add(str(assembly.get("contraction_mode", "unknown")))
+
+    contraction_mode = "+".join(sorted(contraction_modes)) or "none"
 
     batch_wall_s = float(time.perf_counter() - started)
     material_count = len(records)
@@ -299,8 +313,11 @@ def append_sobol_batch(
                 "ritz_contraction_wall_s": assembly_totals["ritz_contraction_wall_s"]
                 / material_count,
                 "operator_assembly_mode": "sequential_exact_prefix_incremental",
+                "ritz_contraction_mode": contraction_mode,
                 "basis_projection_backend": str(basis.last_projection_backend),
                 "operator_stress_workspace_peak_bytes": stress_workspace_peak_bytes,
+                "operator_contraction_workspace_peak_bytes": contraction_workspace_peak_bytes,
+                "ritz_full_volume_equivalent_passes": full_volume_equivalent_passes,
                 "affine_q_block_size": int(affine_q_block_size),
                 "pod_batch_materials": material_count,
             }
@@ -539,14 +556,21 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(pipeline.get("memory_safety_fraction", 0.8)),
     )
-    parser.add_argument("--blas-threads", type=int, default=int(pipeline.get("blas_threads", 8)))
+    parser.add_argument(
+        "--blas-threads",
+        default=str(pipeline.get("blas_threads", "auto")),
+        help="Use 'auto' for the physical cores available to this process.",
+    )
     parser.add_argument(
         "--fft-backend",
         choices=("cpu", "gpu"),
         default=str(pipeline.get("fft_backend", "gpu")),
     )
     parser.add_argument("--geometry-backend", choices=("numba", "cupy", "auto"), default=str(generation["geometry_backend"]))
-    parser.add_argument("--generator-cores", type=int, default=int(generation["generator_cores"]))
+    parser.add_argument(
+        "--generator-cores",
+        default=str(generation.get("generator_cores", "auto")),
+    )
     parser.add_argument("--venv-path", type=Path, default=project_path(paths["venv_path"]))
     parser.add_argument("--save-operators", action=argparse.BooleanOptionalAction, default=bool(pipeline.get("save_operators", True)))
     parser.add_argument("--cleanup-snapshot-fields", action=argparse.BooleanOptionalAction, default=bool(pipeline.get("cleanup_snapshot_fields", True)))
@@ -563,7 +587,13 @@ def main() -> int:
         Path(__file__),
         marker_name="CMAME_SOBOL_POD_CUDA_READY",
     )
-    blas_controller, blas_info = common.configure_blas_threads(int(args.blas_threads))
+    cpu_info = common.cpu_resource_info()
+    blas_threads = common.resolve_cpu_workers(args.blas_threads, resource_info=cpu_info)
+    generator_cores = common.resolve_cpu_workers(
+        args.generator_cores,
+        resource_info=cpu_info,
+    )
+    blas_controller, blas_info = common.configure_blas_threads(blas_threads)
     pipeline_started = time.perf_counter()
     try:
         if int(args.start_materials) < 1:
@@ -675,7 +705,7 @@ def main() -> int:
 
         runtime = common.configure_runtime(
             geometry_backend=str(args.geometry_backend),
-            generator_cores=int(args.generator_cores),
+            generator_cores=generator_cores,
             solver_tol=float(common.SOLVER_PROFILES[str(args.basis_profile)]["solver_rtol"]),
             fft_backend=str(args.fft_backend),
         )
@@ -724,8 +754,14 @@ def main() -> int:
                 "rom_backend": str(args.rom_backend),
                 "memory_plan": memory_plan,
                 "basis_voxel_order": "matrix_then_fiber_by_orientation",
+                "basis_component_layout": "mandel_component_then_voxel",
                 "affine_orientation_kernel": "grouped_blocks_with_voxelwise_fallback",
-                "blas_threads": int(args.blas_threads),
+                "ritz_contraction_kernel": "exact_phase_supported_component_batched",
+                "blas_thread_policy": str(args.blas_threads),
+                "blas_threads": blas_threads,
+                "generator_core_policy": str(args.generator_cores),
+                "generator_cores": generator_cores,
+                "cpu_resources": cpu_info,
                 "blas_info": blas_info,
             },
         )
@@ -1077,6 +1113,14 @@ def main() -> int:
             "operator_assembly_total_wall_s": float(snapshot_timing["operator_assembly_wall_s"].sum()),
             "operator_stress_workspace_peak_bytes": int(
                 snapshot_timing["operator_stress_workspace_peak_bytes"].max()
+            ),
+            "operator_contraction_workspace_peak_bytes": int(
+                snapshot_timing[
+                    "operator_contraction_workspace_peak_bytes"
+                ].max()
+            ),
+            "ritz_full_volume_equivalent_passes": float(
+                snapshot_timing["ritz_full_volume_equivalent_passes"].max()
             ),
             "affine_stress_total_wall_s": float(snapshot_timing["affine_stress_wall_s"].sum()),
             "ritz_contraction_total_wall_s": float(snapshot_timing["ritz_contraction_wall_s"].sum()),

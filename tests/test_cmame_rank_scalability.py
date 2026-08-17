@@ -15,6 +15,15 @@ if str(SCRIPTS) not in sys.path:
 import cmame_campaign_common as rank_scaling
 
 
+def test_auto_cpu_workers_use_physical_scheduler_budget() -> None:
+    info = {
+        "auto_workers": 6,
+    }
+
+    assert rank_scaling.resolve_cpu_workers("auto", resource_info=info) == 6
+    assert rank_scaling.resolve_cpu_workers("3", resource_info=info) == 3
+
+
 def test_required_rank_reports_first_and_stable_crossings() -> None:
     curve = pd.DataFrame(
         {
@@ -177,3 +186,17 @@ def test_runtime_affine_block_respects_current_available_memory() -> None:
     )
 
     assert block_size == 2
+
+
+def test_runtime_affine_block_accounts_for_disjoint_phase_supports() -> None:
+    gib = 1024**3
+    block_size = rank_scaling.runtime_affine_q_block_size(
+        appended_fields_bytes=2 * gib,
+        coefficient_count=7,
+        memory_max_gib=4.0,
+        memory_safety_fraction=0.8,
+        available_bytes=100 * gib,
+        coefficient_supports=((2, 0.75), (5, 0.25)),
+    )
+
+    assert block_size == 7

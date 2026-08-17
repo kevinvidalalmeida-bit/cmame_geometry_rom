@@ -145,7 +145,6 @@ def test_incremental_ritz_operators_match_full_assembly():
         old_basis=old_basis,
         new_basis=new_basis,
         affine_stress_batch=affine,
-        basis_block_size=3,
     )
     Kf, Bf, Df, _ = reduced._assemble_reduced_operators(
         phase=phase, ori=ori, basis=fields
@@ -297,6 +296,50 @@ def test_phase_orientation_permutation_preserves_ritz_operators():
     np.testing.assert_allclose(K1, K0, rtol=2.0e-6, atol=2.0e-6)
     np.testing.assert_allclose(B1, B0, rtol=2.0e-6, atol=2.0e-6)
     np.testing.assert_allclose(D1, D0, rtol=3.0e-13, atol=3.0e-13)
+
+
+def test_phase_supported_incremental_ritz_is_exact_and_memory_bounded():
+    rng = np.random.default_rng(20260904)
+    shape = (6, 5, 4)
+    phase = np.zeros(shape, dtype=np.uint8)
+    phase.reshape(-1)[::4] = 1
+    ori = np.zeros(shape + (3,), dtype=np.float32)
+    fiber = np.flatnonzero(phase.reshape(-1))
+    ori.reshape(-1, 3)[fiber, np.arange(len(fiber)) % 3] = 1.0
+    basis = np.stack(_orthonormal_fields(rng, 9, (6,) + shape)).astype(np.float32)
+    order = reduced.phase_orientation_voxel_order(phase, ori)
+    ordered_phase = phase.reshape(-1)[order]
+    ordered_ori = ori.reshape(-1, 3)[order]
+    ordered_basis = np.take(basis.reshape(9, 6, -1), order, axis=2)
+    affine = reduced.affine_stress_batch_factory(ordered_phase, ordered_ori)
+
+    K0, B0, D0, _ = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=ordered_basis[:5],
+        affine_stress_batch=affine,
+    )
+    Ki, Bi, Di, metadata = reduced._extend_reduced_operators(
+        existing={"Kq": K0, "Bq": B0, "Dq": D0},
+        old_basis=ordered_basis[:5],
+        new_basis=ordered_basis[5:],
+        affine_stress_batch=affine,
+    )
+    Kf, Bf, Df, _ = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=ordered_basis,
+        affine_stress_batch=affine,
+    )
+
+    np.testing.assert_allclose(Ki, Kf, rtol=2.0e-5, atol=2.0e-6)
+    np.testing.assert_allclose(Bi, Bf, rtol=2.0e-5, atol=2.0e-6)
+    np.testing.assert_allclose(Di, Df, rtol=3.0e-13, atol=3.0e-13)
+    expected_passes = 2.0 * 0.75 + 5.0 * 0.25
+    assert metadata["contraction_mode"] == "phase_supported_blocks"
+    assert np.isclose(metadata["full_volume_equivalent_passes"], expected_passes)
+    dense_workspace = 7 * len(ordered_basis[5:]) * 6 * phase.size * 4
+    assert metadata["stress_workspace_peak_bytes"] < dense_workspace
 
 
 def test_vectorized_material_and_engineering_maps_match_scalar_references():

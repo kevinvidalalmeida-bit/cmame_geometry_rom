@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -151,6 +151,61 @@ def available_memory_bytes() -> int:
     return page_size * available_pages
 
 
+def cpu_resource_info() -> dict[str, Any]:
+    """Report CPU capacity visible to this process, including physical cores."""
+    try:
+        affinity = sorted(int(cpu) for cpu in os.sched_getaffinity(0))
+    except AttributeError:
+        affinity = list(range(int(os.cpu_count() or 1)))
+
+    physical_ids: set[tuple[int, int]] = set()
+    for cpu in affinity:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            package_id = int(
+                (topology / "physical_package_id").read_text(encoding="ascii")
+            )
+            core_id = int((topology / "core_id").read_text(encoding="ascii"))
+        except (OSError, ValueError):
+            physical_ids.clear()
+            break
+        physical_ids.add((package_id, core_id))
+
+    logical_count = max(1, len(affinity))
+    physical_count = len(physical_ids) if physical_ids else logical_count
+    scheduler_limits = []
+    for name in ("SLURM_CPUS_PER_TASK", "PBS_NP", "NSLOTS"):
+        try:
+            value = int(os.environ.get(name, ""))
+        except ValueError:
+            continue
+        if value > 0:
+            scheduler_limits.append(value)
+    scheduler_limit = min(scheduler_limits) if scheduler_limits else logical_count
+    auto_workers = max(1, min(physical_count, scheduler_limit))
+    return {
+        "logical_cpus_available": logical_count,
+        "physical_cores_available": physical_count,
+        "scheduler_cpu_limit": scheduler_limit,
+        "auto_workers": auto_workers,
+        "affinity": affinity,
+    }
+
+
+def resolve_cpu_workers(value: str | int, *, resource_info: dict[str, Any] | None = None) -> int:
+    """Resolve an explicit worker count or a portable physical-core policy."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        info = cpu_resource_info() if resource_info is None else resource_info
+        return int(info["auto_workers"])
+    try:
+        workers = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("CPU worker count must be 'auto' or a positive integer.") from exc
+    if workers < 1:
+        raise ValueError("CPU worker count must be positive.")
+    return workers
+
+
 def full_rank_memory_plan(
     *,
     nvox: int,
@@ -261,6 +316,7 @@ def runtime_affine_q_block_size(
     memory_max_gib: float,
     memory_safety_fraction: float,
     available_bytes: int | None = None,
+    coefficient_supports: tuple[tuple[int, float], ...] | None = None,
 ) -> int:
     """Choose the widest safe affine block for the current basis update."""
     bytes_per_coefficient = int(appended_fields_bytes)
@@ -277,11 +333,25 @@ def runtime_affine_q_block_size(
         * fraction
     )
     workspace_budget = min(configured_budget, current_budget)
-    if workspace_budget < bytes_per_coefficient:
+    supports = coefficient_supports or ((count, 1.0),)
+
+    def workspace_bytes(block_size: int) -> int:
+        return int(
+            max(
+                min(int(block_size), int(support_count)) * float(fraction_of_domain)
+                for support_count, fraction_of_domain in supports
+            )
+            * bytes_per_coefficient
+        )
+
+    if workspace_budget < workspace_bytes(1):
         raise MemoryError(
             "Insufficient available memory for one affine stress coefficient block."
         )
-    return min(count, workspace_budget // bytes_per_coefficient)
+    for block_size in range(count, 0, -1):
+        if workspace_bytes(block_size) <= workspace_budget:
+            return block_size
+    raise RuntimeError("Could not derive an affine coefficient block size.")
 
 
 def rom_chunk_memory_plan(
@@ -386,15 +456,17 @@ def solve_material(
     persistent_gpu_cache: bool = False,
     return_solution_fields: bool = False,
     solution_field_dtype: str | np.dtype | None = None,
+    solution_field_consumer: Callable[[int, np.ndarray], None] | None = None,
 ) -> dict[str, Any]:
     """Solve one material or return a validated campaign-owned cache entry."""
     if profile not in SOLVER_PROFILES:
         raise ValueError(f"Perfil desconocido: {profile}")
-    if return_solution_fields and not save_solution_fields:
-        raise ValueError("return_solution_fields requires save_solution_fields=True.")
+    in_memory_fields = return_solution_fields or solution_field_consumer is not None
+    if in_memory_fields and not save_solution_fields:
+        raise ValueError("In-memory solution fields require save_solution_fields=True.")
     material_dir = Path(material_dir)
     material_dir.mkdir(parents=True, exist_ok=True)
-    if not return_solution_fields and _cached_record_is_valid(
+    if not in_memory_fields and _cached_record_is_valid(
         material_dir, profile=profile, require_fields=save_solution_fields
     ):
         return json.loads((material_dir / "solve_record.json").read_text(encoding="utf-8"))
@@ -431,12 +503,17 @@ def solve_material(
     if return_solution_fields:
         params.pop("solution_field_out_path", None)
         params["solution_field_return_in_memory"] = True
+    if solution_field_consumer is not None:
+        params.pop("solution_field_out_path", None)
+        params["solution_field_consumer"] = solution_field_consumer
     if solution_field_dtype is not None:
         params["solution_field_dtype"] = str(np.dtype(solution_field_dtype))
     started = time.perf_counter()
     ceff = np.asarray(sobol_gpu.solve_homogenization(params), dtype=np.float64)
     solve_wall_s = float(time.perf_counter() - started)
     solution_fields = params.pop("_solution_fields_result", None)
+    consumed_fields = params.pop("_solution_fields_consumed", None)
+    params.pop("solution_field_consumer", None)
     np.save(material_dir / "Ceff.npy", ceff)
 
     timing_path = material_dir / "solver_timing.json"
@@ -458,7 +535,12 @@ def solve_material(
     if float(eigenvalues.min()) <= 0.0:
         raise RuntimeError(f"Tensor efectivo no SPD en {material_dir}.")
     if save_solution_fields:
-        if return_solution_fields:
+        if solution_field_consumer is not None:
+            if consumed_fields != tuple(range(6)):
+                raise RuntimeError(
+                    f"El consumidor no recibio los seis campos snapshot en {material_dir}."
+                )
+        elif return_solution_fields:
             if solution_fields is None or len(solution_fields) != 6:
                 raise RuntimeError(
                     f"El solver no devolvio los seis campos snapshot en {material_dir}."
@@ -468,7 +550,7 @@ def solve_material(
 
     solution_field_transport = "none"
     if save_solution_fields:
-        solution_field_transport = "memory" if return_solution_fields else "disk"
+        solution_field_transport = "memory" if in_memory_fields else "disk"
 
     record: dict[str, Any] = {
         **material_row,
@@ -479,7 +561,7 @@ def solve_material(
             if (material_dir / "solution_fields").is_dir()
             else str(material_dir / "solution_fields.npz")
         )
-        if save_solution_fields and not return_solution_fields
+        if save_solution_fields and not in_memory_fields
         else "",
         "solution_field_transport": solution_field_transport,
         "solver_timing_path": str(timing_path),
@@ -723,6 +805,7 @@ def ensure_snapshot(
     persistent_gpu_cache: bool = False,
     return_solution_fields: bool = False,
     solution_field_dtype: str | np.dtype | None = None,
+    solution_field_consumer: Callable[[int, np.ndarray], None] | None = None,
 ) -> dict[str, Any]:
     selected = candidates.loc[candidates["candidate_id"] == int(candidate_id)]
     if len(selected) != 1:
@@ -741,6 +824,7 @@ def ensure_snapshot(
         persistent_gpu_cache=bool(persistent_gpu_cache),
         return_solution_fields=bool(return_solution_fields),
         solution_field_dtype=solution_field_dtype,
+        solution_field_consumer=solution_field_consumer,
     )
 
 

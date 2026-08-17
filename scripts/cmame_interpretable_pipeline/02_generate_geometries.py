@@ -26,12 +26,13 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 FFT_ROOT = ROOT / "FFT"
 FFTHOMPY_ROOT = FFT_ROOT / "ffthompy_core" / "ffthompy"
-for path in (FFT_ROOT, FFTHOMPY_ROOT):
+for path in (ROOT / "scripts", FFT_ROOT, FFTHOMPY_ROOT):
     value = str(path)
     if value not in sys.path:
         sys.path.insert(0, value)
 
 from pipeline.rve_generator import generate_rve_main
+from cmame_campaign_common import cpu_resource_info, resolve_cpu_workers
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -115,6 +116,7 @@ def read_design(path: Path) -> pd.DataFrame:
 
 def generation_params(row: pd.Series, case_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
     generation = config["geometry_generation"]
+    generator_cores = resolve_cpu_workers(generation["generator_cores"])
     cluster_fraction = float(row.get("cluster_fraction", 0.0))
     center_distribution = "gaussian_mixture" if cluster_fraction > 0.0 else "uniform"
     start_scale = float(generation["sam_compaction_start_scale"])
@@ -123,8 +125,8 @@ def generation_params(row: pd.Series, case_dir: Path, config: dict[str, Any]) ->
         "resol": float(row["resolution_vox_per_um"]),
         "seed": int(row["seed"]),
         "output_dir": str(case_dir),
-        "num_cores": int(generation["generator_cores"]),
-        "sam_num_threads": int(generation["generator_cores"]),
+        "num_cores": generator_cores,
+        "sam_num_threads": generator_cores,
         "caja_um": float(row["box_um"]),
         "L_um": float(row["fiber_length_um"]),
         "d_um": float(row["fiber_diameter_um"]),
@@ -379,6 +381,7 @@ def run(config: dict[str, Any], destination: Path, selected_ids: set[int] | None
         generation_frame.to_excel(writer, sheet_name="generation", index=False)
 
     all_accepted = bool(realized["accepted_local"].all()) if not realized.empty else False
+    cpu_info = cpu_resource_info()
     write_json(
         geometry_root / "campaign_manifest.json",
         {
@@ -388,6 +391,11 @@ def run(config: dict[str, Any], destination: Path, selected_ids: set[int] | None
             "all_accepted": all_accepted,
             "design_space": config["design_space"],
             "geometry_generation": config["geometry_generation"],
+            "generator_cores": resolve_cpu_workers(
+                config["geometry_generation"]["generator_cores"],
+                resource_info=cpu_info,
+            ),
+            "cpu_resources": cpu_info,
         },
     )
     print(

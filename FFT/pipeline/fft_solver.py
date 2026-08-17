@@ -215,7 +215,9 @@ def _save_solution_fields_if_requested(
 ) -> Dict[str, Any]:
     out_path_raw = p.get("solution_field_out_path")
     return_in_memory = bool(p.get("solution_field_return_in_memory", False))
-    if not out_path_raw and not return_in_memory:
+    field_consumer = p.get("solution_field_consumer")
+    consume_in_memory = callable(field_consumer)
+    if not out_path_raw and not return_in_memory and not consume_in_memory:
         return {}
 
     out_path = Path(str(out_path_raw)) if out_path_raw else None
@@ -238,6 +240,7 @@ def _save_solution_fields_if_requested(
     if field_dtype not in {np.dtype(np.float32), np.dtype(np.float64)}:
         raise ValueError("solution_field_dtype debe ser float32 o float64.")
     saved_load_ids = []
+    field_shape: list[int] = []
     for load_id in load_ids:
         if load_id < 0 or load_id >= len(solutions):
             raise ValueError("solution_field_load_ids debe contener indices validos.")
@@ -247,23 +250,32 @@ def _save_solution_fields_if_requested(
         total = _to_numpy_array(solution.val).astype(field_dtype, copy=False)
         fluctuation = total.copy()
         fluctuation[load_id] -= field_dtype.type(1.0)
-        arrays[f"fluctuation_load{load_id}"] = fluctuation
-        if save_total:
+        field_shape = list(fluctuation.shape)
+        if consume_in_memory:
+            field_consumer(load_id, fluctuation)
+        else:
+            arrays[f"fluctuation_load{load_id}"] = fluctuation
+        if save_total and not consume_in_memory:
             arrays[f"total_load{load_id}"] = total
         saved_load_ids.append(int(load_id))
 
     metadata = {
         "load_ids": saved_load_ids,
         "grid_shape": [int(v) for v in Ngrid],
-        "field_shape": list(arrays[f"fluctuation_load{saved_load_ids[0]}"].shape)
-        if saved_load_ids
-        else [],
+        "field_shape": field_shape,
         "field": "zero-mean compatible fluctuation strain in Mandel/Kelvin order used by FFTHomPy",
         "macro_subtracted": True,
-        "saved_total_fields": bool(save_total),
+        "saved_total_fields": bool(save_total and not consume_in_memory),
         "dtype": str(field_dtype),
         "load_description": "load0..load5 = E11,E22,E33,E23,E13,E12 unitarios en notacion Mandel",
     }
+    if consume_in_memory:
+        p["_solution_fields_consumed"] = tuple(saved_load_ids)
+        return {
+            "solution_field_path": "",
+            "solution_field_format": "memory_consumer",
+            **metadata,
+        }
     if return_in_memory:
         p["_solution_fields_result"] = tuple(
             arrays[f"fluctuation_load{load_id}"] for load_id in saved_load_ids
@@ -737,6 +749,7 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
     solution_field_requested = bool(
         p.get("solution_field_out_path")
         or p.get("solution_field_return_in_memory", False)
+        or callable(p.get("solution_field_consumer"))
     )
     stress_slice_requested = bool(p.get("stress_slice_out_path"))
     stress_volume_requested = bool(p.get("stress_volume_out_path"))

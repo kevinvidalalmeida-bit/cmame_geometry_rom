@@ -48,6 +48,35 @@ def test_solution_fields_can_return_in_memory_without_disk(tmp_path: Path):
         np.testing.assert_allclose(actual_field, expected_field, rtol=2.0e-6)
 
 
+def test_solution_fields_can_stream_to_consumer_without_retention(tmp_path: Path):
+    solutions = []
+    consumed = {}
+    for load_id in range(6):
+        total = np.zeros((6, 2, 2, 2), dtype=np.float64)
+        total[load_id] = 1.0 + 0.02 * (load_id + 1)
+        solutions.append(SimpleNamespace(val=total))
+
+    params = {
+        "solution_field_consumer": lambda load_id, field: consumed.__setitem__(
+            load_id, field.copy()
+        ),
+        "solution_field_dtype": "float32",
+    }
+    metadata = _save_solution_fields_if_requested(
+        prob=SimpleNamespace(output={"sol_primal": solutions}),
+        Ngrid=np.array((2, 2, 2)),
+        p=params,
+    )
+
+    assert metadata["solution_field_format"] == "memory_consumer"
+    assert params["_solution_fields_consumed"] == tuple(range(6))
+    assert "_solution_fields_result" not in params
+    assert not list(tmp_path.iterdir())
+    for load_id, field in consumed.items():
+        assert field.dtype == np.float32
+        np.testing.assert_allclose(field[load_id], 0.02 * (load_id + 1), rtol=2e-6)
+
+
 def _frequency_unit_vectors(shape: tuple[int, int, int]) -> tuple[np.ndarray, np.ndarray]:
     grids = np.meshgrid(*[np.fft.fftfreq(size) for size in shape], indexing="ij")
     frequency = np.asarray(grids, dtype=float)

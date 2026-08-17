@@ -196,7 +196,7 @@ def command_for_geometry(
         "--memory-safety-fraction",
         str(float(pipe.get("memory_safety_fraction", 0.8))),
         "--blas-threads",
-        str(int(pipe.get("blas_threads", 8))),
+        str(pipe.get("blas_threads", "auto")),
         "--start-materials",
         str(int(pipe.get("start_materials", 2))),
         "--training-limit",
