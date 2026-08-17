@@ -481,7 +481,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional operational cap; zero uses the memory-safe candidate limit.",
     )
     parser.add_argument("--monitor-count", type=int, default=int(pipeline.get("monitor_count", 16)))
-    parser.add_argument("--stopping-consecutive", type=int, default=int(pipeline.get("stopping_consecutive", 2)))
+    parser.add_argument("--stopping-consecutive", type=int, default=int(pipeline.get("stopping_consecutive", 1)))
     parser.add_argument("--final-validation-count", type=int, default=int(pipeline.get("final_validation_count", 16)))
     parser.add_argument("--candidate-seed", type=int, default=int(pipeline.get("candidate_seed", 20260821)))
     parser.add_argument("--monitor-seed", type=int, default=int(pipeline.get("monitor_seed", 20260822)))

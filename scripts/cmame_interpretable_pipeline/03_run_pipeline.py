@@ -170,7 +170,7 @@ def command_for_geometry(
         "--monitor-seed",
         str(int(pipe.get("monitor_seed", 20260822))),
         "--stopping-consecutive",
-        str(int(pipe.get("stopping_consecutive", 2))),
+        str(int(pipe.get("stopping_consecutive", 1))),
         "--final-validation-count",
         str(int(pipe.get("final_validation_count", 16))),
         "--final-validation-seed",

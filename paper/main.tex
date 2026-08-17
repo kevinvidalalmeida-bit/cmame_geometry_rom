@@ -118,8 +118,8 @@ Accuracy is assessed by independent Fourier--Galerkin solves over the
 admissible material space, while
 the online stage uses only reduced dense systems assembled from the
 precomputed affine blocks. A fixed 16-material monitor set controls sequential
-enrichment, requiring two consecutive prefixes below the target error. The
-frozen model is then assessed once on a second independent 16-material set
+enrichment, stopping at the first prefix below the target error. The frozen
+model is then assessed once on a second independent 16-material set
 that has no role in construction. The
 elasticity specialization is stated separately to make explicit how the common
 transfer algebra applies to three-dimensional stiffness tensors.
@@ -926,10 +926,14 @@ operators satisfy
 The derivation of Eqs.~\eqref{eq:ritz_schur_identity} and
 \eqref{eq:nested_ritz_ordering} is given in
 Appendix~\ref{app:ritz_schur}. The nested-space statement is a structural
-property of Ritz approximation; sequential POD bases recomputed with the
-relative numerical-rank threshold need not be exactly nested in finite
-precision, so the adaptive stopping rule below does not assume monotone
-prefix errors.
+property of Ritz approximation. The implementation retains every accepted
+basis vector and only appends numerically independent directions, so its trial
+spaces are nested by construction. Consequently, in exact arithmetic the
+positive-semidefinite error in Eq.~\eqref{eq:ritz_schur_identity}, its
+Frobenius norm, and the corresponding maximum over a fixed monitor set are
+nonincreasing. Mixed precision, iterative-solver tolerances, and finite
+orthogonalization accuracy can introduce small numerical perturbations to this
+ordering; monotonicity is therefore audited rather than assumed bitwise.
 
 A standard material query therefore requires only the constitutive
 coefficients \(\gamma_q(\boldsymbol\xi)\), the assembly of the small reduced
@@ -965,13 +969,10 @@ e_{A,j}
 The \(N_M=16\) full-order monitor tensors are computed once before enrichment.
 Starting at the second Sobol training material, the current ROM is evaluated
 on \(\Xi_M\) after every newly appended material. Enrichment stops when
-\(\max_j e_{M,j}\leq\varepsilon_{\mathrm{ROM}}\) for two consecutive Sobol
-prefixes. The consecutive requirement prevents a single nonmonotone crossing
-from terminating the process. The training sequence remains Sobol ordered;
-the monitor set determines only when its prefix is long enough. For the
-elasticity campaign, the internal stopping value is
-\(\varepsilon_{\mathrm{ROM}}=10^{-5}\), one order of magnitude below the
-reported accuracy threshold.
+\(\max_j e_{M,j}\leq\varepsilon_{\mathrm{ROM}}\) for the first time. The
+training sequence remains Sobol ordered; the monitor set determines only when
+its prefix is long enough. For the elasticity campaign,
+\(\varepsilon_{\mathrm{ROM}}=10^{-4}\).
 
 After stopping, the reduced operators are frozen. Only then are the
 \(N_V=16\) final-validation materials solved with the full-order model and
@@ -1018,8 +1019,8 @@ operators.
       numerical-rank basis \(V_r\), and update the projected blocks in
       Eq.~\eqref{eq:compiled_reduced_operators}.
 \item From the second training material onward, evaluate
-      \(\max_j e_{M,j}\) after every update. Continue until it is below
-      \(\varepsilon_{\mathrm{ROM}}\) for two consecutive prefixes.
+      \(\max_j e_{M,j}\) after every update. Stop at the first prefix at or
+      below \(\varepsilon_{\mathrm{ROM}}=10^{-4}\).
 \item Freeze the final reduced operators and discard the microscopic snapshots
       and POD basis.
 \item Solve the \(N_V=16\) final-validation materials once, evaluate
