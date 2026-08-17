@@ -476,15 +476,39 @@ def write_excel(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
 def write_plot(curve: pd.DataFrame, path: Path, target_error: float) -> None:
     try:
         import matplotlib.pyplot as plt
+        from matplotlib.ticker import FuncFormatter
 
         fig, ax = plt.subplots(figsize=(7.0, 4.2))
         x = curve["training_materials"].to_numpy(dtype=int)
-        ax.semilogy(x, curve["monitor_error_mean"], marker="o", label="mean")
-        ax.semilogy(x, curve["monitor_error_p95"], marker="s", label="p95")
-        ax.semilogy(x, curve["monitor_error_max"], marker="^", label="maximum")
-        ax.axhline(float(target_error), color="black", linestyle="--", linewidth=1.0)
+        percent_scale = 100.0
+        ax.semilogy(
+            x,
+            percent_scale * curve["monitor_error_mean"],
+            marker="o",
+            label="mean",
+        )
+        ax.semilogy(
+            x,
+            percent_scale * curve["monitor_error_p95"],
+            marker="s",
+            label="p95",
+        )
+        ax.semilogy(
+            x,
+            percent_scale * curve["monitor_error_max"],
+            marker="^",
+            label="maximum",
+        )
+        ax.axhline(
+            percent_scale * float(target_error),
+            color="black",
+            linestyle="--",
+            linewidth=1.0,
+            label=f"{percent_scale * target_error:g}% target",
+        )
         ax.set_xlabel("Sobol training materials used for full-rank POD")
-        ax.set_ylabel("relative Frobenius error on the FFT monitor set")
+        ax.set_ylabel("Relative Frobenius error on FFT monitor set (%)")
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}%"))
         ax.grid(True, which="both", alpha=0.25)
         ax.legend()
         fig.tight_layout()

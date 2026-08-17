@@ -420,14 +420,16 @@ def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) ->
         return
     try:
         import matplotlib.pyplot as plt
+        from matplotlib.ticker import FuncFormatter
 
         fig, ax = plt.subplots(figsize=(8.8, 5.2))
+        percent_scale = 100.0
         stop_markers: list[tuple[pd.DataFrame, str]] = []
         for geometry_id, group in curve.groupby("geometry_id", sort=True):
             group = group.sort_values("training_materials")
             (line,) = ax.semilogy(
                 group["training_materials"].to_numpy(dtype=int),
-                group["monitor_error_max"].to_numpy(dtype=float),
+                percent_scale * group["monitor_error_max"].to_numpy(dtype=float),
                 marker="o",
                 linewidth=1.5,
                 markersize=3.8,
@@ -438,16 +440,16 @@ def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) ->
                 if not stop.empty:
                     stop_markers.append((stop, line.get_color()))
         ax.axhline(
-            float(target_error),
+            percent_scale * float(target_error),
             color="black",
             linestyle="--",
             linewidth=1.0,
-            label=f"{target_error:.0e} stop target",
+            label=f"{percent_scale * target_error:g}% stop target",
         )
         for marker_index, (stop, color) in enumerate(stop_markers):
             ax.scatter(
                 stop["training_materials"].to_numpy(dtype=int),
-                stop["monitor_error_max"].to_numpy(dtype=float),
+                percent_scale * stop["monitor_error_max"].to_numpy(dtype=float),
                 marker="X",
                 s=48,
                 color=color,
@@ -457,8 +459,9 @@ def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) ->
                 label="first accepted pass" if marker_index == 0 else None,
             )
         ax.set_xlabel("Sobol training materials used for POD")
-        ax.set_ylabel("maximum relative error on the FFT monitor set")
+        ax.set_ylabel("Maximum relative Frobenius error on FFT monitor set (%)")
         ax.set_title("One-pass stopping at the first tolerance crossing")
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}%"))
         ax.grid(True, which="both", alpha=0.25)
         ax.legend(ncol=2, fontsize=8)
         fig.tight_layout()
