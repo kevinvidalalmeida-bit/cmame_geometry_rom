@@ -307,6 +307,13 @@ def one_pass_timing_table(
         "monitor_count",
         "monitor_fft_once_s",
         "adaptive_training_s",
+        "training_snapshot_fft_s",
+        "pod_basis_update_s",
+        "reduced_operator_assembly_s",
+        "affine_stress_action_s",
+        "ritz_contraction_s",
+        "monitor_rom_updates_s",
+        "training_other_s",
         "final_validation_count",
         "final_validation_s",
         "rom_query_count",
@@ -341,6 +348,12 @@ def one_pass_timing_table(
         )
         adaptive_training_s = (
             float(first_stop["snapshot_step_wall_s"]) + training_overhead_s
+        )
+        snapshot_fft_s = float(first_stop["snapshot_solve_wall_s"])
+        basis_update_s = float(first_stop["basis_update_wall_s"])
+        operator_assembly_s = float(first_stop["operator_assembly_wall_s"])
+        training_other_s = adaptive_training_s - (
+            snapshot_fft_s + basis_update_s + operator_assembly_s
         )
         removed_confirmation_s = max(
             float(full_stop["snapshot_step_wall_s"])
@@ -378,6 +391,15 @@ def one_pass_timing_table(
                 "monitor_count": int(record["monitor_count"]),
                 "monitor_fft_once_s": monitor_s,
                 "adaptive_training_s": adaptive_training_s,
+                "training_snapshot_fft_s": snapshot_fft_s,
+                "pod_basis_update_s": basis_update_s,
+                "reduced_operator_assembly_s": operator_assembly_s,
+                "affine_stress_action_s": float(first_stop["affine_stress_wall_s"]),
+                "ritz_contraction_s": float(first_stop["ritz_contraction_wall_s"]),
+                "monitor_rom_updates_s": float(
+                    first_stop["monitor_rom_cumulative_wall_s"]
+                ),
+                "training_other_s": training_other_s,
                 "final_validation_count": int(record["final_validation_count"]),
                 "final_validation_s": validation_s,
                 "rom_query_count": int(rom_query_count),
