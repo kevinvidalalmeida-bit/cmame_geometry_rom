@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from dataclasses import dataclass
+import gc
 import json
 import math
 import os
@@ -105,6 +106,7 @@ def configure_runtime(
     )
     runtime = sweep._configure_fft_runtime(args)
     sobol_gpu = runtime["sobol_gpu"]
+    sobol_gpu.SOLVER_TOL = runtime_tol
     backend = str(fft_backend).lower()
     if backend not in {"cpu", "gpu"}:
         raise ValueError("fft_backend must be cpu or gpu.")
@@ -509,7 +511,14 @@ def solve_material(
     if solution_field_dtype is not None:
         params["solution_field_dtype"] = str(np.dtype(solution_field_dtype))
     started = time.perf_counter()
-    ceff = np.asarray(sobol_gpu.solve_homogenization(params), dtype=np.float64)
+    try:
+        ceff = np.asarray(sobol_gpu.solve_homogenization(params), dtype=np.float64)
+    finally:
+        if not persistent_gpu_cache:
+            # The local FFTHomPy Problem must be unreachable before CuPy can
+            # release its large FFT workspaces.
+            gc.collect()
+            sobol_gpu.free_gpu_memory_pool(clear_fft_cache=True)
     solve_wall_s = float(time.perf_counter() - started)
     solution_fields = params.pop("_solution_fields_result", None)
     consumed_fields = params.pop("_solution_fields_consumed", None)
