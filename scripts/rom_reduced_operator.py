@@ -868,7 +868,7 @@ def _gpu_contract_dense(
                 A_chunk = np.stack([v[component, s_start:s_end] for v in A])
             else:
                 A_chunk = A[:, component, s_start:s_end]
-            A_gpu = cp.asarray(np.ascontiguousarray(A_chunk), dtype=cp.float32)
+            A_gpu = cp.asarray(np.ascontiguousarray(A_chunk), dtype=cp.float64)
             
             if A is B:
                 B_gpu = A_gpu
@@ -877,7 +877,7 @@ def _gpu_contract_dense(
                     B_chunk = np.stack([v[component, s_start:s_end] for v in B])
                 else:
                     B_chunk = B[:, component, s_start:s_end]
-                B_gpu = cp.asarray(np.ascontiguousarray(B_chunk), dtype=cp.float32)
+                B_gpu = cp.asarray(np.ascontiguousarray(B_chunk), dtype=cp.float64)
                 
             result += cp.asarray(A_gpu @ B_gpu.T, dtype=cp.float64)
             
