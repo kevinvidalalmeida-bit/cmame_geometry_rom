@@ -432,7 +432,29 @@ def _cached_record_is_valid(
     if require_fields and not _snapshot_fields_available(material_dir):
         return False
     record = json.loads(record_path.read_text(encoding="utf-8"))
-    return bool(record.get("solver_all_converged", False)) and record.get("solver_profile") == profile
+    if not bool(record.get("solver_all_converged", False)):
+        return False
+    if record.get("solver_profile") != profile:
+        return False
+    settings = SOLVER_PROFILES.get(profile, {})
+    if settings:
+        if str(record.get("solver_real_dtype", "")) != str(settings["solver_real_dtype"]):
+            return False
+        if not np.isclose(
+            float(record.get("solver_rtol", np.nan)),
+            float(settings["solver_rtol"]),
+            rtol=0.0,
+            atol=1.0e-15,
+        ):
+            return False
+        if not np.isclose(
+            float(record.get("solver_atol", np.nan)),
+            float(settings["solver_atol"]),
+            rtol=0.0,
+            atol=1.0e-15,
+        ):
+            return False
+    return True
 
 
 def _snapshot_fields_available(material_dir: Path) -> bool:
@@ -460,16 +482,24 @@ def solve_material(
     solution_field_dtype: str | np.dtype | None = None,
     solution_field_consumer: Callable[[int, np.ndarray], None] | None = None,
     initial_solution_fields: Any = None,
+    return_solution_sensitivities: bool = False,
+    solution_sensitivity_dtype: str | np.dtype | None = None,
+    solution_sensitivity_consumer: Callable[[int, str, int, np.ndarray], None] | None = None,
+    solution_sensitivity_batch_size: int | None = None,
 ) -> dict[str, Any]:
     """Solve one material or return a validated campaign-owned cache entry."""
     if profile not in SOLVER_PROFILES:
         raise ValueError(f"Perfil desconocido: {profile}")
     in_memory_fields = return_solution_fields or solution_field_consumer is not None
+    in_memory_sensitivities = (
+        return_solution_sensitivities
+        or solution_sensitivity_consumer is not None
+    )
     if in_memory_fields and not save_solution_fields:
         raise ValueError("In-memory solution fields require save_solution_fields=True.")
     material_dir = Path(material_dir)
     material_dir.mkdir(parents=True, exist_ok=True)
-    if not in_memory_fields and _cached_record_is_valid(
+    if not in_memory_fields and not in_memory_sensitivities and _cached_record_is_valid(
         material_dir, profile=profile, require_fields=save_solution_fields
     ):
         return json.loads((material_dir / "solve_record.json").read_text(encoding="utf-8"))
@@ -511,6 +541,14 @@ def solve_material(
         params["solution_field_consumer"] = solution_field_consumer
     if solution_field_dtype is not None:
         params["solution_field_dtype"] = str(np.dtype(solution_field_dtype))
+    if return_solution_sensitivities:
+        params["solution_sensitivity_return_in_memory"] = True
+    if solution_sensitivity_consumer is not None:
+        params["solution_sensitivity_consumer"] = solution_sensitivity_consumer
+    if solution_sensitivity_dtype is not None:
+        params["solution_sensitivity_dtype"] = str(np.dtype(solution_sensitivity_dtype))
+    if solution_sensitivity_batch_size is not None:
+        params["solution_sensitivity_batch_size"] = int(solution_sensitivity_batch_size)
     started = time.perf_counter()
     try:
         ceff = np.asarray(sobol_gpu.solve_homogenization(params), dtype=np.float64)
@@ -523,7 +561,10 @@ def solve_material(
     solve_wall_s = float(time.perf_counter() - started)
     solution_fields = params.pop("_solution_fields_result", None)
     consumed_fields = params.pop("_solution_fields_consumed", None)
+    solution_sensitivities = params.pop("_solution_sensitivities_result", None)
+    consumed_sensitivities = params.pop("_solution_sensitivities_consumed", None)
     params.pop("solution_field_consumer", None)
+    params.pop("solution_sensitivity_consumer", None)
     np.save(material_dir / "Ceff.npy", ceff)
 
     timing_path = material_dir / "solver_timing.json"
@@ -557,10 +598,29 @@ def solve_material(
                 )
         elif not _snapshot_fields_available(material_dir):
             raise RuntimeError(f"Faltan campos snapshot en {material_dir}.")
+    if in_memory_sensitivities:
+        if solution_sensitivity_consumer is not None:
+            expected = {(q, load_id) for q in range(7) for load_id in range(6)}
+            consumed = set(consumed_sensitivities or ())
+            if consumed != expected:
+                raise RuntimeError(
+                    f"El consumidor no recibio las 42 sensibilidades en {material_dir}."
+                )
+        elif return_solution_sensitivities:
+            if (
+                solution_sensitivities is None
+                or np.asarray(solution_sensitivities).shape[:3] != (7, 6, 6)
+            ):
+                raise RuntimeError(
+                    f"El solver no devolvio las sensibilidades afines en {material_dir}."
+                )
 
     solution_field_transport = "none"
     if save_solution_fields:
         solution_field_transport = "memory" if in_memory_fields else "disk"
+    solution_sensitivity_transport = "none"
+    if in_memory_sensitivities:
+        solution_sensitivity_transport = "memory"
 
     record: dict[str, Any] = {
         **material_row,
@@ -574,6 +634,7 @@ def solve_material(
         if save_solution_fields and not in_memory_fields
         else "",
         "solution_field_transport": solution_field_transport,
+        "solution_sensitivity_transport": solution_sensitivity_transport,
         "solver_timing_path": str(timing_path),
         "solver_profile": profile,
         "solver_real_dtype": settings["solver_real_dtype"],
@@ -908,19 +969,30 @@ def append_orthonormal(
     tolerance: float,
     basis_block_size: int = 12,
 ) -> list[np.ndarray]:
-    # IMPLICIT RITZ: Do not compute Gram-Schmidt explicitly!
-    # Just append the raw fields. The implicit Ritz compiler will threshold
-    # the condition number during the assembly pass on the GPU.
     incoming = [np.asarray(field, dtype=np.float64) for field in fields]
     if not incoming:
         return []
-    
-    # We do NOT orthogonalize here.
-    # The list `basis` now holds S (raw fields) instead of V (orthonormal base).
-    appended = [
-        row.reshape(incoming[0].shape)
-        for row in incoming
-    ]
+
+    shape = incoming[0].shape
+    values = np.stack([field.reshape(-1) for field in incoming], axis=0)
+    count = float(values.shape[1])
+    _project_matrix_against_basis_blocks(
+        values, basis, basis_block_size=int(basis_block_size)
+    )
+    _project_matrix_against_basis_blocks(
+        values, basis, basis_block_size=int(basis_block_size)
+    )
+
+    gram = np.asarray(values @ values.T / count, dtype=np.float64)
+    gram = 0.5 * (gram + gram.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(gram)
+    keep = np.flatnonzero(eigenvalues > float(tolerance) ** 2)[::-1]
+    if not len(keep):
+        return []
+
+    transform = (eigenvectors[:, keep] / np.sqrt(eigenvalues[keep])).T
+    block = transform @ values
+    appended = [row.reshape(shape) for row in block]
     basis.extend(appended)
     return appended
 

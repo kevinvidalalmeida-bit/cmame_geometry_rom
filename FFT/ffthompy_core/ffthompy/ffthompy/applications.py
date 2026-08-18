@@ -7,7 +7,7 @@ from ffthompy.general.solver import linear_solver
 from ffthompy.general.solver_pp import CallBack, CallBack_GA
 from ffthompy.general.base import Timer
 from ffthompy.tensors import Tensor, DFT, Operator
-from ffthompy.tensors.fft import cupy_synchronize
+from ffthompy.tensors.fft import cupy_synchronize, to_host_array
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import sys
 import sysconfig
@@ -506,6 +506,159 @@ def solve_load_elasticity_batch(load_ids, D, Nbar, Afun, pb, GN, A, add_macro2mi
     return load_ids, batch_solutions, [dict(result_template) for _ in load_ids]
 
 
+def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='c'):
+    """Solve exact discrete affine sensitivities around the current primal anchor.
+
+    The primal corrector satisfies ``G A(gamma) e = 0``.  Differentiating with
+    respect to an affine coefficient ``gamma_q`` gives
+    ``G A(gamma) de_q = -G dA_q e`` with zero macroscopic mean.
+    """
+    cfields = pb.solve.get('affine_sensitivity_cfields', None)
+    if cfields is None:
+        return None, {}
+
+    names = list(pb.solve.get('affine_sensitivity_names', []))
+    q_count = int(len(cfields))
+    if not names:
+        names = ['gamma_{0}'.format(q) for q in range(q_count)]
+    if len(names) != q_count:
+        raise ValueError("affine_sensitivity_names no coincide con affine_sensitivity_cfields.")
+
+    active_load_ids = pb.solve.get('active_load_ids', None)
+    if active_load_ids is None:
+        load_ids = list(range(D))
+    else:
+        load_ids = sorted({int(value) for value in active_load_ids})
+    if any(not hasattr(solutions[iL], 'val') for iL in load_ids):
+        raise RuntimeError("No hay soluciones primales para calcular sensibilidades afines.")
+
+    batch_size = max(
+        1,
+        int(pb.solve.get('affine_sensitivity_batch_size', pb.solve.get('load_batch_size', 1))),
+    )
+    batch_size = min(batch_size, len(load_ids))
+    real_dtype = _solver_real_dtype(pb)
+    par = dict(pb.solver)
+
+    field_shape = tuple(int(v) for v in np.asarray(Nbar, dtype=int).tolist())
+    fields = np.empty((q_count, len(load_ids), D) + field_shape, dtype=np.dtype(real_dtype))
+    solver_infos = []
+
+    for q, cfield in enumerate(cfields):
+        cfield_array = cfield
+        cfield_shape = tuple(int(value) for value in np.shape(cfield_array))
+        if cfield_shape[:1] == (21,):
+            multype = 'sym21'
+            order = 1
+        elif cfield_shape[:2] == (D, D):
+            multype = 21
+            order = 2
+        else:
+            raise ValueError(
+                "Campo dA/dgamma incompatible: "
+                "se esperaba (21, *N) o (6, 6, *N)."
+            )
+        dA = Tensor(
+            name='dA_dgamma_{0}'.format(q),
+            val=cfield_array,
+            order=order,
+            N=Nbar,
+            Y=pb.Y,
+            multype=multype,
+            Fourier=False,
+            origin=0,
+            fft_form=fft_form,
+        )
+
+        for start in range(0, len(load_ids), batch_size):
+            chunk_load_ids = load_ids[start:start + batch_size]
+            if len(chunk_load_ids) == 1:
+                load_id = int(chunk_load_ids[0])
+                stress_rhs = dA(solutions[load_id])
+                B = -(GN(stress_rhs))
+                x0 = B.zeros_like(name='x0_sens')
+                X, info = linear_solver(
+                    solver=pb.solver['kind'],
+                    Afun=Afun,
+                    B=B,
+                    x0=x0,
+                    par=par,
+                    callback=None,
+                )
+                fields[q, start] = to_host_array(X.val).astype(np.dtype(real_dtype), copy=False)
+                solver_infos.append({
+                    'coefficient_index': int(q),
+                    'coefficient_name': str(names[q]),
+                    'load_ids': [load_id],
+                    'info': info,
+                })
+                continue
+
+            val = np.stack([to_host_array(solutions[iL].val) for iL in chunk_load_ids], axis=1)
+            sol_batch = solutions[int(chunk_load_ids[0])].copy(
+                name='sol_total_batch',
+                val=val,
+                order=2,
+            )
+            stress_rhs = dA(sol_batch)
+            B = -(GN(stress_rhs))
+            x0 = B.zeros_like(name='x0_sens_batch')
+            batch_par = dict(par)
+            batch_par['batched_rhs'] = True
+            X, info = linear_solver(
+                solver=pb.solver['kind'],
+                Afun=Afun,
+                B=B,
+                x0=x0,
+                par=batch_par,
+                callback=None,
+            )
+            x_host = to_host_array(X.val).astype(np.dtype(real_dtype), copy=False)
+            for local, load_id in enumerate(chunk_load_ids):
+                fields[q, start + local] = x_host[:, local]
+            solver_infos.append({
+                'coefficient_index': int(q),
+                'coefficient_name': str(names[q]),
+                'load_ids': [int(value) for value in chunk_load_ids],
+                'info': info,
+            })
+
+    rel_residuals = []
+    convergence_flags = []
+    iterations = []
+    for item in solver_infos:
+        info = item.get('info', {})
+        if 'norm_res_rel_per_rhs' in info:
+            rel_residuals.extend(float(value) for value in info['norm_res_rel_per_rhs'])
+        elif 'norm_res_rel' in info:
+            rel_residuals.append(float(info['norm_res_rel']))
+        elif 'norm_res' in info and 'rhs_norm' in info:
+            rhs_norm = max(float(info['rhs_norm']), np.finfo(float).tiny)
+            rel_residuals.append(float(info['norm_res']) / rhs_norm)
+        if 'converged_per_rhs' in info:
+            convergence_flags.extend(bool(value) for value in info['converged_per_rhs'])
+        elif 'converged' in info:
+            convergence_flags.append(bool(info['converged']))
+        if 'kit' in info:
+            iterations.append(int(info['kit']))
+
+    summary = {
+        'coefficient_names': names,
+        'load_ids': [int(value) for value in load_ids],
+        'batch_size': int(batch_size),
+        'solve_count': int(len(solver_infos)),
+        'rhs_count': int(q_count * len(load_ids)),
+        'all_converged': bool(all(convergence_flags)) if convergence_flags else False,
+        'final_norm_res_rel_max': float(max(rel_residuals)) if rel_residuals else np.nan,
+        'cg_iterations_max': int(max(iterations)) if iterations else -1,
+    }
+    return {
+        'fields': fields,
+        'coefficient_names': names,
+        'load_ids': [int(value) for value in load_ids],
+    }, summary
+
+
 def _is_free_threaded_python():
     checker = getattr(sys, '_is_gil_enabled', None)
     if checker is not None:
@@ -840,6 +993,20 @@ def elasticity(problem):
             pb.output.setdefault('solver_timing', {})[primaldual] = profile_summary
             _print_timing_summary(profile_summary)
 
+        affine_sensitivity_summary = {}
+        if (
+            primaldual == 'primal'
+            and pb.solve.get('affine_sensitivity_cfields', None) is not None
+        ):
+            sens_t0 = _stage_tic()
+            sensitivity_output, affine_sensitivity_summary = solve_affine_sensitivity_fields(
+                D, Nbar, Afun, pb, GN, solutions, fft_form
+            )
+            affine_sensitivity_summary['wall_s'] = float(_stage_toc(sens_t0))
+            if sensitivity_output is not None:
+                pb.output['affine_sensitivity_' + primaldual] = sensitivity_output
+                pb.output['affine_sensitivity_summary_' + primaldual] = affine_sensitivity_summary
+
         # POSTPROCESSING
         partial_load_output = bool(pb.solve.get('partial_load_output', False))
         if partial_load_output:
@@ -873,6 +1040,7 @@ def elasticity(problem):
                 atol=pb.solver.get('atol', 0.0),
                 maxiter=pb.solver.get('maxiter', 0),
             ),
+            'affine_sensitivity_summary': affine_sensitivity_summary,
         }
 
 
