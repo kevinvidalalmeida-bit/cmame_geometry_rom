@@ -7,7 +7,7 @@ scripts/cmame_interpretable_pipeline/campaign_config.json
 ```
 
 That file contains the design space, the ten manual cases, geometry seeds,
-SAM tolerances, Sobol material seeds, adaptive stopping, and validation settings.
+SAM tolerances, Sobol material seeds, fixed training, and validation settings.
 
 The scripts automatically relaunch inside:
 
@@ -41,16 +41,28 @@ Default choices:
 - Ten manual interpretable cases: baseline, low/high `Vf`, short/long `AR`, planar xy, aligned x, biased triaxial, dilute-short, dense-long.
 - Geometry resolution: `6` voxels per fiber diameter, giving `60`, `150`, and
   `240` voxels per side for the current cases. Binary voxelization is retained.
-- ROM campaign: sequential Sobol + numerical full-rank POD, adding one material at a time.
-- FFT precision: training, monitoring, and final validation use `float64` with
-  `rtol=1e-8`. Snapshot/POD storage and contractions remain contiguous
+- ROM campaign: a fixed 14-material Sobol set followed by numerical full-rank
+  POD/Ritz compilation. The solve order may change for warm starts, but the
+  selected Sobol set does not.
+- FFT precision: training and final validation use the configured `snapshot`
+  profile (`float32`, `rtol=1e-5`). Snapshot storage remains contiguous
   `float32`; reduced operators and online solves remain `float64`.
-- Adaptive stop: solve `16` independent FFT monitor materials once, evaluate
-  from training material 2 onward, and stop at the first prefix whose maximum
-  monitor error is at or below `1e-4`.
+- The default fixed mode solves no preliminary monitor or calibration FOMs.
+  Reduced operators are compiled once after the 14 training materials.
+- Optional adaptive mode is enabled explicitly with `--adaptive`. It solves an
+  independent pool of `5` monitor materials once before training and reuses
+  their truth solutions at each stopping check. `--monitor-count` can override
+  that default without changing the final held-out validation set.
+
+For example, this activates those five preliminary monitor solves:
+
+```bash
+python scripts/cmame_interpretable_pipeline/04_sobol_pod_pipeline.py \
+  --geometry-id 9 --adaptive
+```
 - Final validation: after freezing the ROM, solve a new independent set of
-  `16` FFT materials exactly once with `truth_profile=snapshot` (`float64`,
-  `rtol=1e-8`). These final points never control training. The output reports
+  `5` FFT materials exactly once with `truth_profile=snapshot`. These final
+  points never control training. The output reports
   the count and percentage with relative Frobenius error at or below `1e-4`.
   Since `100 * 1e-4 = 0.01`, that threshold means `0.01%` relative tensor-norm
   error on each observed geometry-material pair; it is not a global-domain
@@ -59,12 +71,14 @@ Default choices:
   only appending new directions makes the tensor error nonincreasing. Mixed
   precision and finite solver tolerances can introduce small numerical
   perturbations. The ten completed curves contained no observed increases.
-- Training limit: `0` means continue until convergence, bounded only by the 1024-candidate pool and the exact full-rank memory preflight.
+- Training limit: fixed at `14` by default. Fixed mode requires an explicit
+  positive limit; adaptive mode may stop earlier when all five monitor cases
+  meet the configured tolerance.
 - Online timing: evaluate the final ROM at `10000` independent material points.
 - Memory controls: POD and affine-stress workspaces are capped at `8 GiB`, ROM
   batches at `1 GiB`, and exact full-rank runs must fit within 80% of available
-  host memory. POD projection uses an in-place BLAS GEMM, so it does not create
-  a second snapshot-sized array.
+  host memory. The default raw-Ritz path reveals numerical rank through the
+  small snapshot Gram matrix and avoids a second snapshot-sized array.
 - Online backend: persistent `float64` CUDA operators and batched solves by
   default. Use `--rom-backend auto` only when a CPU fallback is desired.
 
@@ -75,11 +89,11 @@ Scaling with `D = 6*Nvox` and reduced rank `r`:
 - Reduced operators: `O(r^2)` memory.
 - Dense online solve: `O(r^3)` work per material and `O(chunk*r^2)` workspace.
 
-The adaptive pipeline consumes one material per exact Sobol prefix, bounds the
-affine-coefficient and online-query workspaces as rank grows, and retains only
-the final reduced operators. Intermediate `Kq/Bq/Dq`, voxel solutions, and the
-POD basis are not written to disk. Lower asymptotic growth requires truncated
-POD; it is not enabled implicitly because it changes the model space.
+The fixed pipeline consumes the prescribed Sobol training set, compiles at the
+final rank, bounds affine-coefficient and online-query workspaces, and retains
+only the final reduced operators. Intermediate voxel solutions and the POD
+basis are not written to disk. Lower asymptotic growth requires truncated POD;
+it is not enabled implicitly because it changes the model space.
 
 Smoke test:
 

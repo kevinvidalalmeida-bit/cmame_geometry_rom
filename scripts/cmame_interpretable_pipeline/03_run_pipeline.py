@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 3: run the adaptive Sobol + full-rank POD campaign."""
+"""Step 3: run the fixed Sobol + full-rank POD campaign."""
 
 from __future__ import annotations
 
@@ -138,7 +138,8 @@ def command_for_geometry(
     if args.smoke:
         configured_limit = int(pipe.get("training_limit", 0) or 0)
         pipe["training_limit"] = min(configured_limit, 4) if configured_limit else 4
-        pipe["monitor_count"] = min(int(pipe.get("monitor_count", 16)), 2)
+        if bool(pipe.get("adaptive", False)):
+            pipe["monitor_count"] = min(int(pipe.get("monitor_count", 5)), 2)
         pipe["final_validation_count"] = min(
             int(pipe.get("final_validation_count", 16)), 2
         )
@@ -146,6 +147,12 @@ def command_for_geometry(
         pipe["target_error"] = 1.0
         pipe["basis_profile"] = "rom_floor"
         pipe["truth_profile"] = "rom_floor"
+
+    if not bool(pipe.get("adaptive", False)):
+        fixed_limit = int(pipe.get("training_limit", 0) or 0)
+        if fixed_limit < 1:
+            raise ValueError("Fixed training requires a positive training_limit.")
+        pipe["start_materials"] = fixed_limit
 
     actual_run_name = run_name if single_geometry else f"{run_name}_geometry_{geometry_id:02d}"
     command = [
@@ -166,7 +173,7 @@ def command_for_geometry(
         "--candidate-seed",
         str(int(pipe.get("candidate_seed", 20260821))),
         "--monitor-count",
-        str(int(pipe.get("monitor_count", 16))),
+        str(int(pipe.get("monitor_count", 5))),
         "--monitor-seed",
         str(int(pipe.get("monitor_seed", 20260822))),
         "--final-validation-count",
@@ -208,6 +215,12 @@ def command_for_geometry(
         "--rom-chunk-size",
         str(int(pipe.get("rom_chunk_size", 2048))),
     ]
+    append_bool(
+        command,
+        bool(pipe.get("adaptive", False)),
+        "--adaptive",
+        "--no-adaptive",
+    )
     append_bool(command, bool(pipe.get("save_operators", True)), "--save-operators", "--no-save-operators")
     append_bool(
         command,
@@ -277,6 +290,11 @@ def first_threshold_crossing_curve(
     groups: list[pd.DataFrame] = []
     for _, group in curve.groupby("geometry_id", sort=True):
         group = group.sort_values("training_materials").copy()
+        if not group["monitor_error_max"].notna().any():
+            group = group.tail(1).copy()
+            group["one_pass_stop"] = True
+            groups.append(group)
+            continue
         accepted = (
             group["monitor_error_max"].to_numpy(dtype=float) <= float(target_error)
         )
@@ -416,7 +434,7 @@ def one_pass_timing_table(
 
 
 def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) -> None:
-    if curve.empty:
+    if curve.empty or not curve["monitor_error_max"].notna().any():
         return
     try:
         import matplotlib.pyplot as plt

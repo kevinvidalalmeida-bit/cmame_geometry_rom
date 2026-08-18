@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run adaptive Sobol + full-rank POD with independent final FFT validation."""
+"""Run fixed or explicitly adaptive Sobol + full-rank POD validation."""
 
 from __future__ import annotations
 
@@ -140,7 +140,7 @@ def project_path(value: str | Path) -> Path:
 
 def default_run_name(geometry_id: int) -> str:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"run_geometry{int(geometry_id):02d}_adaptive_sobol_pod_{stamp}"
+    return f"run_geometry{int(geometry_id):02d}_sobol_pod_{stamp}"
 
 
 def material_sequence(candidates: pd.DataFrame, count: int) -> pd.DataFrame:
@@ -165,6 +165,27 @@ def independent_pool(
         f"{label_prefix}_{idx:04d}" for idx in frame[id_column].astype(int)
     ]
     return frame
+
+
+def resolve_training_protocol(
+    adaptive: bool, monitor_count: int, training_limit: int
+) -> str:
+    """Validate and resolve the explicit fixed/adaptive FOM protocol."""
+    monitors = int(monitor_count)
+    limit = int(training_limit)
+    if monitors < 0:
+        raise ValueError("monitor_count cannot be negative.")
+    if limit < 0:
+        raise ValueError("training_limit cannot be negative.")
+    if not bool(adaptive):
+        if limit == 0:
+            raise ValueError(
+                "Fixed training requires an explicit positive training_limit."
+            )
+        return "fixed"
+    if monitors == 0:
+        raise ValueError("Adaptive training requires a positive monitor_count.")
+    return "adaptive"
 
 
 def fixed_warm_start_route(sequence: pd.DataFrame) -> pd.DataFrame:
@@ -650,14 +671,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-pool", type=Path, default=None)
     parser.add_argument("--candidate-count", type=int, default=int(pipeline.get("candidate_count", 1024)))
     parser.add_argument("--run-name", default=None)
+    parser.add_argument(
+        "--adaptive",
+        action=argparse.BooleanOptionalAction,
+        default=bool(pipeline.get("adaptive", False)),
+        help="Enable monitor-driven stopping; fixed training is the default.",
+    )
     parser.add_argument("--start-materials", type=int, default=int(pipeline.get("start_materials", 2)))
     parser.add_argument(
         "--training-limit",
         type=int,
         default=int(pipeline.get("training_limit", 0) or 0),
-        help="Optional operational cap; zero uses the memory-safe candidate limit.",
+        help=(
+            "Operational cap; fixed mode requires a positive value, while "
+            "adaptive mode may use zero for the memory-safe candidate limit."
+        ),
     )
-    parser.add_argument("--monitor-count", type=int, default=int(pipeline.get("monitor_count", 16)))
+    parser.add_argument(
+        "--monitor-count",
+        type=int,
+        default=int(pipeline.get("monitor_count", 5)),
+        help="Independent preliminary FOM materials used only with --adaptive.",
+    )
     parser.add_argument("--final-validation-count", type=int, default=int(pipeline.get("final_validation_count", 16)))
     parser.add_argument("--candidate-seed", type=int, default=int(pipeline.get("candidate_seed", 20260821)))
     parser.add_argument(
@@ -761,9 +796,20 @@ def main() -> int:
             raise ValueError("start_materials must be positive.")
         if not np.isfinite(float(args.target_error)) or float(args.target_error) <= 0.0:
             raise ValueError("target_error must be finite and positive.")
-        if len({int(args.candidate_seed), int(args.monitor_seed), int(args.final_validation_seed)}) != 3:
+        if int(args.candidate_seed) == int(args.final_validation_seed):
             raise ValueError(
-                "candidate_seed, monitor_seed, and final_validation_seed must be distinct."
+                "candidate_seed and final_validation_seed must be distinct."
+            )
+        if bool(args.adaptive) and len(
+            {
+                int(args.candidate_seed),
+                int(args.monitor_seed),
+                int(args.final_validation_seed),
+            }
+        ) != 3:
+            raise ValueError(
+                "Adaptive training requires distinct candidate, monitor, and "
+                "final-validation seeds."
             )
 
         out_root = Path(args.out_root).resolve()
@@ -824,15 +870,21 @@ def main() -> int:
             len(candidates), int(provisional_plan["max_safe_rank"]) // 6
         )
         requested_limit = int(args.training_limit)
-        if requested_limit < 0:
-            raise ValueError("training_limit cannot be negative.")
+        protocol = resolve_training_protocol(
+            bool(args.adaptive), int(args.monitor_count), requested_limit
+        )
+        fixed_training_protocol = protocol == "fixed"
         if requested_limit and requested_limit > safe_material_limit:
             raise MemoryError(
                 f"training_limit={requested_limit} exceeds the exact full-rank "
                 f"memory-safe limit of {safe_material_limit} materials."
             )
         training_limit = requested_limit or safe_material_limit
-        minimum_required = int(args.start_materials)
+        minimum_required = (
+            int(training_limit)
+            if fixed_training_protocol
+            else int(args.start_materials)
+        )
         if training_limit < minimum_required:
             raise MemoryError(
                 f"Only {training_limit} materials fit, but at least {minimum_required} "
@@ -858,8 +910,10 @@ def main() -> int:
             sequence = affine_maximin_sequence(candidates, training_limit)
         else:
             sequence = material_sequence(candidates, training_limit)
-        fixed_training = int(args.start_materials) == int(training_limit)
-        if bool(args.warm_start_route) and fixed_training:
+        fixed_training_set = fixed_training_protocol or (
+            int(args.start_materials) == int(training_limit)
+        )
+        if bool(args.warm_start_route) and fixed_training_set:
             sequence = fixed_warm_start_route(sequence)
         else:
             sequence = sequence.copy()
@@ -868,13 +922,16 @@ def main() -> int:
             )
             sequence.insert(1, "solve_position", np.arange(len(sequence), dtype=int))
         sequence.to_csv(run_dir / "planned_sobol_sequence.csv", index=False)
-        monitor = independent_pool(
-            int(args.monitor_count),
-            int(args.monitor_seed),
-            id_column="monitor_id",
-            label_prefix="monitor_sobol",
-        )
-        monitor.to_csv(run_dir / "monitor_pool.csv", index=False)
+        if fixed_training_protocol:
+            monitor = pd.DataFrame()
+        else:
+            monitor = independent_pool(
+                int(args.monitor_count),
+                int(args.monitor_seed),
+                id_column="monitor_id",
+                label_prefix="monitor_sobol",
+            )
+            monitor.to_csv(run_dir / "monitor_pool.csv", index=False)
 
         runtime = common.configure_runtime(
             geometry_backend=str(args.geometry_backend),
@@ -885,7 +942,12 @@ def main() -> int:
         write_json(
             run_dir / "run_manifest.json",
             {
-                "method": "adaptive_sobol_pod_full_rank",
+                "method": (
+                    "fixed_sobol_pod_full_rank"
+                    if fixed_training_protocol
+                    else "adaptive_sobol_pod_full_rank"
+                ),
+                "adaptive": bool(args.adaptive),
                 "run_dir": str(run_dir),
                 "geometry_dir": str(geometry_dir),
                 **geometry_info,
@@ -894,7 +956,7 @@ def main() -> int:
                 "selection_policy": str(args.selection_policy),
                 "solve_order_policy": (
                     "fixed_set_affine_nearest_neighbor"
-                    if bool(args.warm_start_route) and fixed_training
+                    if bool(args.warm_start_route) and fixed_training_set
                     else "sobol_prefix_order"
                 ),
                 "training_limit_policy": "memory_safe_candidate_limit"
@@ -902,7 +964,11 @@ def main() -> int:
                 else "explicit_operational_limit",
                 "training_limit": int(training_limit),
                 "memory_safe_material_limit": int(safe_material_limit),
-                "monitoring_policy": "fixed_independent_fft_pool_after_each_material",
+                "monitoring_policy": (
+                    "none_training_then_final_validation"
+                    if fixed_training_protocol
+                    else "fixed_independent_fft_pool_after_each_material"
+                ),
                 "monitor_count": int(len(monitor)),
                 "monitor_seed": int(args.monitor_seed),
                 "monitor_start_materials": int(args.start_materials),
@@ -971,19 +1037,25 @@ def main() -> int:
         )
         affine_setup_wall_s = float(time.perf_counter() - affine_started)
 
-        monitor_fft_started = time.perf_counter()
-        monitor_truth = solve_truth_pool(
-            run_dir=run_dir,
-            geometry=geometry,
-            runtime=runtime,
-            materials=monitor,
-            seed=int(args.monitor_seed),
-            profile=str(args.truth_profile),
-            quiet_solver=bool(args.quiet_solver),
-            pool_name="monitor",
-        )
-        monitor_truth.to_csv(run_dir / "monitor_truth_results.csv", index=False)
-        monitor_fft_stage_wall_s = float(time.perf_counter() - monitor_fft_started)
+        if fixed_training_protocol:
+            monitor_truth = pd.DataFrame()
+            monitor_fft_stage_wall_s = 0.0
+        else:
+            monitor_fft_started = time.perf_counter()
+            monitor_truth = solve_truth_pool(
+                run_dir=run_dir,
+                geometry=geometry,
+                runtime=runtime,
+                materials=monitor,
+                seed=int(args.monitor_seed),
+                profile=str(args.truth_profile),
+                quiet_solver=bool(args.quiet_solver),
+                pool_name="monitor",
+            )
+            monitor_truth.to_csv(run_dir / "monitor_truth_results.csv", index=False)
+            monitor_fft_stage_wall_s = float(
+                time.perf_counter() - monitor_fft_started
+            )
 
         snapshot_rows: list[dict[str, Any]] = []
         curve_rows: list[dict[str, Any]] = []
@@ -1022,7 +1094,11 @@ def main() -> int:
                 memory_safety_fraction=float(args.memory_safety_fraction),
                 basis_tolerance=float(args.basis_tolerance),
                 cleanup_snapshot_fields=bool(args.cleanup_snapshot_fields),
-                compile_operators=training_materials >= int(args.start_materials),
+                compile_operators=(
+                    training_materials == int(training_limit)
+                    if fixed_training_protocol
+                    else training_materials >= int(args.start_materials)
+                ),
                 initial_solution_fields=warm_start_fields,
                 full_rank_basis_mode=str(args.full_rank_basis_mode),
             )
@@ -1038,10 +1114,51 @@ def main() -> int:
                     f"step={float(record['snapshot_step_wall_s']):.2f}s",
                     flush=True,
                 )
-            if training_materials < int(args.start_materials):
+            if fixed_training_protocol and training_materials < int(training_limit):
+                continue
+            if (
+                not fixed_training_protocol
+                and training_materials < int(args.start_materials)
+            ):
                 continue
             if operators is None:
                 raise RuntimeError("No reduced operators were assembled.")
+
+            if fixed_training_protocol:
+                stop_materials = int(training_materials)
+                effective_rank = int(operators["Kq"].shape[1])
+                curve_rows.append(
+                    {
+                        "method": "fixed_sobol_pod_full_rank",
+                        "training_materials": int(training_materials),
+                        "pod_rank": effective_rank,
+                        "snapshot_solve_wall_s": cumulative["solve_wall_s"],
+                        "snapshot_step_wall_s": cumulative["snapshot_step_wall_s"],
+                        "basis_update_wall_s": cumulative["basis_update_wall_s"],
+                        "operator_assembly_wall_s": cumulative[
+                            "operator_assembly_wall_s"
+                        ],
+                        "affine_stress_wall_s": cumulative["affine_stress_wall_s"],
+                        "ritz_contraction_wall_s": cumulative[
+                            "ritz_contraction_wall_s"
+                        ],
+                        "monitor_rom_cumulative_wall_s": 0.0,
+                        "monitor_error_mean": np.nan,
+                        "monitor_error_median": np.nan,
+                        "monitor_error_p95": np.nan,
+                        "monitor_error_max": np.nan,
+                        "passes_target_max": np.nan,
+                        "stop_triggered": True,
+                        "rom_online_mean_s": np.nan,
+                        "worst_monitor_id": np.nan,
+                    }
+                )
+                print(
+                    f"[SOBOL-POD] fixed training complete | "
+                    f"materials={training_materials} | rank={effective_rank}",
+                    flush=True,
+                )
+                break
 
             monitor_rom_started = time.perf_counter()
             frame = reduced._evaluate_rom(
@@ -1103,9 +1220,14 @@ def main() -> int:
         )
 
         curve = pd.DataFrame(curve_rows)
-        monitor_rom = pd.concat(monitor_frames, ignore_index=True)
+        monitor_rom = (
+            pd.concat(monitor_frames, ignore_index=True)
+            if monitor_frames
+            else pd.DataFrame()
+        )
         curve.to_csv(run_dir / "sobol_pod_error_curve.csv", index=False)
-        monitor_rom.to_csv(run_dir / "monitor_rom_results.csv", index=False)
+        if not monitor_rom.empty:
+            monitor_rom.to_csv(run_dir / "monitor_rom_results.csv", index=False)
         if stop_materials is None:
             selected = sequence.iloc[: len(snapshot_rows)].copy()
             selected.to_csv(run_dir / "selected_sobol_sequence.csv", index=False)
@@ -1208,7 +1330,7 @@ def main() -> int:
         rom_timing_stage_wall_s = float(time.perf_counter() - rom_timing_started)
 
         plot_path = run_dir / "sobol_pod_error_curve.png"
-        if bool(args.write_plot):
+        if bool(args.write_plot) and not fixed_training_protocol:
             write_plot(curve, plot_path, float(args.target_error))
         timing = curve[
             [
@@ -1224,7 +1346,11 @@ def main() -> int:
                 "rom_online_mean_s",
             ]
         ].copy()
-        timing["monitor_fft_total_wall_s"] = float(monitor_truth["solve_wall_s"].sum())
+        timing["monitor_fft_total_wall_s"] = (
+            0.0
+            if monitor_truth.empty
+            else float(monitor_truth["solve_wall_s"].sum())
+        )
         timing["final_validation_fft_total_wall_s"] = float(
             final_validation_truth["solve_wall_s"].sum()
         )
@@ -1233,34 +1359,54 @@ def main() -> int:
             snapshot_timing["affine_q_block_size"] > 0,
             "affine_q_block_size",
         ]
-        stage_timing = pd.DataFrame(
+        stage_rows = [
+            {"stage": "geometry_load", "wall_s": geometry_load_wall_s},
+            {"stage": "affine_setup", "wall_s": affine_setup_wall_s},
+        ]
+        if not fixed_training_protocol:
+            stage_rows.append(
+                {"stage": "adaptive_monitor_fft_once", "wall_s": monitor_fft_stage_wall_s}
+            )
+        stage_rows.extend(
             [
-                {"stage": "geometry_load", "wall_s": geometry_load_wall_s},
-                {"stage": "affine_setup", "wall_s": affine_setup_wall_s},
-                {"stage": "monitor_fft_once", "wall_s": monitor_fft_stage_wall_s},
-                {"stage": "adaptive_sobol_fft_pod_kbd", "wall_s": training_stage_wall_s},
-                {"stage": "final_independent_fft_validation", "wall_s": validation_stage_wall_s},
+                {
+                    "stage": (
+                        "fixed_sobol_fft_pod_kbd"
+                        if fixed_training_protocol
+                        else "adaptive_sobol_fft_pod_kbd"
+                    ),
+                    "wall_s": training_stage_wall_s,
+                },
+                {
+                    "stage": "final_independent_fft_validation",
+                    "wall_s": validation_stage_wall_s,
+                },
                 {"stage": "rom_timing_queries", "wall_s": rom_timing_stage_wall_s},
             ]
         )
-        write_excel(
-            run_dir / "sobol_pod_paper_tables.xlsx",
-            {
-                "monitor_curve": curve,
-                "timing": timing,
-                "stage_timing": stage_timing,
-                "sequence": selected,
-                "monitor_truth": monitor_truth,
-                "monitor_rom": monitor_rom,
-                "final_validation_truth": final_validation_truth,
-                "final_validation_rom": final_validation_rom,
-            },
-        )
+        stage_timing = pd.DataFrame(stage_rows)
+        excel_sheets = {
+            "training": curve,
+            "timing": timing,
+            "stage_timing": stage_timing,
+            "sequence": selected,
+            "final_validation_truth": final_validation_truth,
+            "final_validation_rom": final_validation_rom,
+        }
+        if not monitor_truth.empty:
+            excel_sheets["monitor_truth"] = monitor_truth
+            excel_sheets["monitor_rom"] = monitor_rom
+        write_excel(run_dir / "sobol_pod_paper_tables.xlsx", excel_sheets)
 
         summary = {
             "run_dir": str(run_dir),
             "status": "complete",
-            "method": "adaptive_sobol_pod_full_rank",
+            "method": (
+                "fixed_sobol_pod_full_rank"
+                if fixed_training_protocol
+                else "adaptive_sobol_pod_full_rank"
+            ),
+            "adaptive": bool(args.adaptive),
             **geometry_info,
             "selection_policy": str(args.selection_policy),
             "training_limit": int(training_limit),
@@ -1319,7 +1465,11 @@ def main() -> int:
             "ritz_contraction_total_wall_s": float(snapshot_timing["ritz_contraction_wall_s"].sum()),
             "geometry_load_wall_s": geometry_load_wall_s,
             "affine_setup_wall_s": affine_setup_wall_s,
-            "monitor_fft_total_wall_s": float(monitor_truth["solve_wall_s"].sum()),
+            "monitor_fft_total_wall_s": (
+                0.0
+                if monitor_truth.empty
+                else float(monitor_truth["solve_wall_s"].sum())
+            ),
             "monitor_fft_stage_wall_s": monitor_fft_stage_wall_s,
             "monitor_rom_total_wall_s": monitor_rom_total_wall_s,
             "training_stage_wall_s": training_stage_wall_s,
@@ -1334,8 +1484,16 @@ def main() -> int:
             "fft_backend": str(args.fft_backend),
             "rom_timing": rom_timing,
             "curve_csv": str(run_dir / "sobol_pod_error_curve.csv"),
-            "monitor_truth_csv": str(run_dir / "monitor_truth_results.csv"),
-            "monitor_rom_csv": str(run_dir / "monitor_rom_results.csv"),
+            "monitor_truth_csv": (
+                None
+                if monitor_truth.empty
+                else str(run_dir / "monitor_truth_results.csv")
+            ),
+            "monitor_rom_csv": (
+                None
+                if monitor_rom.empty
+                else str(run_dir / "monitor_rom_results.csv")
+            ),
             "final_validation_truth_csv": str(
                 run_dir / "final_validation_truth_results.csv"
             ),

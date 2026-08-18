@@ -115,12 +115,10 @@ directly approximates the effective operator and preserves the variational
 ordering of the Schur map: the reduced operator bounds the full-order operator
 in the Loewner sense, with an exact energy identity for their difference.
 Accuracy is assessed by independent Fourier--Galerkin solves over the
-admissible material space, while
-the online stage uses only reduced dense systems assembled from the
-precomputed affine blocks. A fixed 16-material monitor set controls sequential
-enrichment, stopping at the first prefix below the target error. The frozen
-model is then assessed once on a second independent 16-material set
-that has no role in construction. The
+admissible material space, while the online stage uses only reduced dense
+systems assembled from the precomputed affine blocks. The offline model uses
+a fixed 14-material Sobol training set. The frozen model is then assessed once
+on an independent five-material set that has no role in construction. The
 elasticity specialization is stated separately to make explicit how the common
 transfer algebra applies to three-dimensional stiffness tensors.
 \end{abstract}
@@ -130,7 +128,7 @@ transfer algebra applies to three-dimensional stiffness tensors.
 \item Exact affine separation compiles fixed geometry while queried material enters only through constitutive coefficients.
 \item Sobol sampling and numerical-rank POD retain the complete numerically resolved snapshot span.
 \item Ritz--Schur projection preserves variational ordering and gives an exact energy identity for the operator error.
-\item Independent FFT monitoring and final validation assess a ROM whose online stage uses only reduced dense algebra.
+\item Independent held-out FFT validation assesses a ROM whose online stage uses only reduced dense algebra.
 \end{highlights}
 
 \begin{keywords}
@@ -173,7 +171,7 @@ Symbol & Meaning & Symbol & Meaning \\
 \(X=[x_1,\ldots,x_m]\) & Full-order response matrix satisfying \(KX=B\). &
 \(Q,\gamma_q,\boldsymbol\gamma\) & Number of affine terms, affine coefficient, and coefficient vector. \\
 \(\mathcal K_{\G}\) & Reusable geometry block set \(\{K_q,B_q,D_q\}_{q=1}^{Q}\). &
-\(\Xi_S,N_s\) & Initial Sobol set and number of sampled materials. \\
+\(\Xi_S,N_s\) & Fixed Sobol training set and number of sampled materials. \\
 \(S\) & Snapshot matrix. &
 \(U,\Sigma,W\) & Singular-value-decomposition factors of \(S\). \\
 \(\sigma_i,\tau_{\mathrm{rank}}\) & Singular values and relative numerical-rank tolerance. &
@@ -285,12 +283,11 @@ independent strain states. Pore-resolved Stokes flow and nonlinear transport
 are outside the direct scope because their mixed or nonlinear structure
 requires a different stability analysis.
 
-The second ingredient is an adaptive assessment protocol. Independent Sobol
-materials are solved with the full-order FFT model and compared with the ROM
-response using a relative Frobenius tensor error. A fixed monitor set controls
-when sequential Sobol enrichment stops, without changing the order of the
-training sequence. A second independent set is evaluated only after the ROM
-has been frozen and provides the final held-out assessment.
+The second ingredient is a held-out assessment protocol. A prescribed Sobol
+training set is solved with the full-order FFT model and frozen before any
+validation response is examined. A second independent set is evaluated only
+after compilation and provides the final relative Frobenius tensor-error
+assessment.
 
 Section~\ref{sec:homogenization} develops the common periodic cell problem and
 its Schur representation. Section~\ref{sec:transfer} introduces the reduced
@@ -731,7 +728,7 @@ solutions sampled over the admissible constitutive domain \(\Xi\).
 
 Let
 \(\Xi_S=\{\boldsymbol\xi^{(1)},\ldots,\boldsymbol\xi^{(N_s)}\}\subset\Xi\)
-denote the prescribed initial Sobol set, where \(N_s\) is the number of
+denote the prescribed fixed Sobol training set, where \(N_s\) is the number of
 sampled materials. For each \(\boldsymbol\xi^{(j)}\),
 Eq.~\eqref{eq:fom_response} is solved for the \(m\) independent macroscopic
 loading states, giving
@@ -930,8 +927,8 @@ property of Ritz approximation. The implementation retains every accepted
 basis vector and only appends numerically independent directions, so its trial
 spaces are nested by construction. Consequently, in exact arithmetic the
 positive-semidefinite error in Eq.~\eqref{eq:ritz_schur_identity}, its
-Frobenius norm, and the corresponding maximum over a fixed monitor set are
-nonincreasing. Mixed precision, iterative-solver tolerances, and finite
+Frobenius norm are nonincreasing at any fixed material query. Mixed precision,
+iterative-solver tolerances, and finite
 orthogonalization accuracy can introduce small numerical perturbations to this
 ordering; monotonicity is therefore audited rather than assumed bitwise.
 
@@ -939,44 +936,36 @@ A standard material query therefore requires only the constitutive
 coefficients \(\gamma_q(\boldsymbol\xi)\), the assembly of the small reduced
 operators, and the solution of the \(r\times r\) system in
 Eq.~\eqref{eq:reduced_response}. No full \(n\)-dimensional solve is required.
-\subsection{Adaptive FFT monitoring and held-out validation}
+\subsection{Fixed training and held-out validation}
 \label{subsec:heldout_validation}
 
-Materials used to control enrichment must be separated from those used for
-the final assessment. Let
-\(\Xi_M=\{\boldsymbol\xi_M^{(1)},\ldots,\boldsymbol\xi_M^{(N_M)}\}\) denote
-a fixed monitor set and let
+Materials used for the final assessment must be separated from those used to
+construct the reduced space. Let
 \(\Xi_V=\{\boldsymbol\xi_V^{(1)},\ldots,\boldsymbol\xi_V^{(N_V)}\}\) denote
-a second independent final-validation set. Neither set contributes snapshots.
-For a material \(\boldsymbol\xi_A^{(j)}\), where
-\(A\in\{M,V\}\), the relative tensor error is
+an independent final-validation set. It contributes no snapshots. For a
+material \(\boldsymbol\xi_V^{(j)}\), the relative tensor error is
 \begin{equation}
 \label{eq:validation_error}
-e_{A,j}
+e_{V,j}
 =
 \frac{
 \left\|
-\Hr(\boldsymbol\xi_A^{(j)})
+\Hr(\boldsymbol\xi_V^{(j)})
 -
-\Hfom(\boldsymbol\xi_A^{(j)})
+\Hfom(\boldsymbol\xi_V^{(j)})
 \right\|_F
 }{
 \left\|
-\Hfom(\boldsymbol\xi_A^{(j)})
+\Hfom(\boldsymbol\xi_V^{(j)})
 \right\|_F
 }.
 \end{equation}
-The \(N_M=16\) full-order monitor tensors are computed once before enrichment.
-Starting at the second Sobol training material, the current ROM is evaluated
-on \(\Xi_M\) after every newly appended material. Enrichment stops when
-\(\max_j e_{M,j}\leq\varepsilon_{\mathrm{ROM}}\) for the first time. The
-training sequence remains Sobol ordered; the monitor set determines only when
-its prefix is long enough. For the elasticity campaign,
-\(\varepsilon_{\mathrm{ROM}}=10^{-4}\).
-
-After stopping, the reduced operators are frozen. Only then are the
-\(N_V=16\) final-validation materials solved with the full-order model and
-evaluated once with the ROM. The reported final statistics are the mean,
+The elasticity campaign prescribes \(N_s=14\) Sobol training materials before
+any validation solve. All six microscopic responses per material are retained
+at numerical full rank, after which the reduced operators are frozen and the
+microscopic fields are discarded. Only then are the \(N_V=5\)
+final-validation materials solved with the full-order model and evaluated once
+with the ROM. The reported final statistics are the mean,
 median, 95th percentile, and maximum of \(e_{V,j}\). In addition, for
 the same \(\varepsilon_{\mathrm{ROM}}=10^{-4}\), the reported empirical coverage is
 \begin{equation}
@@ -1011,19 +1000,15 @@ operators.
 \item \textbf{Initial offline compilation.}
 \item Fix \(\G\) and assemble
       \(\{K_q,B_q,D_q\}_{q=1}^{Q}\) from Eq.~\eqref{eq:affine_operators}.
-\item Generate a fixed Sobol training sequence and independent monitor and
-      final-validation sets \(\Xi_M\) and \(\Xi_V\).
-\item Solve the \(N_M=16\) monitor materials once with the full-order model.
-\item Traverse the Sobol sequence one material at a time: solve the new
+\item Generate a fixed \(N_s=14\) Sobol training set and an independent
+      final-validation set \(\Xi_V\).
+\item Traverse the training set one material at a time: solve the new
       material, append its \(m\) responses to \(S\), retain the full
-      numerical-rank basis \(V_r\), and update the projected blocks in
-      Eq.~\eqref{eq:compiled_reduced_operators}.
-\item From the second training material onward, evaluate
-      \(\max_j e_{M,j}\) after every update. Stop at the first prefix at or
-      below \(\varepsilon_{\mathrm{ROM}}=10^{-4}\).
+      numerical-rank basis \(V_r\), and compile the projected blocks in
+      Eq.~\eqref{eq:compiled_reduced_operators} after the final material.
 \item Freeze the final reduced operators and discard the microscopic snapshots
       and POD basis.
-\item Solve the \(N_V=16\) final-validation materials once, evaluate
+\item Solve the \(N_V=5\) final-validation materials once, evaluate
       Eq.~\eqref{eq:validation_error}, and report the final error statistics
       together with the observed count and percentage below \(10^{-4}\).
 \item \textbf{Online material query.}
@@ -1044,9 +1029,9 @@ rank is bounded by \(r\leq mN_s\) but is not prescribed independently of the
 Sobol budget. Let \(n\) denote the number of entries in one microscopic
 response vector. In the voxel elasticity implementation,
 \(n=6N_{\mathrm{vox}}\). Exact storage of the basis is
-\(\mathcal O(nr)\), while block orthonormalization and incremental compilation
-of all affine Ritz matrices require
-\(\mathcal O(nr^2)\) and \(\mathcal O(Qnr^2)\) cumulative work, respectively.
+\(\mathcal O(nr)\), while numerical-rank revelation and final compilation of
+all affine Ritz matrices require
+\(\mathcal O(nr^2)\) and \(\mathcal O(Qnr^2)\) work, respectively.
 The compiled operators require \(\mathcal O(Qr^2+Qrm)\) memory.
 
 For one online material, affine assembly costs \(\mathcal O(Qr^2)\), and the
@@ -1158,12 +1143,11 @@ required. The framework is independent of the geometry class, while each
 compiled operator remains specific to the fixed geometry from which it was
 constructed.
 
-The adaptive assessment separates model construction from final evaluation.
-A fixed full-order monitor set controls when Sobol enrichment stops, while a
-second independent full-order set is evaluated only after the reduced
-operators have been frozen. The reported relative Frobenius errors therefore
-separate stopping from final held-out assessment while keeping the protocol
-reproducible.
+The assessment separates model construction from final evaluation. A fixed
+Sobol training set determines the complete snapshot space, while an
+independent full-order set is evaluated only after the reduced operators have
+been frozen. The reported relative Frobenius errors therefore remain held out
+from construction while keeping the protocol reproducible.
 
 The three-dimensional elasticity specialization illustrates how the abstract
 operators become stiffness tensors, Mandel rotations, and seven affine
@@ -1464,8 +1448,9 @@ which is equivalent to the Loewner ordering
 \]
 This proves Eq.~\eqref{eq:nested_ritz_ordering}. The result concerns genuinely
 nested trial spaces. When POD bases are recomputed at successive Sobol
-prefixes with a relative numerical-rank threshold, exact nestedness is not
-required and is not assumed by the adaptive monitoring procedure.
+prefixes with a relative numerical-rank threshold, exact nestedness would need
+to be checked separately. The present fixed-budget protocol compiles only the
+final prescribed snapshot space.
 
 
 \section{Affine constitutive coefficients for the elasticity specialization}

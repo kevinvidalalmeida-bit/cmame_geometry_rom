@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,3 +39,28 @@ def test_affine_maximin_and_warm_route_preserve_fixed_design():
     assert set(routed["candidate_id"]) == set(selected_a["candidate_id"])
     assert routed["solve_position"].tolist() == list(range(10))
     assert sorted(routed["sobol_set_position"].tolist()) == list(range(10))
+
+
+def test_default_protocol_uses_only_fixed_training_and_final_validation():
+    config = json.loads(
+        (PIPELINE_DIR / "campaign_config.json").read_text(encoding="utf-8")
+    )["sobol_pod_pipeline"]
+
+    assert pipeline.resolve_training_protocol(
+        config["adaptive"], config["monitor_count"], config["training_limit"]
+    ) == "fixed"
+    assert config["training_limit"] == 14
+    assert config["adaptive"] is False
+    assert config["monitor_count"] == 5
+    assert config["final_validation_count"] == 5
+
+
+def test_fixed_protocol_requires_an_explicit_training_budget():
+    with pytest.raises(ValueError, match="positive training_limit"):
+        pipeline.resolve_training_protocol(False, 5, 0)
+
+
+def test_adaptive_protocol_uses_a_positive_monitor_pool():
+    assert pipeline.resolve_training_protocol(True, 5, 0) == "adaptive"
+    with pytest.raises(ValueError, match="positive monitor_count"):
+        pipeline.resolve_training_protocol(True, 0, 14)
