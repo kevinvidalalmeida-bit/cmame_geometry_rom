@@ -82,6 +82,45 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     )
 
 
+def _stage_profile_row(
+    rows: list[dict[str, Any]],
+    *,
+    stage: str,
+    wall_s: float,
+    scope: str = "pipeline",
+    anchor_id: int | None = None,
+    **details: Any,
+) -> None:
+    rows.append({
+        "scope": str(scope),
+        "stage": str(stage),
+        "anchor_id": "" if anchor_id is None else int(anchor_id),
+        "wall_s": float(wall_s),
+        "details_json": json.dumps(common.jsonable(details), sort_keys=True),
+    })
+
+
+def _read_record_timing(record: dict[str, Any]) -> dict[str, Any]:
+    path_raw = record.get("solver_timing_path")
+    if not path_raw:
+        return {}
+    path = Path(str(path_raw))
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _scalar_meta(payload: dict[str, Any]) -> dict[str, Any]:
+    scalars: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, (str, bool, int, float, np.integer, np.floating, np.bool_)):
+            scalars[key] = value
+    return scalars
+
+
 def center_material() -> dict[str, Any]:
     """Build the center-of-domain material point."""
     sampled = {
@@ -903,6 +942,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--geometry-backend", choices=("numba", "cupy", "auto"), default="numba")
     parser.add_argument("--generator-cores", default="auto")
     parser.add_argument("--affine-q-block-size", type=int, default=1)
+    parser.add_argument(
+        "--stream-basis-group-max-mib",
+        type=float,
+        default=512.0,
+        help=(
+            "RAM budget for grouping streamed anchor/sensitivity blocks before "
+            "rank-revealed orthonormalization. Large meshes automatically fall "
+            "back to one block."
+        ),
+    )
     parser.add_argument("--load-batch-size", type=int, default=6,
                         help="Number of load channels to solve in parallel on GPU (default: 6).")
     parser.add_argument(
@@ -919,6 +968,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    pipeline_started = time.perf_counter()
+    stage_profile_rows: list[dict[str, Any]] = []
     args = parse_args()
     if not 0 <= int(args.geometry_id) <= 9:
         raise ValueError("geometry-id must be in [0, 9].")
@@ -927,11 +978,21 @@ def main() -> int:
 
     out_root = Path(args.out_root).resolve()
     geometry_dir = out_root / "geometries" / f"geometry_{int(args.geometry_id):02d}"
+    geometry_started = time.perf_counter()
     geometry = common.load_fixed_geometry(geometry_dir)
+    geometry_load_wall_s = float(time.perf_counter() - geometry_started)
+    _stage_profile_row(
+        stage_profile_rows,
+        stage="geometry_load",
+        wall_s=geometry_load_wall_s,
+        geometry_dir=str(geometry_dir),
+        grid_shape=list(np.asarray(geometry.phase.shape, dtype=int)),
+    )
     run_name = args.run_name or f"run_anchor_tangent_adaptive_geometry_{int(args.geometry_id):02d}"
     run_dir = out_root / "runs" / run_name
     run_dir.mkdir(parents=True, exist_ok=bool(args.overwrite))
 
+    runtime_started = time.perf_counter()
     cpu_info = common.cpu_resource_info()
     generator_cores = common.resolve_cpu_workers(args.generator_cores, resource_info=cpu_info)
 
@@ -948,16 +1009,46 @@ def main() -> int:
         fft_backend=str(args.fft_backend),
     )
     runtime["load_batch_size"] = int(args.load_batch_size)
+    runtime_setup_wall_s = float(time.perf_counter() - runtime_started)
+    _stage_profile_row(
+        stage_profile_rows,
+        stage="runtime_setup",
+        wall_s=runtime_setup_wall_s,
+        fft_backend=str(args.fft_backend),
+        generator_cores=int(generator_cores),
+        load_batch_size=int(args.load_batch_size),
+    )
 
     dtype = np.dtype(args.basis_dtype)
     tolerance = float(args.tolerance)
     max_anchors = int(args.max_anchors)
 
     # Deterministic voxel ordering for contiguous basis operations
+    ordering_started = time.perf_counter()
     voxel_order = reduced.phase_orientation_voxel_order(geometry.phase, geometry.ori)
     operator_phase = geometry.phase.reshape(-1)[voxel_order]
     operator_ori = geometry.ori.reshape(-1, 3)[voxel_order]
     nvox = int(voxel_order.size)
+    stream_basis_block_mib = (
+        6.0 * 6.0 * float(nvox) * float(dtype.itemsize) / float(1024 ** 2)
+    )
+    stream_basis_group_size = max(
+        1,
+        min(
+            1 + len(reduced.COEFF_NAMES),
+            int(float(args.stream_basis_group_max_mib) // max(stream_basis_block_mib, 1.0e-12)),
+        ),
+    )
+    ordering_wall_s = float(time.perf_counter() - ordering_started)
+    _stage_profile_row(
+        stage_profile_rows,
+        stage="voxel_order_and_operator_layout",
+        wall_s=ordering_wall_s,
+        nvox=nvox,
+        basis_dtype=str(dtype),
+        stream_basis_block_mib=stream_basis_block_mib,
+        stream_basis_group_size=stream_basis_group_size,
+    )
 
     # Precompute gamma scales only when finite-difference tangent steps need them.
     scales = (
@@ -967,7 +1058,15 @@ def main() -> int:
     )
 
     # Affine stress factory (reused across all assemblies)
+    affine_started = time.perf_counter()
     affine = reduced.affine_stress_batch_factory(operator_phase, operator_ori)
+    affine_setup_wall_s = float(time.perf_counter() - affine_started)
+    _stage_profile_row(
+        stage_profile_rows,
+        stage="affine_stress_factory_setup",
+        wall_s=affine_setup_wall_s,
+        coefficient_count=len(reduced.COEFF_NAMES),
+    )
 
     base_monitor_truth_csv = (
         out_root / "runs"
@@ -985,6 +1084,7 @@ def main() -> int:
     # Use one and the same material set for greedy selection and error
     # evaluation, but do not reuse the historical rom_floor Ceff as truth.
     # Its material set is fine; its Ceff tolerance is too loose for a 1e-4 ROM.
+    monitor_truth_started = time.perf_counter()
     monitor_materials = _reference_materials(
         source_csv=base_monitor_truth_csv,
         count=int(args.monitor_count),
@@ -1004,6 +1104,15 @@ def main() -> int:
     )
     monitor_params = monitor_materials.loc[:, MATERIAL_NAMES].to_numpy(dtype=np.float64)
     monitor_gammas = reduced._material_coefficients_batch(monitor_params)
+    monitor_truth_wall_s = float(time.perf_counter() - monitor_truth_started)
+    _stage_profile_row(
+        stage_profile_rows,
+        stage="monitor_truth_fom",
+        wall_s=monitor_truth_wall_s,
+        count=int(len(monitor_truth)),
+        profile=str(args.truth_profile),
+        source=str(truth_info.get("source", "")),
+    )
     print(
         f"[ANCHOR-TANGENT-ADAPTIVE] monitor=FOM-truth ({len(monitor_truth)} points) "
         f"profile={args.truth_profile} high_precision={bool(truth_info.get('high_precision', False))}",
@@ -1082,21 +1191,49 @@ def main() -> int:
         basis_streamed = str(args.tangent_method) == "sensitivity"
 
         if basis_streamed:
-            def append_streamed_block(label: str, block: np.ndarray) -> None:
+            stream_basis_blocks: list[np.ndarray] = []
+            stream_basis_labels: list[str] = []
+
+            def flush_streamed_basis(reason: str) -> None:
                 nonlocal basis_wall_s
+                if not stream_basis_blocks:
+                    return
+                labels = list(stream_basis_labels)
+                candidate_count = sum(int(np.asarray(block).shape[0]) for block in stream_basis_blocks)
                 started = time.perf_counter()
                 new_fields = append_block_orthonormal(
                     existing_basis=basis_fields,
-                    new_fields=[block],
+                    new_fields=stream_basis_blocks,
                     tolerance=float(args.basis_tolerance),
                 )
                 appended_fields.extend(new_fields)
-                basis_wall_s += float(time.perf_counter() - started)
+                group_wall_s = float(time.perf_counter() - started)
+                basis_wall_s += group_wall_s
+                _stage_profile_row(
+                    stage_profile_rows,
+                    stage="basis_stream_group",
+                    scope="anchor",
+                    anchor_id=anchor_idx,
+                    wall_s=group_wall_s,
+                    reason=str(reason),
+                    labels=labels,
+                    candidates=candidate_count,
+                    kept=len(new_fields),
+                    group_size_limit=stream_basis_group_size,
+                    group_max_mib=float(args.stream_basis_group_max_mib),
+                )
                 print(
-                    f"[ANCHOR-TANGENT-ADAPTIVE]   streamed basis block "
-                    f"{label}: +{len(new_fields)}",
+                    f"[ANCHOR-TANGENT-ADAPTIVE]   streamed basis group "
+                    f"{reason}: candidates={candidate_count} +{len(new_fields)}",
                     flush=True,
                 )
+                stream_basis_labels.clear()
+
+            def append_streamed_block(label: str, block: np.ndarray) -> None:
+                stream_basis_blocks.append(block)
+                stream_basis_labels.append(str(label))
+                if len(stream_basis_blocks) >= stream_basis_group_size:
+                    flush_streamed_basis(f"group_{len(appended_fields)}")
 
             def consume_anchor_block(block: np.ndarray) -> None:
                 append_streamed_block("anchor", block)
@@ -1119,6 +1256,7 @@ def main() -> int:
             )
             anchor_raw_fields = None
             sensitivity_fields = None
+            flush_streamed_basis("final")
         else:
             anchor_fields, anchor_record, anchor_raw_fields = solve_ordered_fields(
                 run_dir=run_dir,
@@ -1135,6 +1273,62 @@ def main() -> int:
             sensitivity_fields = None
         total_fom_solves += 1
         total_solve_wall_s += float(anchor_record.get("solve_wall_s", 0.0))
+        anchor_timing = _read_record_timing(anchor_record)
+        sensitivity_summary = anchor_timing.get("affine_sensitivity_summary", {})
+        _stage_profile_row(
+            stage_profile_rows,
+            stage="anchor_fom_and_sensitivities",
+            scope="anchor",
+            anchor_id=anchor_idx,
+            wall_s=float(anchor_record.get("solve_wall_s", 0.0)),
+            solver_profile=str(anchor_record.get("solver_profile", args.profile)),
+            solver_real_dtype=str(anchor_record.get("solver_real_dtype", "")),
+            affine_sensitivity_storage=str(anchor_timing.get("affine_sensitivity_storage", "")),
+            affine_sensitivity_payload_mib=float(anchor_timing.get("affine_sensitivity_payload_mib", 0.0)),
+        )
+        for stage_name, timing_key in (
+            ("anchor_solver_input_loading", "input_loading_s"),
+            ("anchor_solver_cfield_build", "cfield_build_s"),
+            ("anchor_solver_affine_operator_build", "affine_sensitivity_build_s"),
+            ("anchor_solver_primal_calculate", "problem_calculate_s"),
+            ("anchor_solver_postprocess", "problem_postprocessing_s"),
+        ):
+            if timing_key in anchor_timing:
+                _stage_profile_row(
+                    stage_profile_rows,
+                    stage=stage_name,
+                    scope="anchor_solver",
+                    anchor_id=anchor_idx,
+                    wall_s=float(anchor_timing.get(timing_key, 0.0)),
+                )
+        if isinstance(sensitivity_summary, dict) and "wall_s" in sensitivity_summary:
+            _stage_profile_row(
+                stage_profile_rows,
+                stage="anchor_solver_exact_sensitivity_solves",
+                scope="anchor_solver",
+                anchor_id=anchor_idx,
+                wall_s=float(sensitivity_summary.get("wall_s", 0.0)),
+                rhs_count=int(sensitivity_summary.get("rhs_count", 0)),
+                solve_count=int(sensitivity_summary.get("solve_count", 0)),
+                streamed=bool(sensitivity_summary.get("streamed", False)),
+                residual_rel_max=float(sensitivity_summary.get("final_norm_res_rel_max", np.nan)),
+            )
+            _stage_profile_row(
+                stage_profile_rows,
+                stage="anchor_solver_sensitivity_solver_only",
+                scope="anchor_solver",
+                anchor_id=anchor_idx,
+                wall_s=float(sensitivity_summary.get("solver_wall_excluding_consumer_s", 0.0)),
+                rhs_count=int(sensitivity_summary.get("rhs_count", 0)),
+            )
+            _stage_profile_row(
+                stage_profile_rows,
+                stage="anchor_solver_sensitivity_consumer_callback",
+                scope="anchor_solver",
+                anchor_id=anchor_idx,
+                wall_s=float(sensitivity_summary.get("consumer_wall_s", 0.0)),
+                host_transfer_wall_s=float(sensitivity_summary.get("host_transfer_wall_s", 0.0)),
+            )
         print(
             f"[ANCHOR-TANGENT-ADAPTIVE]   anchor FOM solve: "
             f"{float(anchor_record.get('solve_wall_s', 0.0)):.2f}s",
@@ -1201,6 +1395,15 @@ def main() -> int:
                 perturbed_fields[int(mat["material_id"])] = fields
                 total_fom_solves += 1
                 total_solve_wall_s += float(record.get("solve_wall_s", 0.0))
+                _stage_profile_row(
+                    stage_profile_rows,
+                    stage="fd_tangent_fom_solve",
+                    scope="anchor",
+                    anchor_id=anchor_idx,
+                    wall_s=float(record.get("solve_wall_s", 0.0)),
+                    material_id=int(mat["material_id"]),
+                    solver_profile=str(record.get("solver_profile", args.tangent_profile or args.profile)),
+                )
             gc.collect()
 
             for row in step_df.to_dict(orient="records"):
@@ -1234,6 +1437,17 @@ def main() -> int:
             )
             basis_wall_s = float(time.perf_counter() - basis_started)
         new_rank = len(basis_fields)
+        _stage_profile_row(
+            stage_profile_rows,
+            stage="basis_enrichment",
+            scope="anchor",
+            anchor_id=anchor_idx,
+            wall_s=basis_wall_s,
+            old_rank=old_rank,
+            new_rank=new_rank,
+            rank_added=new_rank - old_rank,
+            streamed=bool(basis_streamed),
+        )
         print(
             f"[ANCHOR-TANGENT-ADAPTIVE]   basis: {old_rank} → {new_rank} "
             f"(+{new_rank - old_rank}) in {basis_wall_s:.2f}s",
@@ -1274,6 +1488,29 @@ def main() -> int:
                 affine_q_block_size=int(args.affine_q_block_size),
             )
         assembly_wall_s = float(time.perf_counter() - assembly_started)
+        assembly_stage_meta = _scalar_meta(assembly_meta)
+        _stage_profile_row(
+            stage_profile_rows,
+            stage="reduced_operator_assembly",
+            scope="anchor",
+            anchor_id=anchor_idx,
+            wall_s=assembly_wall_s,
+            **assembly_stage_meta,
+        )
+        for stage_name, meta_key in (
+            ("assembly_affine_stress", "affine_stress_wall_s"),
+            ("assembly_ritz_contraction", "contraction_wall_s"),
+        ):
+            if meta_key in assembly_meta:
+                _stage_profile_row(
+                    stage_profile_rows,
+                    stage=stage_name,
+                    scope="assembly",
+                    anchor_id=anchor_idx,
+                    wall_s=float(assembly_meta.get(meta_key, 0.0)),
+                    assembly_mode=str(assembly_meta.get("assembly_mode", "")),
+                    q_block_size=int(assembly_meta.get("q_block_size", args.affine_q_block_size)),
+                )
         print(
             f"[ANCHOR-TANGENT-ADAPTIVE]   assembly: {assembly_wall_s:.2f}s",
             flush=True,
@@ -1288,6 +1525,14 @@ def main() -> int:
 
         monitor_errors, monitor_C, monitor_wall_s = evaluate_monitor_with_fom_truth(
             monitor_gammas, monitor_materials, Kq, Bq, Dq, monitor_truth,
+        )
+        _stage_profile_row(
+            stage_profile_rows,
+            stage="monitor_rom_evaluation",
+            scope="anchor",
+            anchor_id=anchor_idx,
+            wall_s=float(monitor_wall_s),
+            monitor_count=int(len(monitor_gammas)),
         )
 
         # Nested Ritz spaces must make C_r decrease in Loewner order.  This
@@ -1333,6 +1578,18 @@ def main() -> int:
             "anchor_wall_s": anchor_wall_s,
             "assembly_wall_s": assembly_wall_s,
             "basis_wall_s": basis_wall_s,
+            "monitor_rom_wall_s": float(monitor_wall_s),
+            "anchor_solver_input_loading_s": float(anchor_timing.get("input_loading_s", np.nan)),
+            "anchor_solver_cfield_build_s": float(anchor_timing.get("cfield_build_s", np.nan)),
+            "anchor_solver_affine_operator_build_s": float(anchor_timing.get("affine_sensitivity_build_s", np.nan)),
+            "anchor_solver_primal_calculate_s": float(anchor_timing.get("problem_calculate_s", np.nan)),
+            "anchor_solver_exact_sensitivity_wall_s": float(sensitivity_summary.get("wall_s", np.nan)) if isinstance(sensitivity_summary, dict) else np.nan,
+            "anchor_solver_sensitivity_solver_only_s": float(sensitivity_summary.get("solver_wall_excluding_consumer_s", np.nan)) if isinstance(sensitivity_summary, dict) else np.nan,
+            "anchor_solver_sensitivity_consumer_callback_s": float(sensitivity_summary.get("consumer_wall_s", np.nan)) if isinstance(sensitivity_summary, dict) else np.nan,
+            "anchor_solver_postprocess_s": float(anchor_timing.get("problem_postprocessing_s", np.nan)),
+            "anchor_affine_sensitivity_storage": str(anchor_timing.get("affine_sensitivity_storage", "")),
+            "anchor_affine_sensitivity_payload_mib": float(anchor_timing.get("affine_sensitivity_payload_mib", np.nan)),
+            **{f"assembly_{key}": value for key, value in assembly_stage_meta.items()},
             "status": status,
             "monitor_has_fom_truth": bool(monitor_truth is not None),
             "ritz_monotonic_min_eig_rel": monotonic_min_eig_rel,
@@ -1388,6 +1645,7 @@ def main() -> int:
     final_summary: dict[str, Any] | None = None
     final_truth_info: dict[str, Any] | None = None
     if operators is not None:
+        final_truth_started = time.perf_counter()
         final_materials = _reference_materials(
             source_csv=base_final_truth_csv,
             count=int(args.final_validation_count),
@@ -1405,11 +1663,28 @@ def main() -> int:
             index_column="final_validation_id",
             quiet_solver=bool(args.quiet_solver),
         )
+        final_truth_wall_s = float(time.perf_counter() - final_truth_started)
+        _stage_profile_row(
+            stage_profile_rows,
+            stage="final_validation_truth_fom",
+            wall_s=final_truth_wall_s,
+            count=int(len(final_truth)),
+            profile=str(args.truth_profile),
+            source=str(final_truth_info.get("source", "")) if final_truth_info else "",
+        )
+        final_rom_started = time.perf_counter()
         final_rom = reduced._evaluate_rom(
             results_df=final_truth,
             Kq=operators["Kq"],
             Bq=operators["Bq"],
             Dq=operators["Dq"],
+        )
+        final_rom_wall_s = float(time.perf_counter() - final_rom_started)
+        _stage_profile_row(
+            stage_profile_rows,
+            stage="final_validation_rom_evaluation",
+            wall_s=final_rom_wall_s,
+            count=int(len(final_truth)),
         )
         final_rom.to_csv(run_dir / "final_validation_rom_results.csv", index=False)
         final_errors = final_rom["relative_frobenius_error"].to_numpy(dtype=float)
@@ -1431,11 +1706,19 @@ def main() -> int:
     # Also evaluate monitor ROM results if operators exist
     monitor_summary: dict[str, Any] | None = None
     if operators is not None:
+        final_monitor_started = time.perf_counter()
         monitor_rom = reduced._evaluate_rom(
             results_df=monitor_truth,
             Kq=operators["Kq"],
             Bq=operators["Bq"],
             Dq=operators["Dq"],
+        )
+        final_monitor_wall_s = float(time.perf_counter() - final_monitor_started)
+        _stage_profile_row(
+            stage_profile_rows,
+            stage="final_monitor_rom_evaluation",
+            wall_s=final_monitor_wall_s,
+            count=int(len(monitor_truth)),
         )
         monitor_rom.to_csv(run_dir / "monitor_rom_results.csv", index=False)
         monitor_errors_final = monitor_rom["relative_frobenius_error"].to_numpy(dtype=float)
@@ -1477,6 +1760,24 @@ def main() -> int:
     # Summary manifest
     # -----------------------------------------------------------------------
     n_anchors = len(anchor_records)
+    pipeline_profile_path = run_dir / "pipeline_stage_profile.csv"
+    pipeline_profile_json_path = run_dir / "pipeline_stage_profile.json"
+    _stage_profile_row(
+        stage_profile_rows,
+        stage="pipeline_wall_before_summary",
+        wall_s=float(time.perf_counter() - pipeline_started),
+        n_anchors=n_anchors,
+        basis_rank=int(operators["Kq"].shape[1]) if operators is not None else len(basis_fields),
+    )
+    pd.DataFrame(stage_profile_rows).to_csv(pipeline_profile_path, index=False)
+    write_json(
+        pipeline_profile_json_path,
+        {
+            "run_dir": str(run_dir),
+            "stages": stage_profile_rows,
+            "total_profiled_wall_s": float(time.perf_counter() - pipeline_started),
+        },
+    )
     if str(args.tangent_method) == "sensitivity":
         method_note = (
             "Adaptive greedy anchor selection with exact discrete affine "
@@ -1531,6 +1832,9 @@ def main() -> int:
         ],
         "iteration_records": iteration_records,
         "basis_dtype": str(dtype),
+        "stream_basis_group_max_mib": float(args.stream_basis_group_max_mib),
+        "stream_basis_block_mib": float(stream_basis_block_mib),
+        "stream_basis_group_size": int(stream_basis_group_size),
         "reduced_compute_dtype": "float64",
         "solver_profile": str(args.profile),
         "tangent_solver_profile": str(args.tangent_profile or args.profile),
@@ -1541,6 +1845,8 @@ def main() -> int:
         "final_truth_info": final_truth_info,
         "monitor_truth_csv": str(monitor_truth_csv),
         "final_validation_truth_csv": str(final_truth_csv),
+        "pipeline_stage_profile_csv": str(pipeline_profile_path),
+        "pipeline_stage_profile_json": str(pipeline_profile_json_path),
         "legacy_monitor_material_source_csv": str(base_monitor_truth_csv),
         "legacy_final_material_source_csv": str(base_final_truth_csv),
         "fft_backend": str(args.fft_backend),

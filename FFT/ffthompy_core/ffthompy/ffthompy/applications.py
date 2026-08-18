@@ -549,6 +549,8 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
     )
     solver_infos = []
     consumed = []
+    host_transfer_wall_s = 0.0
+    consumer_wall_s = 0.0
 
     def make_sensitivity_tensor(q, spec):
         if isinstance(spec, dict):
@@ -611,9 +613,14 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
         )
 
     def emit_or_store(q, storage_index, load_id, value):
+        nonlocal host_transfer_wall_s, consumer_wall_s
+        transfer_started = time.perf_counter()
         host_value = to_host_array(value).astype(np.dtype(real_dtype), copy=False)
+        host_transfer_wall_s += float(time.perf_counter() - transfer_started)
         if streaming:
+            consumer_started = time.perf_counter()
             consumer(int(q), str(names[q]), int(load_id), host_value)
+            consumer_wall_s += float(time.perf_counter() - consumer_started)
             consumed.append((int(q), int(load_id)))
         else:
             fields[int(q), int(storage_index)] = host_value
@@ -711,6 +718,8 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
         'final_norm_res_rel_max': float(max(rel_residuals)) if rel_residuals else np.nan,
         'cg_iterations_max': int(max(iterations)) if iterations else -1,
         'streamed': bool(streaming),
+        'host_transfer_wall_s': float(host_transfer_wall_s),
+        'consumer_wall_s': float(consumer_wall_s),
     }
     output = {
         'coefficient_names': names,
@@ -1102,6 +1111,13 @@ def elasticity(problem):
                 D, Nbar, Afun, pb, GN, solutions, fft_form
             )
             affine_sensitivity_summary['wall_s'] = float(_stage_toc(sens_t0))
+            affine_sensitivity_summary['solver_wall_excluding_consumer_s'] = float(
+                max(
+                    0.0,
+                    affine_sensitivity_summary['wall_s']
+                    - float(affine_sensitivity_summary.get('consumer_wall_s', 0.0)),
+                )
+            )
             if sensitivity_output is not None:
                 pb.output['affine_sensitivity_' + primaldual] = sensitivity_output
                 pb.output['affine_sensitivity_summary_' + primaldual] = affine_sensitivity_summary
