@@ -123,11 +123,16 @@ def _evaluate_budget(
     fields: list[np.ndarray] = []
     load_started = time.perf_counter()
     for candidate_id in candidate_ids:
-        fields.extend(common.load_snapshot_fields(common._snapshot_dir(campaign_dir, candidate_id)))
+        fields.extend(
+            common.load_snapshot_fields(
+                common._snapshot_dir(campaign_dir, candidate_id),
+                dtype=np.float32,
+            )
+        )
     snapshot_shape = tuple(int(value) for value in np.asarray(fields[0]).shape)
     matrix_started = time.perf_counter()
     snapshot_matrix = np.stack(
-        [np.asarray(field, dtype=np.float64).reshape(-1) for field in fields], axis=0
+        [np.asarray(field, dtype=np.float32).reshape(-1) for field in fields], axis=0
     )
     matrix_wall_s = float(time.perf_counter() - matrix_started)
     fields_load_wall_s = float(matrix_started - load_started)

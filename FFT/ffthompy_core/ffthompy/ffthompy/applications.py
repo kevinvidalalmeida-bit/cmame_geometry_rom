@@ -7,7 +7,14 @@ from ffthompy.general.solver import linear_solver
 from ffthompy.general.solver_pp import CallBack, CallBack_GA
 from ffthompy.general.base import Timer
 from ffthompy.tensors import Tensor, DFT, Operator
-from ffthompy.tensors.fft import cupy_synchronize, get_array_module, to_backend_array, to_host_array
+from ffthompy.tensors.fft import (
+    CUPY_AVAILABLE,
+    cp,
+    cupy_synchronize,
+    get_array_module,
+    to_backend_array,
+    to_host_array,
+)
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import sys
 import sysconfig
@@ -172,6 +179,53 @@ def _load_batch_size(pb, nloads):
         return 1
     size = int(_solver_get(pb.solver, "load_batch_size", pb.solve.get("load_batch_size", 1)))
     return max(1, min(size, int(nloads)))
+
+
+def _resolve_affine_sensitivity_batch_size(pb, field_shape, nloads):
+    """Choose a bounded GPU RHS batch without risking a large-grid OOM."""
+    requested = int(pb.solve.get("affine_sensitivity_batch_size", 0))
+    if requested < 0:
+        raise ValueError("affine_sensitivity_batch_size debe ser no negativo.")
+    if requested > 0:
+        return max(1, min(requested, int(nloads)))
+    if (
+        not CUPY_AVAILABLE
+        or cp is None
+        or str(pb.solve.get("fft_backend", "")).lower() != "cupy"
+    ):
+        return 1
+    nvox = int(np.prod(field_shape))
+    # Small grids are faster with the already measured scalar path.
+    if nvox < 1_000_000:
+        return 1
+    try:
+        free_bytes, _ = cp.cuda.runtime.memGetInfo()
+        rhs_bytes = 6 * nvox * np.dtype(_solver_real_dtype(pb)).itemsize
+        # B, x, R, P, AP plus FFT/operator temporaries. Keep this budget
+        # deliberately below half of the currently free VRAM.
+        estimated_per_rhs = 5.0 * float(rhs_bytes)
+        memory_limited = int((0.40 * float(free_bytes)) // estimated_per_rhs)
+        return max(1, min(2, int(nloads), memory_limited))
+    except Exception:
+        return 1
+
+
+def _release_affine_sensitivity_batch_memory(pb):
+    """Return dead batched CG workspaces to CuPy between sensitivity batches."""
+    if (
+        not CUPY_AVAILABLE
+        or cp is None
+        or str(pb.solve.get("fft_backend", "")).lower() != "cupy"
+    ):
+        return
+    try:
+        cp.cuda.Stream.null.synchronize()
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        # Pool trimming is an optimization; the solve result remains valid if
+        # a backend/version does not expose one of these pool APIs.
+        return
 
 
 def _solver_real_dtype(pb):
@@ -408,6 +462,13 @@ def solve_load_elasticity(iL, D, Nbar, Afun, pb, GN, A, add_macro2minimizer, lin
     if init_fields is not None:
         x0 = EN.zeros_like(name='x0')
         val = np.asarray(init_fields[iL], dtype=real_dtype)
+        if val.size != x0.val.size:
+            raise ValueError(
+                'initial_solution_fields[{0}] has {1} entries; expected {2}.'.format(
+                    iL, val.size, x0.val.size
+                )
+            )
+        val = val.reshape(x0.val.shape)
         if hasattr(x0.val, "get") or type(x0.val).__module__.startswith("cupy"):
             import cupy as cp
             x0.val = cp.asarray(val)
@@ -532,16 +593,17 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
     if any(not hasattr(solutions[iL], 'val') for iL in load_ids):
         raise RuntimeError("No hay soluciones primales para calcular sensibilidades afines.")
 
-    batch_size = max(
-        1,
-        int(pb.solve.get('affine_sensitivity_batch_size', pb.solve.get('load_batch_size', 1))),
-    )
-    batch_size = min(batch_size, len(load_ids))
     real_dtype = _solver_real_dtype(pb)
+    batch_size = _resolve_affine_sensitivity_batch_size(
+        pb,
+        field_shape=tuple(int(v) for v in np.asarray(Nbar, dtype=int).tolist()),
+        nloads=len(load_ids),
+    )
     par = dict(pb.solver)
 
     field_shape = tuple(int(v) for v in np.asarray(Nbar, dtype=int).tolist())
     consumer = pb.solve.get('affine_sensitivity_consumer', None)
+    progress = pb.solve.get('affine_sensitivity_progress', None)
     streaming = callable(consumer)
     fields = None if streaming else np.empty(
         (q_count, len(load_ids), D) + field_shape,
@@ -631,6 +693,7 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
         for start in range(0, len(load_ids), batch_size):
             chunk_load_ids = load_ids[start:start + batch_size]
             if len(chunk_load_ids) == 1:
+                solve_started = time.perf_counter()
                 load_id = int(chunk_load_ids[0])
                 stress_rhs = dA(solutions[load_id])
                 B = -(GN(stress_rhs))
@@ -643,15 +706,26 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
                     par=par,
                     callback=None,
                 )
-                emit_or_store(q, start, load_id, X.val)
+                x_host = to_host_array(X.val).astype(np.dtype(real_dtype), copy=False)
+                solver_wall_s = float(time.perf_counter() - solve_started)
                 solver_infos.append({
                     'coefficient_index': int(q),
                     'coefficient_name': str(names[q]),
                     'load_ids': [load_id],
                     'info': info,
                 })
+                del X, x0, B, stress_rhs
+                _release_affine_sensitivity_batch_memory(pb)
+                emit_or_store(q, start, load_id, x_host)
+                del x_host
+                if callable(progress):
+                    progress(
+                        int(q), str(names[q]), [load_id],
+                        solver_wall_s,
+                    )
                 continue
 
+            solve_started = time.perf_counter()
             solution_values = [solutions[iL].val for iL in chunk_load_ids]
             xp = get_array_module(dA.val, *solution_values)
             if xp is np:
@@ -680,14 +754,24 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
                 callback=None,
             )
             x_host = to_host_array(X.val).astype(np.dtype(real_dtype), copy=False)
-            for local, load_id in enumerate(chunk_load_ids):
-                emit_or_store(q, start + local, load_id, x_host[:, local])
+            solver_wall_s = float(time.perf_counter() - solve_started)
             solver_infos.append({
                 'coefficient_index': int(q),
                 'coefficient_name': str(names[q]),
                 'load_ids': [int(value) for value in chunk_load_ids],
                 'info': info,
             })
+            del X, x0, B, stress_rhs, sol_batch, val, solution_values
+            _release_affine_sensitivity_batch_memory(pb)
+            for local, load_id in enumerate(chunk_load_ids):
+                emit_or_store(q, start + local, load_id, x_host[:, local])
+            del x_host
+            if callable(progress):
+                progress(
+                    int(q), str(names[q]),
+                    [int(value) for value in chunk_load_ids],
+                    solver_wall_s,
+                )
 
     rel_residuals = []
     convergence_flags = []

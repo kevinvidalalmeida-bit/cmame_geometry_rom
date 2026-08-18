@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,6 +103,134 @@ def test_contiguous_basis_accepts_preordered_blocks():
     singular_values = np.linalg.svd(overlap, compute_uv=False)
     np.testing.assert_allclose(singular_values, 1.0, rtol=3.0e-6, atol=3.0e-6)
     assert preordered.last_projection_backend == "initial_block_no_projection"
+
+
+def test_contiguous_basis_raw_preordered_preserves_full_rank_fields():
+    rng = np.random.default_rng(20260910)
+    shape = (6, 5, 4, 3)
+    first = rng.standard_normal((4,) + shape).astype(np.float32)
+    second = rng.standard_normal((3,) + shape).astype(np.float32)
+    basis = common.ContiguousBasis(7, shape, dtype=np.float32)
+
+    appended_first = basis.append_raw_preordered(first)
+    appended_second = basis.append_raw_preordered(second)
+
+    np.testing.assert_array_equal(appended_first, first)
+    np.testing.assert_array_equal(appended_second, second)
+    np.testing.assert_array_equal(basis.active_fields, np.concatenate((first, second)))
+    assert len(basis) == 7
+    assert basis.last_projection_backend == "raw_full_rank_no_projection"
+
+
+def test_raw_full_rank_ritz_is_invariant_to_basis_coordinates():
+    rng = np.random.default_rng(20260911)
+    shape = (5, 4, 3)
+    phase = np.zeros(shape, dtype=np.uint8)
+    phase.reshape(-1)[::3] = 1
+    ori = np.zeros(shape + (3,), dtype=np.float64)
+    ori[..., 0] = 1.0
+    orthonormal = np.stack(_orthonormal_fields(rng, 8, (6,) + shape))
+    mixing = np.eye(8) + 0.08 * rng.standard_normal((8, 8))
+    raw = (mixing @ orthonormal.reshape(8, -1)).reshape(orthonormal.shape)
+
+    K_pod, B_pod, D_pod, _ = reduced._assemble_reduced_operators(
+        phase=phase, ori=ori, basis=orthonormal
+    )
+    K_raw, B_raw, D_raw, metadata = reduced._assemble_reduced_operators(
+        phase=phase, ori=ori, basis=raw
+    )
+    material = {
+        "Em": 3.5,
+        "nu_m": 0.35,
+        "Ef_L": 120.0,
+        "Ef_T": 14.0,
+        "G_LT": 5.5,
+        "nu_LT": 0.22,
+        "nu_TT": 0.32,
+    }
+    coefficients = reduced._material_coefficients(material)
+    C_pod, _, _ = reduced._rom_ceff(coefficients, K_pod, B_pod, D_pod)
+    C_raw, _, _ = reduced._rom_ceff(coefficients, K_raw, B_raw, D_raw)
+
+    np.testing.assert_allclose(C_raw, C_pod, rtol=2.0e-12, atol=2.0e-12)
+    assert metadata["gram_condition"] > 1.0
+
+
+def test_raw_ritz_rank_reveal_discards_only_dependent_directions():
+    rng = np.random.default_rng(20260912)
+    shape = (5, 4, 3)
+    phase = np.zeros(shape, dtype=np.uint8)
+    phase.reshape(-1)[::3] = 1
+    ori = np.zeros(shape + (3,), dtype=np.float64)
+    ori[..., 0] = 1.0
+    independent = np.stack(_orthonormal_fields(rng, 5, (6,) + shape))
+    dependent = np.concatenate((independent, independent[[2]]), axis=0)
+
+    Kq, Bq, _, metadata = reduced._assemble_reduced_operators(
+        phase=phase,
+        ori=ori,
+        basis=dependent,
+        gram_rank_reveal=True,
+    )
+
+    assert Kq.shape[1:] == (5, 5)
+    assert Bq.shape[1] == 5
+    assert metadata["effective_rank"] == 5
+    assert metadata["discarded_rank"] == 1
+    assert metadata["gram_transform_mode"] == "eigh_rank_reveal"
+
+
+def test_raw_ritz_incremental_extension_matches_full_assembly():
+    rng = np.random.default_rng(20260913)
+    shape = (5, 4, 3)
+    phase = np.zeros(shape, dtype=np.uint8)
+    phase.reshape(-1)[::3] = 1
+    ori = np.zeros(shape + (3,), dtype=np.float64)
+    ori[..., 0] = 1.0
+    orthonormal = np.stack(_orthonormal_fields(rng, 9, (6,) + shape))
+    mixing = np.eye(9) + 0.05 * rng.standard_normal((9, 9))
+    raw = (mixing @ orthonormal.reshape(9, -1)).reshape(orthonormal.shape)
+    order = reduced.phase_orientation_voxel_order(phase, ori)
+    ordered_phase = phase.reshape(-1)[order]
+    ordered_ori = ori.reshape(-1, 3)[order]
+    raw = np.take(raw.reshape(9, 6, -1), order, axis=2)
+    split = 5
+    affine = reduced.affine_stress_batch_factory(ordered_phase, ordered_ori)
+
+    K0, B0, D0, first = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=raw[:split],
+        affine_stress_batch=affine,
+        gram_rank_reveal=True,
+    )
+    existing = {
+        "Kq": K0,
+        "Bq": B0,
+        "Dq": D0,
+        "raw_Kq": first["raw_Kq"],
+        "raw_Bq": first["raw_Bq"],
+        "G": first["G"],
+        "invR": first["invR"],
+    }
+    Ki, Bi, Di, _ = reduced._extend_reduced_operators(
+        existing=existing,
+        old_basis=raw[:split],
+        new_basis=raw[split:],
+        affine_stress_batch=affine,
+        gram_rank_reveal=True,
+    )
+    Kf, Bf, Df, _ = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=raw,
+        affine_stress_batch=affine,
+        gram_rank_reveal=True,
+    )
+
+    np.testing.assert_allclose(Ki, Kf, rtol=3.0e-12, atol=3.0e-12)
+    np.testing.assert_allclose(Bi, Bf, rtol=3.0e-12, atol=3.0e-12)
+    np.testing.assert_allclose(Di, Df, rtol=3.0e-13, atol=3.0e-13)
 
 
 def test_contiguous_basis_blocked_projection_preserves_subspace():
@@ -208,6 +337,92 @@ def test_vectorized_affine_assembly_matches_direct_contractions():
         rtol=3.0e-13,
         atol=3.0e-13,
     )
+
+
+def test_gpu_supported_affine_chunks_match_cpu():
+    try:
+        import cupy as cp
+
+        cp.cuda.Device().compute_capability
+    except Exception:
+        pytest.skip("CUDA/CuPy is unavailable")
+    rng = np.random.default_rng(20260914)
+    shape = (5, 4, 3)
+    phase = np.zeros(shape, dtype=np.uint8)
+    phase.reshape(-1)[::3] = 1
+    ori = np.zeros(shape + (3,), dtype=np.float32)
+    fiber = np.flatnonzero(phase.reshape(-1))
+    ori.reshape(-1, 3)[fiber, np.arange(len(fiber)) % 3] = 1.0
+    order = reduced.phase_orientation_voxel_order(phase, ori)
+    ordered_phase = phase.reshape(-1)[order]
+    ordered_ori = ori.reshape(-1, 3)[order]
+    affine = reduced.affine_stress_batch_factory(ordered_phase, ordered_ori)
+
+    for support, indices, selector in affine.support_blocks:
+        count = int(selector.stop) - int(selector.start)
+        values = rng.standard_normal((7, 6, count)).astype(np.float32)
+        expected = affine.apply_supported_chunk(indices, values, support, 0)
+        actual = cp.asnumpy(
+            affine.apply_supported_chunk_gpu(
+                indices,
+                cp.asarray(values.reshape(len(values), -1)),
+                support,
+                0,
+            )
+        )
+        np.testing.assert_allclose(actual, expected, rtol=2.0e-6, atol=2.0e-6)
+
+
+def test_gpu_affine_failure_falls_back_to_cpu_without_changing_operators():
+    try:
+        import cupy as cp
+
+        cp.cuda.Device().compute_capability
+    except Exception:
+        pytest.skip("CUDA/CuPy is unavailable")
+    rng = np.random.default_rng(20260915)
+    shape = (5, 4, 3)
+    phase = np.zeros(shape, dtype=np.uint8)
+    phase.reshape(-1)[::3] = 1
+    ori = np.zeros(shape + (3,), dtype=np.float32)
+    ori[..., 0] = 1.0
+    order = reduced.phase_orientation_voxel_order(phase, ori)
+    ordered_phase = phase.reshape(-1)[order]
+    ordered_ori = ori.reshape(-1, 3)[order]
+    basis = np.take(
+        np.stack(_orthonormal_fields(rng, 7, (6,) + shape))
+        .astype(np.float32)
+        .reshape(7, 6, -1),
+        order,
+        axis=2,
+    )
+    cpu_affine = reduced.affine_stress_batch_factory(ordered_phase, ordered_ori)
+    cpu_affine.apply_supported_chunk_gpu = None
+    expected = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=basis,
+        affine_stress_batch=cpu_affine,
+    )[:3]
+
+    fallback_affine = reduced.affine_stress_batch_factory(ordered_phase, ordered_ori)
+
+    def fail_gpu(*_args, **_kwargs):
+        raise RuntimeError("intentional GPU test failure")
+
+    fallback_affine.apply_supported_chunk_gpu = fail_gpu
+    *actual, metadata = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=basis,
+        affine_stress_batch=fallback_affine,
+    )
+
+    for value, reference in zip(actual, expected, strict=True):
+        np.testing.assert_allclose(value, reference, rtol=2.0e-6, atol=2.0e-6)
+    assert metadata["affine_stress_backend"] == "cpu"
+    assert metadata["cpu_affine_chunks"] > 0
+    assert "intentional GPU test failure" in metadata["gpu_affine_fallback"]
 
 
 def test_affine_coefficient_blocks_preserve_reduced_operators():

@@ -343,6 +343,7 @@ def _affine_tensor_batch_factory(
             (int(fiber_group_ids[start]), int(start), int(end))
             for start, end in zip(starts, ends, strict=True)
         )
+    gpu_basis_cache: dict[str, tuple[Any, Any]] = {}
 
     def apply(q: int, strains: np.ndarray) -> np.ndarray:
         values = np.asarray(strains)
@@ -629,6 +630,92 @@ def _affine_tensor_batch_factory(
                 )
         return stresses
 
+    def apply_supported_chunk_gpu(
+        q_indices: Any,
+        strains_gpu: Any,
+        support: str,
+        support_offset: int,
+    ) -> Any:
+        """GPU counterpart of ``apply_supported_chunk`` for resident Ritz chunks."""
+        import cupy as cp
+
+        selected = np.asarray(q_indices, dtype=np.intp).reshape(-1)
+        values = cp.asarray(strains_gpu)
+        if values.ndim == 2:
+            if values.shape[1] % 6:
+                raise ValueError("flattened GPU strains lack a six-component axis")
+            values = values.reshape(values.shape[0], 6, values.shape[1] // 6)
+        if values.ndim != 3 or values.shape[1] != 6:
+            raise ValueError("GPU supported strains must be component-major")
+        n_chunk = int(values.shape[2])
+        offset = int(support_offset)
+        if offset < 0:
+            raise ValueError("invalid support chunk offset")
+        dtype_key = "float32" if values.dtype == cp.float32 else "float64"
+        if dtype_key not in gpu_basis_cache:
+            np_dtype = np.float32 if dtype_key == "float32" else np.float64
+            gpu_basis_cache[dtype_key] = (
+                cp.asarray(matrix_bases_by_dtype[np.dtype(np_dtype)]),
+                cp.asarray(fiber_bases_by_dtype[np.dtype(np_dtype)]),
+            )
+        matrix_gpu, fiber_gpu = gpu_basis_cache[dtype_key]
+
+        if support == "matrix":
+            if np.any((selected < 0) | (selected >= 2)):
+                raise ValueError("matrix support only accepts coefficients 0 and 1")
+            if offset + n_chunk > len(matrix_idx):
+                raise ValueError("matrix support chunk exceeds available voxels")
+            stresses = cp.empty((len(selected),) + values.shape, dtype=values.dtype)
+            if stiffness_matrix_fast_path:
+                for output_index, q in enumerate(selected):
+                    if q == 0:
+                        stresses[output_index].fill(0)
+                        normal_sum = cp.sum(values[:, :3], axis=1, dtype=values.dtype)
+                        stresses[output_index, :, :3] = normal_sum[:, None, :]
+                    else:
+                        cp.multiply(values, values.dtype.type(2.0), out=stresses[output_index])
+            else:
+                stresses[:] = cp.einsum(
+                    "qab,lbn->qlan",
+                    matrix_gpu[selected],
+                    values,
+                    optimize=True,
+                )
+            return stresses
+
+        if support != "fiber":
+            raise ValueError("support must be 'matrix' or 'fiber'")
+        if np.any((selected < 2) | (selected >= q_count)):
+            raise ValueError("fiber support only accepts coefficients 2 and above")
+        if offset + n_chunk > len(fiber_idx):
+            raise ValueError("fiber support chunk exceeds available voxels")
+        local_indices = selected - 2
+        chunk_group_ids = fiber_group_ids[offset : offset + n_chunk]
+        if not len(chunk_group_ids):
+            return cp.empty((len(selected),) + values.shape, dtype=values.dtype)
+        starts = np.concatenate(
+            (np.array([0], dtype=np.int64), np.flatnonzero(np.diff(chunk_group_ids)) + 1)
+        )
+        ends = np.concatenate((starts[1:], np.array([len(chunk_group_ids)])))
+        if len(starts) == 1:
+            group = int(chunk_group_ids[0])
+            return cp.einsum(
+                "qab,lbn->qlan",
+                fiber_gpu[group, local_indices],
+                values,
+                optimize=True,
+            )
+        stresses = cp.empty((len(selected),) + values.shape, dtype=values.dtype)
+        for start, end in zip(starts, ends, strict=True):
+            group = int(chunk_group_ids[int(start)])
+            stresses[:, :, :, int(start) : int(end)] = cp.einsum(
+                "qab,lbn->qlan",
+                fiber_gpu[group, local_indices],
+                values[:, :, int(start) : int(end)],
+                optimize=True,
+            )
+        return stresses
+
     def apply_all(strains: np.ndarray) -> np.ndarray:
         return apply_indices(np.arange(q_count), strains)
 
@@ -645,6 +732,7 @@ def _affine_tensor_batch_factory(
             ("fiber", np.arange(2, q_count, dtype=np.intp), fiber_selector),
         )
         apply.apply_supported_indices = apply_supported_indices
+        apply.apply_supported_chunk_gpu = apply_supported_chunk_gpu
     return apply
 
 
@@ -854,7 +942,15 @@ def _snapshot_path(run_dir: Path, material_id: int) -> Path:
     return run_dir / f"material_{int(material_id):04d}" / "solution_fields.npz"
 
 
-def _load_snapshot_fields(run_dir: Path, material_ids: list[int]) -> list[np.ndarray]:
+def _load_snapshot_fields(
+    run_dir: Path,
+    material_ids: list[int],
+    *,
+    dtype: str | np.dtype = np.float32,
+) -> list[np.ndarray]:
+    field_dtype = np.dtype(dtype)
+    if field_dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+        raise ValueError("snapshot dtype must be float32 or float64.")
     fields: list[np.ndarray] = []
     for material_id in material_ids:
         path = _snapshot_path(run_dir, material_id)
@@ -865,7 +961,7 @@ def _load_snapshot_fields(run_dir: Path, material_ids: list[int]) -> list[np.nda
                 key = f"fluctuation_load{load_id}"
                 if key not in payload:
                     raise KeyError(f"{path} no contiene {key}")
-                fields.append(np.asarray(payload[key], dtype=np.float64))
+                fields.append(np.asarray(payload[key], dtype=field_dtype))
     return fields
 
 
@@ -1028,25 +1124,129 @@ def _gpu_flat64(values: np.ndarray) -> Any | None:
         return None
 
 
-def _contract_preloaded(
+def _gpu_batch_flat64(values: np.ndarray) -> Any | None:
+    """Upload a batched component-major chunk as ``(batch, rows, dofs)``."""
+    try:
+        import cupy as cp
+        array = np.ascontiguousarray(values)
+        if array.ndim < 3:
+            raise ValueError("batched contraction expects at least three dimensions")
+        flat = array.reshape(array.shape[0], array.shape[1], -1)
+        return cp.asarray(flat, dtype=cp.float64)
+    except Exception:
+        return None
+
+
+def _gpu_flat_compute(values: np.ndarray) -> Any | None:
+    """Upload a flattened chunk in its field-storage precision."""
+    try:
+        import cupy as cp
+        array = np.ascontiguousarray(values)
+        dtype = cp.float32 if array.dtype.itemsize <= 4 else cp.float64
+        return cp.asarray(array.reshape(array.shape[0], -1), dtype=dtype)
+    except Exception:
+        return None
+
+
+def _gpu_batch_flat_compute(values: np.ndarray) -> Any | None:
+    """Upload batched stresses in field precision for mixed Ritz GEMMs."""
+    try:
+        import cupy as cp
+        array = np.ascontiguousarray(values)
+        if array.ndim < 3:
+            raise ValueError("batched contraction expects at least three dimensions")
+        dtype = cp.float32 if array.dtype.itemsize <= 4 else cp.float64
+        flat = array.reshape(array.shape[0], array.shape[1], -1)
+        return cp.asarray(flat, dtype=dtype)
+    except Exception:
+        return None
+
+
+def _contract_preloaded_batch(
     left: np.ndarray,
     right: np.ndarray,
-    left_gpu: Any | None,
+    left_gpu: Any | None = None,
+    right_gpu: Any | None = None,
 ) -> np.ndarray:
-    """Contract with a GPU-resident left operand when available."""
-    if left_gpu is not None:
-        try:
-            import cupy as cp
-            right_gpu = cp.asarray(
-                np.ascontiguousarray(right).reshape(right.shape[0], -1),
-                dtype=cp.float64,
-            )
-            result = cp.asnumpy(left_gpu @ right_gpu.T)
+    """Return ``left @ right[q].T`` for all affine coefficients at once.
+
+    ``right`` has shape ``(q, rows, 6, n)``.  Keeping the coefficient axis
+    inside one GPU contraction avoids one host-to-device transfer and one
+    kernel launch per affine coefficient.  The NumPy path follows the same
+    contraction and remains the fallback when CUDA is unavailable.
+    """
+    if left.ndim != 3 or right.ndim != 4:
+        raise ValueError("batched contraction expects (r, 6, n) and (q, r, 6, n)")
+    if left.shape[1] != 6 or right.shape[2] != 6 or left.shape[2] != right.shape[3]:
+        raise ValueError("batched contraction arrays have incompatible shapes")
+    left_flat = np.ascontiguousarray(left).reshape(left.shape[0], -1)
+    right_flat = np.ascontiguousarray(right).reshape(
+        right.shape[0], right.shape[1], -1
+    )
+
+    try:
+        import cupy as cp
+
+        owns_left = left_gpu is None
+        owns_right = right_gpu is None
+        compute_dtype = (
+            cp.float32
+            if left_flat.dtype.itemsize <= 4 and right_flat.dtype.itemsize <= 4
+            else cp.float64
+        )
+        if left_gpu is None:
+            left_gpu = cp.asarray(left_flat, dtype=compute_dtype)
+        if right_gpu is None:
+            right_gpu = cp.asarray(right_flat, dtype=compute_dtype)
+        result = cp.einsum("am,qbm->qab", left_gpu, right_gpu, optimize=True)
+        result = cp.asnumpy(result)
+        if owns_left:
+            del left_gpu
+        if owns_right:
             del right_gpu
-            return np.asarray(result, dtype=np.float64)
-        except Exception:
-            pass
-    return _contract_component_major(left, right)
+        return np.asarray(result, dtype=np.float64)
+    except Exception:
+        return np.einsum(
+            "am,qbm->qab",
+            np.asarray(left_flat, dtype=np.float64),
+            np.asarray(right_flat, dtype=np.float64),
+            optimize=True,
+        )
+
+
+def _contract_and_sum_gpu_batch(
+    left_gpu: Any,
+    right_gpu: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Contract resident stresses and reduce their voxel mean in float64."""
+    import cupy as cp
+
+    left = cp.asarray(left_gpu)
+    right = cp.asarray(right_gpu)
+    if left.ndim != 2 or right.ndim != 4 or right.shape[2] != 6:
+        raise ValueError("resident contraction expects (r, 6*n) and (q, r, 6, n)")
+    right_flat = right.reshape(right.shape[0], right.shape[1], -1)
+    if left.shape[1] != right_flat.shape[2]:
+        raise ValueError("resident contraction operands have incompatible dimensions")
+    products = cp.einsum("am,qbm->qab", left, right_flat, optimize=True)
+    sums = cp.sum(right, axis=3, dtype=cp.float64)
+    return (
+        np.asarray(cp.asnumpy(products), dtype=np.float64),
+        np.asarray(cp.asnumpy(sums), dtype=np.float64),
+    )
+
+
+def _contract_gpu_batch(left_gpu: Any, right_gpu: Any) -> np.ndarray:
+    """Contract a second resident basis against an existing stress batch."""
+    import cupy as cp
+
+    left = cp.asarray(left_gpu)
+    right = cp.asarray(right_gpu)
+    right_flat = right.reshape(right.shape[0], right.shape[1], -1)
+    if left.ndim != 2 or left.shape[1] != right_flat.shape[2]:
+        raise ValueError("resident contraction operands have incompatible dimensions")
+    products = cp.einsum("am,qbm->qab", left, right_flat, optimize=True)
+    return np.asarray(cp.asnumpy(products), dtype=np.float64)
 
 
 def _contract_component_major(A: np.ndarray, B: np.ndarray) -> np.ndarray:
@@ -1116,8 +1316,9 @@ def _orthonormal_transform_from_gram(
     G: np.ndarray,
     *,
     rank_rtol: float = 1.0e-11,
-) -> tuple[np.ndarray, dict[str, float | int]]:
-    """Return T such that T G T.T = I, rejecting numerically dependent bases."""
+    allow_rank_reveal: bool = False,
+) -> tuple[np.ndarray, dict[str, float | int | str]]:
+    """Return T such that T G T.T = I, optionally dropping dependent rows."""
     gram = 0.5 * (np.asarray(G, dtype=np.float64) + np.asarray(G, dtype=np.float64).T)
     eigvals = scipy_linalg.eigvalsh(gram, check_finite=False)
     largest = float(eigvals[-1]) if len(eigvals) else 0.0
@@ -1125,25 +1326,39 @@ def _orthonormal_transform_from_gram(
     if not np.isfinite(largest) or largest <= 0.0:
         raise np.linalg.LinAlgError("reduced Gram matrix is not positive")
     relative_min = smallest / largest
-    if smallest <= 0.0 or relative_min <= float(rank_rtol):
+    dependent = smallest <= 0.0 or relative_min <= float(rank_rtol)
+    if dependent and not allow_rank_reveal:
         raise np.linalg.LinAlgError(
             "Reduced basis is numerically rank deficient: "
             f"lambda_min/lambda_max={relative_min:.3e}. "
             "Rank-reveal the incoming block before assembly."
         )
-    L = scipy_linalg.cholesky(gram, lower=True, check_finite=False)
-    T = scipy_linalg.solve_triangular(
-        L,
-        np.eye(L.shape[0], dtype=np.float64),
-        lower=True,
-        check_finite=False,
-    )
+    if dependent:
+        eigenvalues, eigenvectors = scipy_linalg.eigh(gram, check_finite=False)
+        keep = eigenvalues > largest * float(rank_rtol)
+        if not np.any(keep):
+            raise np.linalg.LinAlgError("reduced Gram matrix has zero numerical rank")
+        T = (
+            eigenvectors[:, keep] / np.sqrt(eigenvalues[keep])
+        ).T
+        transform_mode = "eigh_rank_reveal"
+    else:
+        L = scipy_linalg.cholesky(gram, lower=True, check_finite=False)
+        T = scipy_linalg.solve_triangular(
+            L,
+            np.eye(L.shape[0], dtype=np.float64),
+            lower=True,
+            check_finite=False,
+        )
+        transform_mode = "cholesky_full_rank"
     meta = {
         "gram_lambda_min": smallest,
         "gram_lambda_max": largest,
         "gram_condition": largest / smallest,
         "gram_relative_min": relative_min,
-        "effective_rank": int(G.shape[0]),
+        "effective_rank": int(T.shape[0]),
+        "discarded_rank": int(G.shape[0] - T.shape[0]),
+        "gram_transform_mode": transform_mode,
     }
     return T, meta
 
@@ -1152,10 +1367,25 @@ def _transform_raw_operators(
     raw_Kq: np.ndarray,
     raw_Bq: np.ndarray,
     G: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float | int]]:
-    T, gram_meta = _orthonormal_transform_from_gram(G)
-    Kq = np.empty_like(raw_Kq, dtype=np.float64)
-    Bq = np.empty_like(raw_Bq, dtype=np.float64)
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float | int | str]]:
+    return _transform_raw_operators_with_rank_policy(
+        raw_Kq, raw_Bq, G, allow_rank_reveal=False
+    )
+
+
+def _transform_raw_operators_with_rank_policy(
+    raw_Kq: np.ndarray,
+    raw_Bq: np.ndarray,
+    G: np.ndarray,
+    *,
+    allow_rank_reveal: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float | int | str]]:
+    T, gram_meta = _orthonormal_transform_from_gram(
+        G, allow_rank_reveal=bool(allow_rank_reveal)
+    )
+    rank = int(T.shape[0])
+    Kq = np.empty((raw_Kq.shape[0], rank, rank), dtype=np.float64)
+    Bq = np.empty((raw_Bq.shape[0], rank, raw_Bq.shape[2]), dtype=np.float64)
     for q in range(raw_Kq.shape[0]):
         Kq[q] = T @ raw_Kq[q] @ T.T
         Kq[q] = 0.5 * (Kq[q] + Kq[q].T)
@@ -1171,6 +1401,7 @@ def _assemble_dense_operators(
     basis: np.ndarray | list[np.ndarray],
     affine_stress_batch: Any | None,
     preserve_raw_coordinates: bool = False,
+    gram_rank_reveal: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Compatibility assembly for non phase-contiguous layouts."""
     t0 = time.perf_counter()
@@ -1189,9 +1420,16 @@ def _assemble_dense_operators(
     stresses = np.asarray(affine.apply_all(values))
     affine_stress_wall_s = float(time.perf_counter() - stress_started)
     contraction_started = time.perf_counter()
-    for q in range(q_count):
-        raw_Kq[q] = _contract_component_major(values, stresses[q]) / float(nvox)
-        raw_Bq[q] = np.sum(stresses[q], axis=2, dtype=np.float64) / float(nvox)
+    values_gpu = _gpu_flat_compute(values)
+    stresses_gpu = _gpu_batch_flat_compute(stresses)
+    raw_Kq[:] = _contract_preloaded_batch(
+        values, stresses, values_gpu, stresses_gpu
+    ) / float(nvox)
+    raw_Bq[:] = np.sum(stresses, axis=3, dtype=np.float64) / float(nvox)
+    if values_gpu is not None:
+        del values_gpu
+    if stresses_gpu is not None:
+        del stresses_gpu
     contraction_wall_s = float(time.perf_counter() - contraction_started)
     Dq = np.asarray(affine.averaged_stiffness, dtype=np.float64).copy()
     G = 0.5 * (G + G.T)
@@ -1212,7 +1450,12 @@ def _assemble_dense_operators(
             "effective_rank": int(r),
         }
     else:
-        Kq, Bq, invR, gram_meta = _transform_raw_operators(raw_Kq, raw_Bq, G)
+        Kq, Bq, invR, gram_meta = _transform_raw_operators_with_rank_policy(
+            raw_Kq,
+            raw_Bq,
+            G,
+            allow_rank_reveal=bool(gram_rank_reveal),
+        )
     metadata = {
         "assembly_wall_s": float(time.perf_counter() - t0),
         "assembly_mode": "batched_affine_cpu",
@@ -1238,6 +1481,7 @@ def _assemble_reduced_operators(
     basis: np.ndarray | list[np.ndarray],
     affine_stress_batch: Any | None = None,
     affine_q_block_size: int | None = None,
+    gram_rank_reveal: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Stream an exact reduced Ritz assembly without stacking the global basis.
 
@@ -1253,6 +1497,7 @@ def _assemble_reduced_operators(
     external_affine = affine_stress_batch is not None
     affine = affine_stress_batch or affine_stress_batch_factory(phase, ori)
     apply_chunk = getattr(affine, "apply_supported_chunk", None)
+    apply_chunk_gpu = getattr(affine, "apply_supported_chunk_gpu", None)
     support_blocks = getattr(affine, "support_blocks", None)
     if apply_chunk is None or support_blocks is None:
         return _assemble_dense_operators(
@@ -1261,11 +1506,15 @@ def _assemble_reduced_operators(
             basis=basis,
             affine_stress_batch=affine,
             preserve_raw_coordinates=external_affine and isinstance(basis, list),
+            gram_rank_reveal=bool(gram_rank_reveal),
         )
 
     coefficient_names = tuple(getattr(affine, "coefficient_names", COEFF_NAMES))
     q_count = len(coefficient_names)
-    q_block_size = max(1, int(affine_q_block_size or 1))
+    requested_q_block_size = (
+        q_count if affine_q_block_size is None else int(affine_q_block_size)
+    )
+    q_block_size = max(1, requested_q_block_size)
     q_block_size = min(q_block_size, q_count)
     first_dtype = _field_component_voxel_view(
         basis[0] if isinstance(basis, list) else basis[0], nvox
@@ -1282,6 +1531,10 @@ def _assemble_reduced_operators(
     contraction_wall_s = 0.0
     stress_workspace_peak_bytes = 0
     full_volume_equivalent_passes = 0.0
+    basis_gpu_uploads = 0
+    gpu_affine_chunks = 0
+    cpu_affine_chunks = 0
+    gpu_affine_fallback = ""
 
     for support, support_indices, selector in support_blocks:
         support_start = int(selector.start or 0)
@@ -1294,9 +1547,10 @@ def _assemble_reduced_operators(
             global_end = min(global_start + chunk_voxels, support_stop)
             values = _basis_chunk(basis, nvox=nvox, start=global_start, end=global_end)
             contraction_started = time.perf_counter()
-            values_gpu = _gpu_flat64(values)
+            values_gpu = _gpu_flat_compute(values)
             if values_gpu is not None:
                 import cupy as cp
+                basis_gpu_uploads += 1
                 G += cp.asnumpy(values_gpu @ values_gpu.T) / float(nvox)
             else:
                 G += _contract_component_major(values, values) / float(nvox)
@@ -1308,21 +1562,52 @@ def _assemble_reduced_operators(
                     support_indices[q_start : q_start + q_block_size], dtype=np.intp
                 )
                 stress_started = time.perf_counter()
-                stresses = apply_chunk(q_indices, values, support, support_offset)
-                stress_workspace_peak_bytes = max(
-                    stress_workspace_peak_bytes, int(stresses.nbytes)
-                )
+                stresses_gpu = None
+                if values_gpu is not None and apply_chunk_gpu is not None:
+                    try:
+                        stresses_gpu = apply_chunk_gpu(
+                            q_indices, values_gpu, support, support_offset
+                        )
+                        import cupy as cp
+
+                        cp.cuda.get_current_stream().synchronize()
+                        gpu_affine_chunks += 1
+                        stress_workspace_peak_bytes = max(
+                            stress_workspace_peak_bytes, int(stresses_gpu.nbytes)
+                        )
+                    except Exception as exc:
+                        gpu_affine_fallback = f"{type(exc).__name__}: {exc}"
+                        apply_chunk_gpu = None
+                        stresses_gpu = None
+                if stresses_gpu is None:
+                    stresses = apply_chunk(q_indices, values, support, support_offset)
+                    cpu_affine_chunks += 1
+                    stress_workspace_peak_bytes = max(
+                        stress_workspace_peak_bytes, int(stresses.nbytes)
+                    )
                 affine_stress_wall_s += float(time.perf_counter() - stress_started)
                 contraction_started = time.perf_counter()
-                for local, q in enumerate(q_indices):
-                    raw_Kq[int(q)] += (
-                        _contract_preloaded(values, stresses[local], values_gpu) / float(nvox)
+                if stresses_gpu is not None:
+                    contracted, summed = _contract_and_sum_gpu_batch(
+                        values_gpu, stresses_gpu
                     )
-                    raw_Bq[int(q)] += (
-                        np.sum(stresses[local], axis=2, dtype=np.float64) / float(nvox)
+                    raw_Kq[q_indices] += contracted / float(nvox)
+                    raw_Bq[q_indices] += summed / float(nvox)
+                else:
+                    uploaded_stresses = _gpu_batch_flat_compute(stresses)
+                    raw_Kq[q_indices] += _contract_preloaded_batch(
+                        values, stresses, values_gpu, uploaded_stresses
+                    ) / float(nvox)
+                    raw_Bq[q_indices] += (
+                        np.sum(stresses, axis=3, dtype=np.float64) / float(nvox)
                     )
+                    if uploaded_stresses is not None:
+                        del uploaded_stresses
                 contraction_wall_s += float(time.perf_counter() - contraction_started)
-                del stresses
+                if stresses_gpu is not None:
+                    del stresses_gpu
+                else:
+                    del stresses
             if values_gpu is not None:
                 del values_gpu
             del values
@@ -1334,18 +1619,34 @@ def _assemble_reduced_operators(
         raw_Kq[q] = 0.5 * (raw_Kq[q] + raw_Kq[q].T)
         Dq[q] = 0.5 * (Dq[q] + Dq[q].T)
 
-    Kq, Bq, invR, gram_meta = _transform_raw_operators(raw_Kq, raw_Bq, G)
+    Kq, Bq, invR, gram_meta = _transform_raw_operators_with_rank_policy(
+        raw_Kq,
+        raw_Bq,
+        G,
+        allow_rank_reveal=bool(gram_rank_reveal),
+    )
     metadata = {
         "assembly_wall_s": float(time.perf_counter() - t0),
         "assembly_mode": "phase_supported_blocks",
         "contraction_mode": "phase_supported_blocks",
         "contraction_dtype": str(first_dtype),
+        "gram_product_dtype": str(first_dtype),
+        "reduced_accumulation_dtype": "float64",
         "affine_stress_wall_s": affine_stress_wall_s,
         "contraction_wall_s": contraction_wall_s,
         "stress_workspace_peak_bytes": int(stress_workspace_peak_bytes),
         "full_volume_equivalent_passes": float(full_volume_equivalent_passes),
         "chunk_voxels": int(chunk_voxels),
         "q_block_size": int(q_block_size),
+        "batched_contraction": True,
+        "basis_gpu_uploads": int(basis_gpu_uploads),
+        "avoided_duplicate_basis_gpu_uploads": int(basis_gpu_uploads),
+        "affine_stress_backend": (
+            "gpu_resident" if gpu_affine_chunks and not cpu_affine_chunks else "cpu"
+        ),
+        "gpu_affine_chunks": int(gpu_affine_chunks),
+        "cpu_affine_chunks": int(cpu_affine_chunks),
+        "gpu_affine_fallback": gpu_affine_fallback,
         "raw_Kq": raw_Kq,
         "raw_Bq": raw_Bq,
         "G": G,
@@ -1361,6 +1662,7 @@ def _extend_reduced_operators(
     new_basis: np.ndarray | list[np.ndarray],
     affine_stress_batch: Any,
     affine_q_block_size: int | None = None,
+    gram_rank_reveal: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Exact streaming extension of raw Ritz blocks, followed by re-whitening."""
     t0 = time.perf_counter()
@@ -1388,6 +1690,7 @@ def _extend_reduced_operators(
             basis=combined,
             affine_stress_batch=affine_stress_batch,
             affine_q_block_size=affine_q_block_size,
+            gram_rank_reveal=bool(gram_rank_reveal),
         )
         metadata.update({
             "assembly_mode": "incremental",
@@ -1417,12 +1720,16 @@ def _extend_reduced_operators(
     new_rank = old_rank + count
 
     apply_chunk = getattr(affine_stress_batch, "apply_supported_chunk", None)
+    apply_chunk_gpu = getattr(affine_stress_batch, "apply_supported_chunk_gpu", None)
     support_blocks = getattr(affine_stress_batch, "support_blocks", None)
     if apply_chunk is None or support_blocks is None:
         raise NotImplementedError("streaming extension requires supported chunk kernels")
     coefficient_names = tuple(getattr(affine_stress_batch, "coefficient_names", COEFF_NAMES))
     q_count = len(coefficient_names)
-    q_block_size = max(1, min(int(affine_q_block_size or 1), q_count))
+    requested_q_block_size = (
+        q_count if affine_q_block_size is None else int(affine_q_block_size)
+    )
+    q_block_size = max(1, min(requested_q_block_size, q_count))
     first_dtype = _field_component_voxel_view(
         new_basis[0] if isinstance(new_basis, list) else new_basis[0], nvox
     ).dtype
@@ -1441,6 +1748,10 @@ def _extend_reduced_operators(
     contraction_wall_s = 0.0
     stress_workspace_peak_bytes = 0
     full_volume_equivalent_passes = 0.0
+    basis_gpu_uploads = 0
+    gpu_affine_chunks = 0
+    cpu_affine_chunks = 0
+    gpu_affine_fallback = ""
 
     for support, support_indices, selector in support_blocks:
         support_start = int(selector.start or 0)
@@ -1454,12 +1765,17 @@ def _extend_reduced_operators(
             old_values = _basis_chunk(old_basis, nvox=nvox, start=global_start, end=global_end)
             new_values = _basis_chunk(new_basis, nvox=nvox, start=global_start, end=global_end)
             contraction_started = time.perf_counter()
-            old_gpu = _gpu_flat64(old_values)
-            new_gpu = _gpu_flat64(new_values)
+            old_gpu = _gpu_flat_compute(old_values)
+            new_gpu = _gpu_flat_compute(new_values)
             if old_gpu is not None and new_gpu is not None:
                 import cupy as cp
-                G[:old_rank, old_rank:] += cp.asnumpy(old_gpu @ new_gpu.T) / float(nvox)
-                G[old_rank:, old_rank:] += cp.asnumpy(new_gpu @ new_gpu.T) / float(nvox)
+                basis_gpu_uploads += 2
+                G[:old_rank, old_rank:] += cp.asnumpy(
+                    old_gpu @ new_gpu.T
+                ) / float(nvox)
+                G[old_rank:, old_rank:] += cp.asnumpy(
+                    new_gpu @ new_gpu.T
+                ) / float(nvox)
             else:
                 G[:old_rank, old_rank:] += (
                     _contract_component_major(old_values, new_values) / float(nvox)
@@ -1475,25 +1791,67 @@ def _extend_reduced_operators(
                     support_indices[q_start : q_start + q_block_size], dtype=np.intp
                 )
                 stress_started = time.perf_counter()
-                stresses = apply_chunk(q_indices, new_values, support, support_offset)
-                stress_workspace_peak_bytes = max(
-                    stress_workspace_peak_bytes, int(stresses.nbytes)
-                )
+                stresses_gpu = None
+                if new_gpu is not None and apply_chunk_gpu is not None:
+                    try:
+                        stresses_gpu = apply_chunk_gpu(
+                            q_indices, new_gpu, support, support_offset
+                        )
+                        import cupy as cp
+
+                        cp.cuda.get_current_stream().synchronize()
+                        gpu_affine_chunks += 1
+                        stress_workspace_peak_bytes = max(
+                            stress_workspace_peak_bytes, int(stresses_gpu.nbytes)
+                        )
+                    except Exception as exc:
+                        gpu_affine_fallback = f"{type(exc).__name__}: {exc}"
+                        apply_chunk_gpu = None
+                        stresses_gpu = None
+                if stresses_gpu is None:
+                    stresses = apply_chunk(
+                        q_indices, new_values, support, support_offset
+                    )
+                    cpu_affine_chunks += 1
+                    stress_workspace_peak_bytes = max(
+                        stress_workspace_peak_bytes, int(stresses.nbytes)
+                    )
                 affine_stress_wall_s += float(time.perf_counter() - stress_started)
                 contraction_started = time.perf_counter()
-                for local, q in enumerate(q_indices):
-                    q = int(q)
-                    raw_Kq[q, :old_rank, old_rank:] += (
-                        _contract_preloaded(old_values, stresses[local], old_gpu) / float(nvox)
+                if stresses_gpu is not None:
+                    new_contracted, summed = _contract_and_sum_gpu_batch(
+                        new_gpu, stresses_gpu
                     )
-                    raw_Kq[q, old_rank:, old_rank:] += (
-                        _contract_preloaded(new_values, stresses[local], new_gpu) / float(nvox)
+                    old_contracted = _contract_gpu_batch(old_gpu, stresses_gpu)
+                    raw_Kq[q_indices, :old_rank, old_rank:] += (
+                        old_contracted / float(nvox)
                     )
-                    raw_Bq[q, old_rank:] += (
-                        np.sum(stresses[local], axis=2, dtype=np.float64) / float(nvox)
+                    raw_Kq[q_indices, old_rank:, old_rank:] += (
+                        new_contracted / float(nvox)
                     )
+                    raw_Bq[q_indices, old_rank:] += summed / float(nvox)
+                else:
+                    uploaded_stresses = _gpu_batch_flat_compute(stresses)
+                    raw_Kq[q_indices, :old_rank, old_rank:] += (
+                        _contract_preloaded_batch(
+                            old_values, stresses, old_gpu, uploaded_stresses
+                        ) / float(nvox)
+                    )
+                    raw_Kq[q_indices, old_rank:, old_rank:] += (
+                        _contract_preloaded_batch(
+                            new_values, stresses, new_gpu, uploaded_stresses
+                        ) / float(nvox)
+                    )
+                    raw_Bq[q_indices, old_rank:] += (
+                        np.sum(stresses, axis=3, dtype=np.float64) / float(nvox)
+                    )
+                    if uploaded_stresses is not None:
+                        del uploaded_stresses
                 contraction_wall_s += float(time.perf_counter() - contraction_started)
-                del stresses
+                if stresses_gpu is not None:
+                    del stresses_gpu
+                else:
+                    del stresses
             if old_gpu is not None:
                 del old_gpu
             if new_gpu is not None:
@@ -1506,18 +1864,34 @@ def _extend_reduced_operators(
         raw_Kq[q, old_rank:, :old_rank] = raw_Kq[q, :old_rank, old_rank:].T
         raw_Kq[q] = 0.5 * (raw_Kq[q] + raw_Kq[q].T)
 
-    Kq, Bq, invR, gram_meta = _transform_raw_operators(raw_Kq, raw_Bq, G)
+    Kq, Bq, invR, gram_meta = _transform_raw_operators_with_rank_policy(
+        raw_Kq,
+        raw_Bq,
+        G,
+        allow_rank_reveal=bool(gram_rank_reveal),
+    )
     metadata = {
         "assembly_wall_s": float(time.perf_counter() - t0),
         "assembly_mode": "incremental",
         "contraction_mode": "phase_supported_blocks",
         "contraction_dtype": str(first_dtype),
+        "gram_product_dtype": str(first_dtype),
+        "reduced_accumulation_dtype": "float64",
         "affine_stress_wall_s": affine_stress_wall_s,
         "contraction_wall_s": contraction_wall_s,
         "stress_workspace_peak_bytes": int(stress_workspace_peak_bytes),
         "full_volume_equivalent_passes": float(full_volume_equivalent_passes),
         "chunk_voxels": int(chunk_voxels),
         "q_block_size": int(q_block_size),
+        "batched_contraction": True,
+        "basis_gpu_uploads": int(basis_gpu_uploads),
+        "avoided_duplicate_basis_gpu_uploads": int(basis_gpu_uploads),
+        "affine_stress_backend": (
+            "gpu_resident" if gpu_affine_chunks and not cpu_affine_chunks else "cpu"
+        ),
+        "gpu_affine_chunks": int(gpu_affine_chunks),
+        "cpu_affine_chunks": int(cpu_affine_chunks),
+        "gpu_affine_fallback": gpu_affine_fallback,
         "raw_Kq": raw_Kq,
         "raw_Bq": raw_Bq,
         "G": G,

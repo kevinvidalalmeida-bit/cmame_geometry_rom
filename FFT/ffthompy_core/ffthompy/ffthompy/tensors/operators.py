@@ -551,7 +551,7 @@ def _tensor_apply_cupy(tensor, value):
         return xp.einsum('i...,i...->...', tval, value)
     elif isinstance(multype, str):
         return xp.einsum(multype, tval, value)
-    raise NotImplementedError(f"multype '{multype}' no soportado en backend CuPy experimental.")
+    raise NotImplementedError(f"multype '{multype}' no soportado en backend CuPy.")
 
 
 def _apply_dft_raw(dft, value):
@@ -707,10 +707,10 @@ class Operator():
             self.define_operand(operand)
 
     def __call__(self, x):
-        cupy_res = self._call_cupy_experimental(x)
-        if cupy_res is not None:
-            cupy_res.name='{0}({1})'.format(self.name[:6], x.name[:10])
-            return cupy_res
+        fast_path_result = self._call_cupy_fast_path(x)
+        if fast_path_result is not None:
+            fast_path_result.name='{0}({1})'.format(self.name[:6], x.name[:10])
+            return fast_path_result
 
         if self.no_summands == 1:
             summand = self.mat_rev[0]
@@ -740,7 +740,7 @@ class Operator():
         res.name='{0}({1})'.format(self.name[:6], x.name[:10])
         return res
 
-    def _call_cupy_experimental(self, x):
+    def _call_cupy_fast_path(self, x):
         if get_fft_backend() != 'cupy' or not CUPY_AVAILABLE:
             return None
         if not isinstance(x, Tensor):

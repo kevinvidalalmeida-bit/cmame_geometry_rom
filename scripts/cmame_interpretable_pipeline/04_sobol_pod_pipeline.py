@@ -17,7 +17,8 @@ from env_bootstrap import ensure_configured_venv
 from validation_reporting import empirical_coverage
 
 
-ensure_configured_venv(CONFIG_DEFAULT)
+if __name__ == "__main__":
+    ensure_configured_venv(CONFIG_DEFAULT)
 
 import argparse
 import gc
@@ -166,6 +167,65 @@ def independent_pool(
     return frame
 
 
+def fixed_warm_start_route(sequence: pd.DataFrame) -> pd.DataFrame:
+    """Order a fixed Sobol set by affine proximity without changing the set."""
+    if len(sequence) < 2:
+        routed = sequence.copy()
+        routed.insert(0, "sobol_set_position", np.arange(len(routed), dtype=int))
+        routed.insert(1, "solve_position", np.arange(len(routed), dtype=int))
+        return routed
+
+    records = sequence.to_dict(orient="records")
+    gamma = np.stack([reduced._material_coefficients(row) for row in records])
+    lower = np.min(gamma, axis=0)
+    span = np.maximum(np.max(gamma, axis=0) - lower, np.finfo(float).eps)
+    normalized = (gamma - lower) / span
+
+    remaining = set(range(len(sequence)))
+    current = min(remaining, key=lambda idx: float(np.linalg.norm(normalized[idx] - 0.5)))
+    route = [current]
+    remaining.remove(current)
+    while remaining:
+        current = min(
+            remaining,
+            key=lambda idx: float(np.linalg.norm(normalized[idx] - normalized[current])),
+        )
+        route.append(current)
+        remaining.remove(current)
+
+    routed = sequence.iloc[route].copy().reset_index(drop=True)
+    routed.insert(0, "sobol_set_position", np.asarray(route, dtype=int))
+    routed.insert(1, "solve_position", np.arange(len(routed), dtype=int))
+    return routed
+
+
+def affine_maximin_sequence(candidates: pd.DataFrame, count: int) -> pd.DataFrame:
+    """Select a deterministic space-filling subset in affine operator space."""
+    requested = int(count)
+    if requested < 1 or requested > len(candidates):
+        raise ValueError("maximin count must be between one and the pool size")
+    records = candidates.to_dict(orient="records")
+    gamma = np.stack([reduced._material_coefficients(row) for row in records])
+    lower = np.min(gamma, axis=0)
+    span = np.maximum(np.max(gamma, axis=0) - lower, np.finfo(float).eps)
+    normalized = (gamma - lower) / span
+
+    center_distance = np.linalg.norm(normalized - 0.5, axis=1)
+    selected = [int(np.argmin(center_distance))]
+    minimum_distance = np.linalg.norm(normalized - normalized[selected[0]], axis=1)
+    minimum_distance[selected[0]] = -np.inf
+    while len(selected) < requested:
+        next_index = int(np.argmax(minimum_distance))
+        selected.append(next_index)
+        distance = np.linalg.norm(normalized - normalized[next_index], axis=1)
+        minimum_distance = np.minimum(minimum_distance, distance)
+        minimum_distance[selected] = -np.inf
+
+    result = candidates.iloc[selected].copy().reset_index(drop=True)
+    result.insert(0, "design_pool_position", np.asarray(selected, dtype=int))
+    return result
+
+
 def append_sobol_batch(
     *,
     run_dir: Path,
@@ -186,9 +246,14 @@ def append_sobol_batch(
     memory_safety_fraction: float,
     basis_tolerance: float,
     cleanup_snapshot_fields: bool,
-) -> tuple[list[dict[str, Any]], dict[str, np.ndarray] | None]:
+    compile_operators: bool = True,
+    initial_solution_fields: np.ndarray | None = None,
+    full_rank_basis_mode: str = "orthonormal",
+) -> tuple[
+    list[dict[str, Any]], dict[str, np.ndarray] | None, np.ndarray | None
+]:
     if not candidate_ids:
-        return [], operators
+        return [], operators, initial_solution_fields
     started = time.perf_counter()
     nvox = int(voxel_order.size)
     ordered_fields = np.empty(
@@ -196,12 +261,15 @@ def append_sobol_batch(
         dtype=basis.dtype,
     )
     records: list[dict[str, Any]] = []
+    next_initial_fields = np.empty((6, 6, nvox), dtype=basis.dtype)
     for material_index, candidate_id in enumerate(candidate_ids):
         offset = 6 * material_index
 
         def consume_field(load_id: int, field: np.ndarray) -> None:
+            field_view = np.asarray(field).reshape(6, nvox)
+            next_initial_fields[int(load_id)] = field_view
             np.take(
-                field.reshape(6, nvox),
+                field_view,
                 voxel_order,
                 axis=1,
                 out=ordered_fields[offset + int(load_id)],
@@ -219,21 +287,28 @@ def append_sobol_batch(
                 persistent_gpu_cache=False,
                 solution_field_dtype=basis.dtype,
                 solution_field_consumer=consume_field,
+                initial_solution_fields=initial_solution_fields,
             )
+        initial_solution_fields = next_initial_fields
         if cleanup_snapshot_fields:
             shutil.rmtree(common.snapshot_dir(run_dir, candidate_id), ignore_errors=True)
         records.append(record)
 
     rank_before = len(basis)
     basis_started = time.perf_counter()
-    new_fields = basis.append_preordered(
-        ordered_fields,
-        tolerance=float(basis_tolerance),
-    )
+    if str(full_rank_basis_mode) == "raw-ritz":
+        new_fields = basis.append_raw_preordered(ordered_fields)
+    elif str(full_rank_basis_mode) == "orthonormal":
+        new_fields = basis.append_preordered(
+            ordered_fields,
+            tolerance=float(basis_tolerance),
+        )
+    else:
+        raise ValueError(f"Unknown full-rank basis mode: {full_rank_basis_mode}")
     basis_wall_s = float(time.perf_counter() - basis_started)
     del ordered_fields
     affine_q_block_size = 0
-    if len(new_fields):
+    if compile_operators and len(new_fields):
         fiber_fraction = float(np.count_nonzero(operator_phase)) / float(nvox)
         affine_q_block_size = common.runtime_affine_q_block_size(
             appended_fields_bytes=int(np.asarray(new_fields).nbytes),
@@ -257,33 +332,62 @@ def append_sobol_batch(
     stress_workspace_peak_bytes = 0
     contraction_workspace_peak_bytes = 0
     full_volume_equivalent_passes = 0.0
+    basis_gpu_uploads = 0
+    avoided_duplicate_basis_gpu_uploads = 0
+    gram_condition = 1.0
+    gram_relative_min = 1.0
+    gram_transform_mode = "not_assembled"
+    gram_discarded_rank = 0
+    ritz_effective_rank = len(basis)
+    affine_stress_backend = "not_assembled"
+    gpu_affine_chunks = 0
+    cpu_affine_chunks = 0
+    gpu_affine_fallback = ""
     contraction_modes: set[str] = set()
-    for start in range(0, len(new_fields), 6):
-        end = min(start + 6, len(new_fields))
-        absolute_end = rank_before + end
+    if compile_operators and len(new_fields):
         operators, assembly = common._update_reduced_operators(
             phase=operator_phase,
             ori=operator_ori,
-            basis=basis.active_fields[:absolute_end],
+            basis=basis.active_fields,
             existing=operators,
-            new_fields=basis.active_fields[rank_before + start : absolute_end],
+            new_fields=basis.active_fields[rank_before:],
             affine_stress_batch=affine_stress_batch,
             affine_q_block_size=int(affine_q_block_size),
+            gram_rank_reveal=str(full_rank_basis_mode) == "raw-ritz",
         )
         for name in assembly_totals:
-            assembly_totals[name] += float(assembly.get(name, 0.0))
-        stress_workspace_peak_bytes = max(
-            stress_workspace_peak_bytes,
-            int(assembly.get("stress_workspace_peak_bytes", 0)),
+            source_name = (
+                "contraction_wall_s"
+                if name == "ritz_contraction_wall_s"
+                else name
+            )
+            assembly_totals[name] += float(assembly.get(source_name, 0.0))
+        stress_workspace_peak_bytes = int(
+            assembly.get("stress_workspace_peak_bytes", 0)
         )
-        contraction_workspace_peak_bytes = max(
-            contraction_workspace_peak_bytes,
-            int(assembly.get("contraction_workspace_peak_bytes", 0)),
+        contraction_workspace_peak_bytes = int(
+            assembly.get("contraction_workspace_peak_bytes", 0)
         )
-        full_volume_equivalent_passes = max(
-            full_volume_equivalent_passes,
-            float(assembly.get("full_volume_equivalent_passes", 0.0)),
+        full_volume_equivalent_passes = float(
+            assembly.get("full_volume_equivalent_passes", 0.0)
         )
+        basis_gpu_uploads = int(assembly.get("basis_gpu_uploads", 0))
+        avoided_duplicate_basis_gpu_uploads = int(
+            assembly.get("avoided_duplicate_basis_gpu_uploads", 0)
+        )
+        gram_condition = float(assembly.get("gram_condition", 1.0))
+        gram_relative_min = float(assembly.get("gram_relative_min", 1.0))
+        gram_transform_mode = str(
+            assembly.get("gram_transform_mode", "unknown")
+        )
+        gram_discarded_rank = int(assembly.get("discarded_rank", 0))
+        ritz_effective_rank = int(assembly.get("effective_rank", len(basis)))
+        affine_stress_backend = str(
+            assembly.get("affine_stress_backend", "cpu")
+        )
+        gpu_affine_chunks = int(assembly.get("gpu_affine_chunks", 0))
+        cpu_affine_chunks = int(assembly.get("cpu_affine_chunks", 0))
+        gpu_affine_fallback = str(assembly.get("gpu_affine_fallback", ""))
         contraction_modes.add(str(assembly.get("contraction_mode", "unknown")))
 
     contraction_mode = "+".join(sorted(contraction_modes)) or "none"
@@ -312,17 +416,32 @@ def append_sobol_batch(
                 / material_count,
                 "ritz_contraction_wall_s": assembly_totals["ritz_contraction_wall_s"]
                 / material_count,
-                "operator_assembly_mode": "sequential_exact_prefix_incremental",
+                "operator_assembly_mode": (
+                    "monitor_checkpoint_exact_prefix"
+                    if compile_operators
+                    else "deferred_until_monitor_checkpoint"
+                ),
                 "ritz_contraction_mode": contraction_mode,
                 "basis_projection_backend": str(basis.last_projection_backend),
                 "operator_stress_workspace_peak_bytes": stress_workspace_peak_bytes,
                 "operator_contraction_workspace_peak_bytes": contraction_workspace_peak_bytes,
                 "ritz_full_volume_equivalent_passes": full_volume_equivalent_passes,
+                "basis_gpu_uploads": basis_gpu_uploads,
+                "avoided_duplicate_basis_gpu_uploads": avoided_duplicate_basis_gpu_uploads,
+                "ritz_gram_condition": gram_condition,
+                "ritz_gram_relative_min": gram_relative_min,
+                "ritz_gram_transform_mode": gram_transform_mode,
+                "ritz_gram_discarded_rank": gram_discarded_rank,
+                "ritz_effective_rank": ritz_effective_rank,
+                "affine_stress_backend": affine_stress_backend,
+                "gpu_affine_chunks": gpu_affine_chunks,
+                "cpu_affine_chunks": cpu_affine_chunks,
+                "gpu_affine_fallback": gpu_affine_fallback,
                 "affine_q_block_size": int(affine_q_block_size),
                 "pod_batch_materials": material_count,
             }
         )
-    return records, operators
+    return records, operators, next_initial_fields
 
 
 def solve_truth_pool(
@@ -541,6 +660,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--monitor-count", type=int, default=int(pipeline.get("monitor_count", 16)))
     parser.add_argument("--final-validation-count", type=int, default=int(pipeline.get("final_validation_count", 16)))
     parser.add_argument("--candidate-seed", type=int, default=int(pipeline.get("candidate_seed", 20260821)))
+    parser.add_argument(
+        "--selection-policy",
+        choices=("sobol-prefix", "affine-maximin"),
+        default="sobol-prefix",
+        help="Choose a Sobol prefix or a maximin subset in affine operator space.",
+    )
     parser.add_argument("--monitor-seed", type=int, default=int(pipeline.get("monitor_seed", 20260822)))
     parser.add_argument("--final-validation-seed", type=int, default=int(pipeline.get("final_validation_seed", 20260824)))
     parser.add_argument("--rom-timing-count", type=int, default=int(pipeline.get("rom_timing_count", 10000)))
@@ -554,6 +679,12 @@ def parse_args() -> argparse.Namespace:
         "--basis-dtype",
         choices=("float32", "float64"),
         default=str(pipeline.get("basis_dtype", "float32")),
+    )
+    parser.add_argument(
+        "--full-rank-basis-mode",
+        choices=("orthonormal", "raw-ritz"),
+        default=str(pipeline.get("full_rank_basis_mode", "raw-ritz")),
+        help="Keep the explicit POD basis or whiten raw full-rank snapshots in Ritz.",
     )
     parser.add_argument(
         "--pod-batch-max-gib",
@@ -600,6 +731,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cleanup-snapshot-fields", action=argparse.BooleanOptionalAction, default=bool(pipeline.get("cleanup_snapshot_fields", True)))
     parser.add_argument("--quiet-solver", action=argparse.BooleanOptionalAction, default=bool(pipeline.get("quiet_solver", True)))
     parser.add_argument("--write-plot", action=argparse.BooleanOptionalAction, default=bool(pipeline.get("write_per_geometry_plots", False)))
+    parser.add_argument(
+        "--warm-start-route",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Route a fixed Sobol set by affine proximity to improve CG warm starts.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -717,7 +854,19 @@ def main() -> int:
         if not pool_hash:
             pool_hash = sha256(run_dir / "candidate_pool_used.csv")
 
-        sequence = material_sequence(candidates, training_limit)
+        if str(args.selection_policy) == "affine-maximin":
+            sequence = affine_maximin_sequence(candidates, training_limit)
+        else:
+            sequence = material_sequence(candidates, training_limit)
+        fixed_training = int(args.start_materials) == int(training_limit)
+        if bool(args.warm_start_route) and fixed_training:
+            sequence = fixed_warm_start_route(sequence)
+        else:
+            sequence = sequence.copy()
+            sequence.insert(
+                0, "sobol_set_position", np.arange(len(sequence), dtype=int)
+            )
+            sequence.insert(1, "solve_position", np.arange(len(sequence), dtype=int))
         sequence.to_csv(run_dir / "planned_sobol_sequence.csv", index=False)
         monitor = independent_pool(
             int(args.monitor_count),
@@ -742,7 +891,12 @@ def main() -> int:
                 **geometry_info,
                 "candidate_pool": source,
                 "candidate_pool_sha256": pool_hash,
-                "selection_policy": "sequential_sobol_prefix",
+                "selection_policy": str(args.selection_policy),
+                "solve_order_policy": (
+                    "fixed_set_affine_nearest_neighbor"
+                    if bool(args.warm_start_route) and fixed_training
+                    else "sobol_prefix_order"
+                ),
                 "training_limit_policy": "memory_safe_candidate_limit"
                 if requested_limit == 0
                 else "explicit_operational_limit",
@@ -762,9 +916,16 @@ def main() -> int:
                 "target_error": float(args.target_error),
                 "basis_tolerance": float(args.basis_tolerance),
                 "basis_dtype": str(args.basis_dtype),
+                "full_rank_basis_mode": str(args.full_rank_basis_mode),
                 "basis_storage": "preallocated_contiguous",
-                "basis_projection_passes": 1,
-                "basis_projection_backend": "scipy_blas_gemm_in_place",
+                "basis_projection_passes": (
+                    0 if str(args.full_rank_basis_mode) == "raw-ritz" else 1
+                ),
+                "basis_projection_backend": (
+                    "raw_full_rank_no_projection"
+                    if str(args.full_rank_basis_mode) == "raw-ritz"
+                    else "scipy_blas_gemm_in_place"
+                ),
                 "snapshot_field_transport": f"in_memory_{np.dtype(args.basis_dtype).name}",
                 "pod_batching": "one_material_exact_prefix",
                 "pod_batch_max_gib": float(args.pod_batch_max_gib),
@@ -802,6 +963,7 @@ def main() -> int:
             ),
         )
         operators: dict[str, np.ndarray] | None = None
+        warm_start_fields: np.ndarray | None = None
         affine_started = time.perf_counter()
         affine = reduced.affine_stress_batch_factory(
             operator_phase,
@@ -841,7 +1003,7 @@ def main() -> int:
 
         training_started = time.perf_counter()
         for training_materials, candidate_id in enumerate(candidate_ids, start=1):
-            records, operators = append_sobol_batch(
+            records, operators, warm_start_fields = append_sobol_batch(
                 run_dir=run_dir,
                 geometry=geometry,
                 runtime=runtime,
@@ -860,6 +1022,9 @@ def main() -> int:
                 memory_safety_fraction=float(args.memory_safety_fraction),
                 basis_tolerance=float(args.basis_tolerance),
                 cleanup_snapshot_fields=bool(args.cleanup_snapshot_fields),
+                compile_operators=training_materials >= int(args.start_materials),
+                initial_solution_fields=warm_start_fields,
+                full_rank_basis_mode=str(args.full_rank_basis_mode),
             )
             snapshot_rows.extend(records)
             for record in records:
@@ -873,10 +1038,10 @@ def main() -> int:
                     f"step={float(record['snapshot_step_wall_s']):.2f}s",
                     flush=True,
                 )
-            if operators is None:
-                raise RuntimeError("No reduced operators were assembled.")
             if training_materials < int(args.start_materials):
                 continue
+            if operators is None:
+                raise RuntimeError("No reduced operators were assembled.")
 
             monitor_rom_started = time.perf_counter()
             frame = reduced._evaluate_rom(
@@ -889,7 +1054,8 @@ def main() -> int:
             monitor_rom_total_wall_s += monitor_rom_wall_s
             frame.insert(0, "monitor_id", monitor["monitor_id"].to_numpy(dtype=int))
             frame.insert(1, "training_materials", int(training_materials))
-            frame.insert(2, "pod_rank", int(len(basis)))
+            effective_rank = int(operators["Kq"].shape[1])
+            frame.insert(2, "pod_rank", effective_rank)
             stats = error_stats(frame, id_column="monitor_id")
             passes = bool(stats["error_max"] <= float(args.target_error))
             last_monitor_stats = stats
@@ -898,7 +1064,7 @@ def main() -> int:
                 {
                     "method": "adaptive_sobol_pod_full_rank",
                     "training_materials": int(training_materials),
-                    "pod_rank": int(len(basis)),
+                    "pod_rank": effective_rank,
                     "snapshot_solve_wall_s": cumulative["solve_wall_s"],
                     "snapshot_step_wall_s": cumulative["snapshot_step_wall_s"],
                     "basis_update_wall_s": cumulative["basis_update_wall_s"],
@@ -932,7 +1098,9 @@ def main() -> int:
                 stop_materials = int(training_materials)
                 break
         training_stage_wall_s = float(time.perf_counter() - training_started)
-        final_basis_rank = int(len(basis))
+        final_basis_rank = int(
+            operators["Kq"].shape[1] if operators is not None else len(basis)
+        )
 
         curve = pd.DataFrame(curve_rows)
         monitor_rom = pd.concat(monitor_frames, ignore_index=True)
@@ -1094,12 +1262,13 @@ def main() -> int:
             "status": "complete",
             "method": "adaptive_sobol_pod_full_rank",
             **geometry_info,
-            "selection_policy": "sequential_sobol_prefix",
+            "selection_policy": str(args.selection_policy),
             "training_limit": int(training_limit),
             "memory_safe_material_limit": int(safe_material_limit),
             "final_selected_materials": int(stop_materials),
             "basis_rank": final_basis_rank,
             "basis_dtype": str(args.basis_dtype),
+            "full_rank_basis_mode": str(args.full_rank_basis_mode),
             "snapshot_field_transport": f"in_memory_{np.dtype(args.basis_dtype).name}",
             "pod_batch_max_gib": float(args.pod_batch_max_gib),
             "pod_batch_material_limit": 1,

@@ -52,7 +52,8 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from env_bootstrap import ensure_configured_venv
 
-ensure_configured_venv(CONFIG_DEFAULT)
+if __name__ == "__main__":
+    ensure_configured_venv(CONFIG_DEFAULT)
 
 ROOT = SCRIPT_DIR.parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -292,15 +293,16 @@ def _linear_chunk_size(
     rows_a: int,
     rows_b: int,
     length: int,
-    requested: int = 2_000_000,
+    requested: int = 8_000_000,
+    itemsize: int = 8,
 ) -> int:
-    """Choose a conservative float64 GPU chunk for tall-skinny products."""
+    """Choose a conservative GPU chunk for tall-skinny products."""
     limit = int(requested)
     try:
         import cupy as cp
         free_bytes, _ = cp.cuda.runtime.memGetInfo()
         target = max(256 * 1024**2, int(0.22 * free_bytes))
-        bytes_per_scalar = 8 * max(int(rows_a) + int(rows_b), 1)
+        bytes_per_scalar = int(itemsize) * max(int(rows_a) + int(rows_b), 1)
         limit = min(limit, max(65536, int(target // bytes_per_scalar)))
     except Exception:
         pass
@@ -309,18 +311,22 @@ def _linear_chunk_size(
 
 def _gpu_spatial_chunked_gram(
     incoming_matrix: np.ndarray,
-    chunk_size: int = 2_000_000,
+    chunk_size: int = 8_000_000,
 ) -> np.ndarray:
     """Compute A A.T with float64 accumulation while A stays in float32 RAM."""
     k, d = incoming_matrix.shape
-    effective = _linear_chunk_size(rows_a=k, rows_b=k, length=d, requested=chunk_size)
+    compute_dtype = np.float32 if incoming_matrix.dtype == np.float32 else np.float64
+    effective = _linear_chunk_size(
+        rows_a=k, rows_b=k, length=d, requested=chunk_size,
+        itemsize=np.dtype(compute_dtype).itemsize,
+    )
     try:
         import cupy as cp
         G_gpu = cp.zeros((k, k), dtype=cp.float64)
         for start in range(0, d, effective):
             end = min(start + effective, d)
-            block_gpu = cp.asarray(incoming_matrix[:, start:end], dtype=cp.float64)
-            G_gpu += block_gpu @ block_gpu.T
+            block_gpu = cp.asarray(incoming_matrix[:, start:end], dtype=compute_dtype)
+            G_gpu += (block_gpu @ block_gpu.T).astype(cp.float64)
             del block_gpu
         G = cp.asnumpy(G_gpu)
         cp.cuda.Stream.null.synchronize()
@@ -334,22 +340,24 @@ def _gpu_spatial_chunked_gram(
 def _gpu_spatial_chunked_project(
     incoming_matrix: np.ndarray,
     v_old_matrix: np.ndarray,
-    chunk_size: int = 2_000_000,
+    chunk_size: int = 8_000_000,
 ) -> np.ndarray:
     """Compute A V_old.T with float64 accumulation and bounded VRAM."""
     k, d = incoming_matrix.shape
     r_old = v_old_matrix.shape[0]
+    compute_dtype = np.float32 if incoming_matrix.dtype == np.float32 else np.float64
     effective = _linear_chunk_size(
-        rows_a=k, rows_b=r_old, length=d, requested=chunk_size
+        rows_a=k, rows_b=r_old, length=d, requested=chunk_size,
+        itemsize=np.dtype(compute_dtype).itemsize,
     )
     try:
         import cupy as cp
         C_gpu = cp.zeros((k, r_old), dtype=cp.float64)
         for start in range(0, d, effective):
             end = min(start + effective, d)
-            a_chunk = cp.asarray(incoming_matrix[:, start:end], dtype=cp.float64)
-            v_chunk = cp.asarray(v_old_matrix[:, start:end], dtype=cp.float64)
-            C_gpu += a_chunk @ v_chunk.T
+            a_chunk = cp.asarray(incoming_matrix[:, start:end], dtype=compute_dtype)
+            v_chunk = cp.asarray(v_old_matrix[:, start:end], dtype=compute_dtype)
+            C_gpu += (a_chunk @ v_chunk.T).astype(cp.float64)
             del a_chunk, v_chunk
         C = cp.asnumpy(C_gpu)
         cp.cuda.Stream.null.synchronize()
@@ -361,25 +369,151 @@ def _gpu_spatial_chunked_project(
         )
 
 
+def _gpu_spatial_chunked_subtract_projection(
+    incoming_matrix: np.ndarray,
+    old_matrix: np.ndarray,
+    coefficients: np.ndarray,
+    chunk_size: int = 8_000_000,
+) -> None:
+    """Subtract a global projection while keeping the large GEMM on GPU."""
+    k, d = incoming_matrix.shape
+    r_old = old_matrix.shape[0]
+    compute_dtype = np.float32 if incoming_matrix.dtype == np.float32 else np.float64
+    effective = _linear_chunk_size(
+        rows_a=k, rows_b=r_old, length=d, requested=chunk_size,
+        itemsize=np.dtype(compute_dtype).itemsize,
+    )
+    try:
+        import cupy as cp
+        coeff_gpu = cp.asarray(coefficients, dtype=compute_dtype)
+        for start in range(0, d, effective):
+            end = min(start + effective, d)
+            block_gpu = cp.asarray(incoming_matrix[:, start:end], dtype=compute_dtype)
+            old_gpu = cp.asarray(old_matrix[:, start:end], dtype=compute_dtype)
+            block_gpu -= coeff_gpu @ old_gpu
+            incoming_matrix[:, start:end] = cp.asnumpy(block_gpu).astype(
+                incoming_matrix.dtype, copy=False
+            )
+            del block_gpu, old_gpu
+        cp.cuda.Stream.null.synchronize()
+    except Exception:
+        for start in range(0, d, effective):
+            end = min(start + effective, d)
+            incoming_matrix[:, start:end] -= (
+                coefficients @ np.asarray(old_matrix[:, start:end], dtype=np.float64)
+            ).astype(incoming_matrix.dtype, copy=False)
+
+
+def _gpu_spatial_chunked_reorthogonalize(
+    incoming_matrix: np.ndarray,
+    existing_basis: list[np.ndarray],
+    chunk_size: int = 8_000_000,
+    *,
+    basis_group_size: int = 4,
+) -> None:
+    """Apply CGS2 while transferring each incoming spatial tile only twice/pass."""
+    if not existing_basis:
+        return
+
+    k, d = incoming_matrix.shape
+    r_old = len(existing_basis)
+    compute_dtype = np.float32 if incoming_matrix.dtype == np.float32 else np.float64
+    effective = _linear_chunk_size(
+        rows_a=k,
+        rows_b=min(r_old, max(1, int(basis_group_size))),
+        length=d,
+        requested=chunk_size,
+        itemsize=np.dtype(compute_dtype).itemsize,
+    )
+
+    try:
+        import cupy as cp
+
+        def basis_chunk(start_row: int, end_row: int, start: int, end: int):
+            block = cp.empty((end_row - start_row, end - start), dtype=compute_dtype)
+            for local, field in enumerate(existing_basis[start_row:end_row]):
+                block[local] = cp.asarray(
+                    np.asarray(field).reshape(-1)[start:end], dtype=compute_dtype
+                )
+            return block
+
+        for _ in range(2):
+            coefficients_gpu = cp.zeros((k, r_old), dtype=cp.float64)
+            for start in range(0, d, effective):
+                end = min(start + effective, d)
+                incoming_gpu = cp.asarray(
+                    incoming_matrix[:, start:end], dtype=compute_dtype
+                )
+                for start_row in range(0, r_old, basis_group_size):
+                    end_row = min(start_row + basis_group_size, r_old)
+                    old_gpu = basis_chunk(start_row, end_row, start, end)
+                    coefficients_gpu[:, start_row:end_row] += (
+                        incoming_gpu @ old_gpu.T
+                    ).astype(cp.float64)
+                    del old_gpu
+                del incoming_gpu
+
+            coefficients_gpu = coefficients_gpu.astype(compute_dtype)
+            for start in range(0, d, effective):
+                end = min(start + effective, d)
+                incoming_gpu = cp.asarray(
+                    incoming_matrix[:, start:end], dtype=compute_dtype
+                )
+                for start_row in range(0, r_old, basis_group_size):
+                    end_row = min(start_row + basis_group_size, r_old)
+                    old_gpu = basis_chunk(start_row, end_row, start, end)
+                    incoming_gpu -= (
+                        coefficients_gpu[:, start_row:end_row] @ old_gpu
+                    )
+                    del old_gpu
+                incoming_matrix[:, start:end] = cp.asnumpy(incoming_gpu).astype(
+                    incoming_matrix.dtype, copy=False
+                )
+                del incoming_gpu
+            del coefficients_gpu
+        cp.cuda.Stream.null.synchronize()
+        return
+    except Exception:
+        # Preserve the CPU path for environments without a working CuPy device.
+        for _ in range(2):
+            for start_row in range(0, r_old, basis_group_size):
+                end_row = min(start_row + basis_group_size, r_old)
+                old_matrix = np.stack(
+                    [
+                        np.asarray(field, dtype=np.float32).reshape(-1)
+                        for field in existing_basis[start_row:end_row]
+                    ],
+                    axis=0,
+                )
+                coefficients = _gpu_spatial_chunked_project(
+                    incoming_matrix, old_matrix, chunk_size
+                )
+                _gpu_spatial_chunked_subtract_projection(
+                    incoming_matrix, old_matrix, coefficients, chunk_size
+                )
+                del old_matrix
+
+
 def _apply_left_transform_in_place(
     matrix: np.ndarray,
     transform: np.ndarray,
     *,
-    chunk_size: int = 2_000_000,
+    chunk_size: int = 8_000_000,
 ) -> np.ndarray:
     """Apply a small float64 left transform while storing the result in float32."""
     out_rows = int(transform.shape[0])
     d = int(matrix.shape[1])
+    compute_dtype = np.float32 if matrix.dtype == np.float32 else np.float64
     effective = _linear_chunk_size(
         rows_a=max(matrix.shape[0], out_rows), rows_b=out_rows,
-        length=d, requested=chunk_size,
+        length=d, requested=chunk_size, itemsize=np.dtype(compute_dtype).itemsize,
     )
     try:
         import cupy as cp
-        T_gpu = cp.asarray(transform, dtype=cp.float64)
+        T_gpu = cp.asarray(transform, dtype=compute_dtype)
         for start in range(0, d, effective):
             end = min(start + effective, d)
-            block_gpu = cp.asarray(matrix[:, start:end], dtype=cp.float64)
+            block_gpu = cp.asarray(matrix[:, start:end], dtype=compute_dtype)
             out_gpu = T_gpu @ block_gpu
             matrix[:out_rows, start:end] = cp.asnumpy(out_gpu).astype(
                 matrix.dtype, copy=False
@@ -402,15 +536,15 @@ def append_block_orthonormal(
     *,
     tolerance: float = 1.0e-12,
     verbose: bool = True,
-    chunk_size: int = 2_000_000,
+    chunk_size: int = 8_000_000,
     rank_rtol: float = 1.0e-12,
 ) -> list[np.ndarray]:
     """Append a rank-revealed block with mixed-precision storage.
 
-    Large fields remain float32 in RAM.  Projection coefficients, Gram
-    matrices, eigendecompositions and normalization transforms are computed in
-    float64.  Near-dependent tangent directions are rejected *before* they can
-    pollute the Ritz system.
+    Large fields and large GPU products remain float32. Projection Gram
+    matrices, eigendecompositions and rank decisions use float64 accumulation.
+    Near-dependent tangent directions are rejected *before* they can pollute
+    the Ritz system.
     """
     if not new_fields:
         return []
@@ -434,28 +568,15 @@ def append_block_orthonormal(
         del block
     gc.collect()
 
-    # Project against the existing approximately orthonormal basis.  Existing
-    # fields are float32 storage; dot products and coefficients are float64.
+    # Project against the existing basis. Large field GEMMs and corrections stay
+    # on GPU; only the small Gram matrix is accumulated in float64.
     if existing_basis:
-        old_group = 4
-        for start_old in range(0, len(existing_basis), old_group):
-            group = existing_basis[start_old : start_old + old_group]
-            old_matrix = np.stack(
-                [np.asarray(v, dtype=np.float32).reshape(-1) for v in group], axis=0
-            )
-            for _ in range(2):
-                coeffs = _gpu_spatial_chunked_project(incoming, old_matrix, chunk_size)
-                effective = _linear_chunk_size(
-                    rows_a=incoming.shape[0], rows_b=old_matrix.shape[0],
-                    length=d, requested=chunk_size,
-                )
-                for start in range(0, d, effective):
-                    end = min(start + effective, d)
-                    correction = coeffs @ np.asarray(
-                        old_matrix[:, start:end], dtype=np.float64
-                    )
-                    incoming[:, start:end] -= correction.astype(np.float32)
-            del old_matrix
+        _gpu_spatial_chunked_reorthogonalize(
+            incoming,
+            existing_basis,
+            chunk_size,
+            basis_group_size=4,
+        )
 
     # Rank reveal the residual block.  Gram eigenvalues are squared singular
     # values; a relative 1e-12 cutoff corresponds to ~1e-6 singular-value
@@ -564,6 +685,7 @@ def solve_ordered_fields(
     return_sensitivity_fields: bool = False,
     field_block_consumer: Callable[[np.ndarray], None] | None = None,
     sensitivity_block_consumer: Callable[[int, str, np.ndarray], None] | None = None,
+    sensitivity_batch_size: int | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]] | tuple[np.ndarray, dict[str, Any], np.ndarray]:
     """Solve the FOM for one material, returning reordered fields (6, 6, nvox)."""
     nvox = int(voxel_order.size)
@@ -577,6 +699,24 @@ def solve_ordered_fields(
     )
     sensitivity_blocks: dict[int, np.ndarray] = {}
     sensitivity_loads_seen: dict[int, set[int]] = {}
+    progress_path = run_dir / "anchor_sensitivity_progress.tsv"
+
+    def sensitivity_progress(
+        coefficient_index: int,
+        coefficient_name: str,
+        load_ids: list[int],
+        wall_s: float,
+    ) -> None:
+        header = "coefficient_index\tcoefficient_name\tload_ids\twall_s\n"
+        existed = progress_path.exists()
+        with open(progress_path, "a", encoding="utf-8") as fh:
+            if not existed or progress_path.stat().st_size == 0:
+                fh.write(header)
+            fh.write(
+                f"{int(coefficient_index)}\t{coefficient_name}\t"
+                f"{','.join(str(int(value)) for value in load_ids)}\t"
+                f"{float(wall_s):.6f}\n"
+            )
 
     def consume(load_id: int, field: np.ndarray) -> None:
         arr = np.asarray(field).reshape(6, nvox)
@@ -648,6 +788,8 @@ def solve_ordered_fields(
                         if return_sensitivity_fields or sensitivity_block_consumer is not None
                         else None
                     ),
+                    solution_sensitivity_batch_size=sensitivity_batch_size,
+                    solution_sensitivity_progress=sensitivity_progress,
                 )
         else:
             record = common.solve_material(
@@ -662,12 +804,14 @@ def solve_ordered_fields(
                 solution_field_consumer=consume,
                 initial_solution_fields=initial_solution_fields,
                 solution_sensitivity_dtype=basis_dtype,
-                solution_sensitivity_consumer=(
-                    consume_sensitivity
-                    if return_sensitivity_fields or sensitivity_block_consumer is not None
-                    else None
-                ),
-            )
+                    solution_sensitivity_consumer=(
+                        consume_sensitivity
+                        if return_sensitivity_fields or sensitivity_block_consumer is not None
+                        else None
+                    ),
+                    solution_sensitivity_batch_size=sensitivity_batch_size,
+                    solution_sensitivity_progress=sensitivity_progress,
+                )
     if return_raw_fields and return_sensitivity_fields:
         if raw_fields is None or sensitivity_fields is None:
             raise RuntimeError("internal field storage was not allocated.")
@@ -761,7 +905,7 @@ def _reference_materials(
         if missing:
             raise KeyError(f"{source_csv} is missing material columns: {missing}")
         rows: list[dict[str, Any]] = []
-        for idx, row in source.iterrows():
+        for idx, row in source.iloc[: int(count)].iterrows():
             sampled = {name: float(row[name]) for name in MATERIAL_NAMES}
             material = sweep._material_derived(sampled)
             sweep._validate_material(material)
@@ -941,7 +1085,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fft-backend", choices=("gpu", "cpu"), default="gpu")
     parser.add_argument("--geometry-backend", choices=("numba", "cupy", "auto"), default="numba")
     parser.add_argument("--generator-cores", default="auto")
-    parser.add_argument("--affine-q-block-size", type=int, default=1)
+    parser.add_argument(
+        "--affine-q-block-size",
+        type=int,
+        default=0,
+        help=(
+            "Affine coefficients per contraction block; 0 selects all "
+            "coefficients with bounded spatial tiles."
+        ),
+    )
     parser.add_argument(
         "--stream-basis-group-max-mib",
         type=float,
@@ -952,8 +1104,24 @@ def parse_args() -> argparse.Namespace:
             "back to one block."
         ),
     )
-    parser.add_argument("--load-batch-size", type=int, default=6,
-                        help="Number of load channels to solve in parallel on GPU (default: 6).")
+    parser.add_argument(
+        "--load-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of load channels to solve in one batched CG call; "
+            "1 is the measured default for heterogeneous convergence."
+        ),
+    )
+    parser.add_argument(
+        "--sensitivity-batch-size",
+        type=int,
+        default=0,
+        help=(
+            "Sensitivity RHS per GPU solve; 0 selects a VRAM-bounded automatic "
+            "batch (G09 normally selects 2, G03 selects 1)."
+        ),
+    )
     parser.add_argument(
         "--cleanup-training-truth",
         action=argparse.BooleanOptionalAction,
@@ -975,6 +1143,8 @@ def main() -> int:
         raise ValueError("geometry-id must be in [0, 9].")
     if float(args.tolerance) <= 0.0:
         raise ValueError("tolerance must be positive.")
+    if int(args.sensitivity_batch_size) < 0:
+        raise ValueError("sensitivity-batch-size must be non-negative.")
 
     out_root = Path(args.out_root).resolve()
     geometry_dir = out_root / "geometries" / f"geometry_{int(args.geometry_id):02d}"
@@ -1007,8 +1177,8 @@ def main() -> int:
         generator_cores=generator_cores,
         solver_tol=float(common.SOLVER_PROFILES[str(args.profile)]["solver_rtol"]),
         fft_backend=str(args.fft_backend),
+        load_batch_size=int(args.load_batch_size),
     )
-    runtime["load_batch_size"] = int(args.load_batch_size)
     runtime_setup_wall_s = float(time.perf_counter() - runtime_started)
     _stage_profile_row(
         stage_profile_rows,
@@ -1205,6 +1375,7 @@ def main() -> int:
                     existing_basis=basis_fields,
                     new_fields=stream_basis_blocks,
                     tolerance=float(args.basis_tolerance),
+                    verbose=False,
                 )
                 appended_fields.extend(new_fields)
                 group_wall_s = float(time.perf_counter() - started)
@@ -1253,6 +1424,7 @@ def main() -> int:
                 quiet_solver=bool(args.quiet_solver),
                 field_block_consumer=consume_anchor_block,
                 sensitivity_block_consumer=consume_sensitivity_block,
+                sensitivity_batch_size=int(args.sensitivity_batch_size),
             )
             anchor_raw_fields = None
             sensitivity_fields = None
@@ -1474,7 +1646,11 @@ def main() -> int:
                 existing=None,
                 new_fields=basis_fields,
                 affine_stress_batch=affine,
-                affine_q_block_size=int(args.affine_q_block_size),
+                affine_q_block_size=(
+                    None
+                    if int(args.affine_q_block_size) <= 0
+                    else int(args.affine_q_block_size)
+                ),
             )
         else:
             # Incremental extension
@@ -1485,7 +1661,11 @@ def main() -> int:
                 existing=operators,
                 new_fields=appended_fields,
                 affine_stress_batch=affine,
-                affine_q_block_size=int(args.affine_q_block_size),
+                affine_q_block_size=(
+                    None
+                    if int(args.affine_q_block_size) <= 0
+                    else int(args.affine_q_block_size)
+                ),
             )
         assembly_wall_s = float(time.perf_counter() - assembly_started)
         assembly_stage_meta = _scalar_meta(assembly_meta)

@@ -1537,6 +1537,7 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             'solution_field_stream_before_sensitivity': bool(
                 callable(p.get("solution_field_consumer")) and solution_sensitivity_requested
             ),
+            'initial_solution_fields': p.get('initial_solution_fields'),
             'load_batch_size': int(load_batch_size),
             'postprocess_batch_size': int(postprocess_batch_size),
             'postprocess_assembly': str(postprocess_assembly),
@@ -1548,8 +1549,9 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             'affine_sensitivity_cfields': affine_sensitivity_cfields,
             'affine_sensitivity_names': list(AFFINE_SENSITIVITY_NAMES),
             'affine_sensitivity_consumer': p.get("solution_sensitivity_consumer"),
+            'affine_sensitivity_progress': p.get("solution_sensitivity_progress"),
             'affine_sensitivity_batch_size': int(
-                p.get('solution_sensitivity_batch_size', load_batch_size)
+                p.get('solution_sensitivity_batch_size', 0)
             ),
         },
         'postprocess': [{'kind': 'GaNi', 'fft_form': solver_fft_form}],
@@ -1800,6 +1802,7 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             "check_macro_mean": bool(check_macro_mean),
             "store_solution_fields": bool(store_solution_fields),
             "load_batch_size": int(load_batch_size),
+            "warm_start_used": bool(p.get("initial_solution_fields") is not None),
             "postprocess_batch_size": int(postprocess_batch_size),
             "postprocess_assembly": str(postprocess_assembly),
             "projection_storage": str(projection_storage),

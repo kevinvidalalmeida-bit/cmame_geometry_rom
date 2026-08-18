@@ -92,6 +92,7 @@ def configure_runtime(
     generator_cores: int = 2,
     solver_tol: float | None = None,
     fft_backend: str = "gpu",
+    load_batch_size: int | None = None,
 ) -> dict[str, Any]:
     runtime_tol = (
         float(SOLVER_PROFILES["snapshot"]["solver_rtol"])
@@ -113,6 +114,12 @@ def configure_runtime(
     solver_backend = "cupy" if backend == "gpu" else "scipy"
     sobol_gpu.FFT_BACKEND = solver_backend
     runtime["config"]["fft_backend"] = solver_backend
+    if load_batch_size is not None:
+        batch_size = int(load_batch_size)
+        if batch_size < 1:
+            raise ValueError("load_batch_size must be positive.")
+        runtime["config"]["solver_load_batch_size"] = batch_size
+        runtime["load_batch_size"] = batch_size
     if backend == "gpu":
         sobol_gpu.check_cupy_gpu()
         sobol_gpu.warmup_gpu_once()
@@ -486,6 +493,7 @@ def solve_material(
     solution_sensitivity_dtype: str | np.dtype | None = None,
     solution_sensitivity_consumer: Callable[[int, str, int, np.ndarray], None] | None = None,
     solution_sensitivity_batch_size: int | None = None,
+    solution_sensitivity_progress: Callable[[int, str, list[int], float], None] | None = None,
 ) -> dict[str, Any]:
     """Solve one material or return a validated campaign-owned cache entry."""
     if profile not in SOLVER_PROFILES:
@@ -549,6 +557,10 @@ def solve_material(
         params["solution_sensitivity_dtype"] = str(np.dtype(solution_sensitivity_dtype))
     if solution_sensitivity_batch_size is not None:
         params["solution_sensitivity_batch_size"] = int(solution_sensitivity_batch_size)
+    if solution_sensitivity_progress is not None:
+        params["solution_sensitivity_progress"] = solution_sensitivity_progress
+    if initial_solution_fields is not None:
+        params["initial_solution_fields"] = initial_solution_fields
     started = time.perf_counter()
     try:
         ceff = np.asarray(sobol_gpu.solve_homogenization(params), dtype=np.float64)
@@ -641,6 +653,7 @@ def solve_material(
         "solver_rtol": float(settings["solver_rtol"]),
         "solver_atol": float(settings["solver_atol"]),
         "persistent_gpu_cache": bool(persistent_gpu_cache),
+        "warm_start_used": bool(initial_solution_fields is not None),
         "solver_all_converged": all_converged,
         "solver_max_relative_residual": max_residual,
         "solver_max_iterations": int(load_summary.get("cg_iterations_max", -1)),
@@ -804,6 +817,29 @@ class ContiguousBasis:
             )
         return self._append_values(values, tolerance=float(tolerance))
 
+    def append_raw_preordered(self, fields: np.ndarray) -> np.ndarray:
+        """Append an exact full-rank block without constructing a POD basis."""
+        values = np.asarray(fields)
+        expected = (len(values),) + self.field_shape
+        if values.dtype != self.dtype or values.shape != expected or not values.flags.c_contiguous:
+            raise ValueError(
+                "preordered fields must be C-contiguous with the basis dtype and shape."
+            )
+        appended_count = int(len(values))
+        start = self.rank
+        stop = start + appended_count
+        if stop > self.capacity:
+            raise MemoryError(
+                f"basis capacity {self.capacity} is smaller than requested rank {stop}."
+            )
+        np.copyto(
+            self._values[start:stop],
+            values.reshape(appended_count, self.dimension),
+        )
+        self.rank = stop
+        self.last_projection_backend = "raw_full_rank_no_projection"
+        return self.active_fields[start:stop]
+
     def append(
         self,
         fields: Any,
@@ -877,6 +913,7 @@ def ensure_snapshot(
     return_solution_fields: bool = False,
     solution_field_dtype: str | np.dtype | None = None,
     solution_field_consumer: Callable[[int, np.ndarray], None] | None = None,
+    initial_solution_fields: Any = None,
 ) -> dict[str, Any]:
     selected = candidates.loc[candidates["candidate_id"] == int(candidate_id)]
     if len(selected) != 1:
@@ -896,6 +933,7 @@ def ensure_snapshot(
         return_solution_fields=bool(return_solution_fields),
         solution_field_dtype=solution_field_dtype,
         solution_field_consumer=solution_field_consumer,
+        initial_solution_fields=initial_solution_fields,
     )
 
 
@@ -1036,6 +1074,7 @@ def update_reduced_operators(
     new_fields: np.ndarray | list[np.ndarray],
     affine_stress_batch: Any,
     affine_q_block_size: int | None = None,
+    gram_rank_reveal: bool = False,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     import rom_reduced_operator as reduced
 
@@ -1046,6 +1085,7 @@ def update_reduced_operators(
             basis=basis,
             affine_stress_batch=affine_stress_batch,
             affine_q_block_size=affine_q_block_size,
+            gram_rank_reveal=bool(gram_rank_reveal),
         )
     else:
         old_basis = basis[: -len(new_fields)]
@@ -1055,6 +1095,7 @@ def update_reduced_operators(
             new_basis=new_fields,
             affine_stress_batch=affine_stress_batch,
             affine_q_block_size=affine_q_block_size,
+            gram_rank_reveal=bool(gram_rank_reveal),
         )
         
     ops = {"Kq": Kq, "Bq": Bq, "Dq": Dq}
