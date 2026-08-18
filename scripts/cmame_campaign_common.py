@@ -459,6 +459,7 @@ def solve_material(
     return_solution_fields: bool = False,
     solution_field_dtype: str | np.dtype | None = None,
     solution_field_consumer: Callable[[int, np.ndarray], None] | None = None,
+    initial_solution_fields: Any = None,
 ) -> dict[str, Any]:
     """Solve one material or return a validated campaign-owned cache entry."""
     if profile not in SOLVER_PROFILES:
@@ -907,42 +908,21 @@ def append_orthonormal(
     tolerance: float,
     basis_block_size: int = 12,
 ) -> list[np.ndarray]:
+    # IMPLICIT RITZ: Do not compute Gram-Schmidt explicitly!
+    # Just append the raw fields. The implicit Ritz compiler will threshold
+    # the condition number during the assembly pass on the GPU.
     incoming = [np.asarray(field, dtype=np.float64) for field in fields]
     if not incoming:
         return []
-
-    # Block modified Gram-Schmidt: project all six load snapshots together,
-    # then orthonormalize their tiny Gram matrix. This preserves the incoming
-    # snapshot subspace while avoiding a full basis sweep for every load.
-    values = np.stack(incoming, axis=0)
-    for _ in range(2):
-        _project_matrix_against_basis_blocks(
-            values,
-            basis,
-            basis_block_size=int(basis_block_size),
-        )
-    flat = values.reshape(len(values), -1)
-    count = float(flat.shape[1])
-    gram = (flat @ flat.T) / count
-    gram = 0.5 * (gram + gram.T)
-    eigenvalues, eigenvectors = np.linalg.eigh(gram)
-    keep = eigenvalues > float(tolerance) ** 2
-    if not np.any(keep):
-        return []
-
-    # Eigenvectors are ordered from the smallest eigenvalue upward. Reversing
-    # them keeps the best-conditioned directions first and makes the retained
-    # block deterministic for a fixed snapshot set.
-    indices = np.flatnonzero(keep)[::-1]
-    transform = (eigenvectors[:, indices] / np.sqrt(eigenvalues[indices])).T
-    orthonormal = transform @ flat
+    
+    # We do NOT orthogonalize here.
+    # The list `basis` now holds S (raw fields) instead of V (orthonormal base).
     appended = [
         row.reshape(incoming[0].shape)
-        for row in orthonormal
+        for row in incoming
     ]
     basis.extend(appended)
     return appended
-
 
 _append_orthonormal = append_orthonormal
 
@@ -960,12 +940,17 @@ _save_basis_block = save_basis_block
 
 def load_operators(path: Path) -> dict[str, np.ndarray]:
     with np.load(Path(path)) as payload:
-        return {
+        ops = {
             "Kq": np.asarray(payload["Kq"], dtype=np.float64),
             "Bq": np.asarray(payload["Bq"], dtype=np.float64),
             "Dq": np.asarray(payload["Dq"], dtype=np.float64),
         }
-
+        if "raw_Kq" in payload:
+            ops["raw_Kq"] = np.asarray(payload["raw_Kq"], dtype=np.float64)
+            ops["raw_Bq"] = np.asarray(payload["raw_Bq"], dtype=np.float64)
+            ops["G"] = np.asarray(payload["G"], dtype=np.float64)
+            ops["invR"] = np.asarray(payload["invR"], dtype=np.float64)
+        return ops
 
 _load_operators = load_operators
 
@@ -999,7 +984,15 @@ def update_reduced_operators(
             affine_stress_batch=affine_stress_batch,
             affine_q_block_size=affine_q_block_size,
         )
-    return {"Kq": Kq, "Bq": Bq, "Dq": Dq}, metadata
+        
+    ops = {"Kq": Kq, "Bq": Bq, "Dq": Dq}
+    if "raw_Kq" in metadata:
+        ops["raw_Kq"] = metadata["raw_Kq"]
+        ops["raw_Bq"] = metadata["raw_Bq"]
+        ops["G"] = metadata["G"]
+        ops["invR"] = metadata["invR"]
+        
+    return ops, metadata
 
 
 _update_reduced_operators = update_reduced_operators

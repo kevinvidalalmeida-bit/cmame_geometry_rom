@@ -404,7 +404,17 @@ def solve_load_elasticity(iL, D, Nbar, Afun, pb, GN, A, add_macro2minimizer, lin
     print(('macroscopic load E = ' + str(E)))
     EN = Tensor(name='EN', N=Nbar, shape=(D,), Fourier=False, fft_form=fft_form, dtype=real_dtype)
     EN.set_mean(E)
-    x0 = EN.zeros_like(name='x0')
+    init_fields = pb.solve.get('initial_solution_fields', None)
+    if init_fields is not None:
+        x0 = EN.zeros_like(name='x0')
+        val = np.asarray(init_fields[iL], dtype=real_dtype)
+        if hasattr(x0.val, "get") or type(x0.val).__module__.startswith("cupy"):
+            import cupy as cp
+            x0.val = cp.asarray(val)
+        else:
+            x0.val = val
+    else:
+        x0 = EN.zeros_like(name='x0')
     profile_enabled = _profile_enabled(pb)
     timing_stats = _new_component_stats() if profile_enabled else None
     Afun_local = _instrument_afun_for_profile(Afun, GN, A, timing_stats) if profile_enabled else Afun

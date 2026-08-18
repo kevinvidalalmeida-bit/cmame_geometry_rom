@@ -835,6 +835,58 @@ def _supported_stress_mean(stresses: np.ndarray, layout: str, nvox: int) -> np.n
     return np.sum(stresses, axis=voxel_axis) / float(nvox)
 
 
+def _gpu_contract_dense(
+    A: np.ndarray | list[np.ndarray],
+    B: np.ndarray | list[np.ndarray],
+    spatial_chunk_size: int = 5_000_000,
+) -> np.ndarray:
+    """Computes A^T B by streaming spatial chunks to GPU."""
+    try:
+        import cupy as cp
+    except ImportError:
+        raise RuntimeError("GPU contraction requires CuPy.")
+        
+    if isinstance(A, list):
+        rA = len(A)
+        N = A[0].shape[-1]
+    else:
+        rA = A.shape[0]
+        N = A.shape[-1]
+        
+    if isinstance(B, list):
+        rB = len(B)
+    else:
+        rB = B.shape[0]
+        
+    result = cp.zeros((rA, rB), dtype=cp.float64)
+    
+    for component in range(6):
+        for s_start in range(0, N, spatial_chunk_size):
+            s_end = min(s_start + spatial_chunk_size, N)
+            
+            if isinstance(A, list):
+                A_chunk = np.stack([v[component, s_start:s_end] for v in A])
+            else:
+                A_chunk = A[:, component, s_start:s_end]
+            A_gpu = cp.asarray(np.ascontiguousarray(A_chunk), dtype=cp.float32)
+            
+            if A is B:
+                B_gpu = A_gpu
+            else:
+                if isinstance(B, list):
+                    B_chunk = np.stack([v[component, s_start:s_end] for v in B])
+                else:
+                    B_chunk = B[:, component, s_start:s_end]
+                B_gpu = cp.asarray(np.ascontiguousarray(B_chunk), dtype=cp.float32)
+                
+            result += cp.asarray(A_gpu @ B_gpu.T, dtype=cp.float64)
+            
+            del A_gpu
+            if A is not B:
+                del B_gpu
+                
+    return result.get()
+
 def _assemble_reduced_operators(
     *,
     phase: np.ndarray,
@@ -843,7 +895,6 @@ def _assemble_reduced_operators(
     affine_stress_batch: Any | None = None,
     affine_q_block_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """Assemble all affine Ritz operators with one batched CPU contraction."""
     t0 = time.perf_counter()
     phase_flat = np.asarray(phase).reshape(-1)
     nvox = int(phase_flat.size)
@@ -858,406 +909,185 @@ def _assemble_reduced_operators(
         count=r,
         nvox=nvox,
     )
-    apply_all = getattr(affine, "apply_all", None)
-    apply_indices = getattr(affine, "apply_indices", None)
     apply_supported_indices = getattr(affine, "apply_supported_indices", None)
     support_blocks = getattr(affine, "support_blocks", None)
     coefficient_names = tuple(getattr(affine, "coefficient_names", COEFF_NAMES))
     q_count = len(coefficient_names)
-    q_block_size = min(q_count, max(1, int(affine_q_block_size or q_count)))
-    Kq = np.zeros((q_count, r, r), dtype=np.float64)
-    Bq = np.zeros((q_count, r, 6), dtype=np.float64)
+    
+    q_block_size = 1
+    
+    raw_Kq = np.zeros((q_count, r, r), dtype=np.float64)
+    raw_Bq = np.zeros((q_count, r, 6), dtype=np.float64)
+    G = np.zeros((r, r), dtype=np.float64)
+    
     affine_stress_wall_s = 0.0
     contraction_wall_s = 0.0
-    stress_workspace_peak_bytes = 0
-    contraction_workspace_peak_bytes = 0
-    contraction_mode = "full_stress_blocks"
-    active_voxel_passes = 0
+    
     if apply_supported_indices is not None and support_blocks is not None:
-        contraction_mode = "phase_supported_blocks"
         for support, support_indices, selector in support_blocks:
-            support_values = _supported_values(
-                basis_values,
-                selector,
-                basis_layout,
-            )
-            support_nvox = int(
-                support_values.shape[1]
-                if basis_layout == "voxel_component"
-                else support_values.shape[-1]
-            )
+            support_values = _supported_values(basis_values, selector, basis_layout)
+            
+            contraction_started = time.perf_counter()
+            G += _gpu_contract_dense(support_values, support_values) / float(nvox)
+            contraction_wall_s += float(time.perf_counter() - contraction_started)
+            
             for start in range(0, len(support_indices), q_block_size):
                 q_indices = support_indices[start : start + q_block_size]
-                active_voxel_passes += int(len(q_indices)) * support_nvox
                 stress_started = time.perf_counter()
                 stresses = np.asarray(
                     apply_supported_indices(q_indices, support_values, support)
                 )
                 affine_stress_wall_s += float(time.perf_counter() - stress_started)
-                expected_shape = (len(q_indices),) + support_values.shape
-                if stresses.shape != expected_shape:
-                    raise ValueError(
-                        "affine supported action returned an incompatible shape."
-                    )
-                stress_workspace_peak_bytes = max(
-                    stress_workspace_peak_bytes, int(stresses.nbytes)
-                )
-                stress_flat = stresses.reshape(len(q_indices), r, -1)
+                
                 contraction_started = time.perf_counter()
-                if basis_layout == "voxel_component":
-                    support_flat = _flatten_supported_values(
-                        support_values,
-                        basis_layout,
-                    )
-                    Kq[q_indices] = np.asarray(
-                        np.einsum(
-                            "id,qjd->qij",
-                            support_flat,
-                            stress_flat,
-                            optimize=True,
-                        )
-                        / float(nvox),
-                        dtype=np.float64,
-                    )
-                else:
-                    supported_K = np.zeros(
-                        (len(q_indices), r, r),
-                        dtype=np.result_type(basis_values.dtype, np.float32),
-                    )
-                    for component in range(6):
-                        stress_component = np.ascontiguousarray(
-                            stresses[:, :, component, :]
-                        ).reshape(len(q_indices) * r, -1)
-                        contraction_workspace_peak_bytes = max(
-                            contraction_workspace_peak_bytes,
-                            int(stress_component.nbytes),
-                        )
-                        products = (
-                            support_values[:, component, :] @ stress_component.T
-                        ).reshape(r, len(q_indices), r)
-                        supported_K += np.transpose(products, (1, 0, 2))
-                    Kq[q_indices] = np.asarray(
-                        supported_K / float(nvox),
-                        dtype=np.float64,
-                    )
-                Bq[q_indices] = np.asarray(
+                for i, q in enumerate(q_indices):
+                    raw_Kq[q] += _gpu_contract_dense(support_values, stresses[i]) / float(nvox)
+                raw_Bq[q_indices] += np.asarray(
                     _supported_stress_mean(stresses, basis_layout, nvox),
                     dtype=np.float64,
                 )
                 contraction_wall_s += float(time.perf_counter() - contraction_started)
-                del stresses, stress_flat
+                del stresses
     else:
-        full_basis_values = (
-            np.transpose(basis_values, (0, 2, 1))
-            if basis_layout == "voxel_component"
-            else basis_values
-        )
-        basis_flat = np.ascontiguousarray(full_basis_values).reshape(r, -1)
-        active_voxel_passes = q_count * nvox
-        for q_start in range(0, q_count, q_block_size):
-            q_end = min(q_start + q_block_size, q_count)
-            q_indices = np.arange(q_start, q_end)
-            stress_started = time.perf_counter()
-            if apply_indices is not None:
-                stresses = np.asarray(apply_indices(q_indices, full_basis_values))
-            elif q_start == 0 and q_end == q_count and apply_all is not None:
-                stresses = np.asarray(apply_all(full_basis_values))
-            else:
-                stresses = np.stack(
-                    [np.asarray(affine(q, full_basis_values)) for q in q_indices]
-                )
-            affine_stress_wall_s += float(time.perf_counter() - stress_started)
-            if stresses.shape != (q_end - q_start,) + full_basis_values.shape:
-                raise ValueError("affine_stress_batch returned an incompatible shape.")
-            stress_workspace_peak_bytes = max(
-                stress_workspace_peak_bytes, int(stresses.nbytes)
-            )
-            stress_flat = stresses.reshape(q_end - q_start, r, -1)
-            contraction_started = time.perf_counter()
-            Kq[q_start:q_end] = np.asarray(
-                np.einsum(
-                    "id,qjd->qij",
-                    basis_flat,
-                    stress_flat,
-                    optimize=True,
-                )
-                / float(nvox),
-                dtype=np.float64,
-            )
-            Bq[q_start:q_end] = np.asarray(
-                np.mean(stresses, axis=3), dtype=np.float64
-            )
-            contraction_wall_s += float(time.perf_counter() - contraction_started)
-            del stresses, stress_flat
+        raise NotImplementedError("Only supported blocks layout is implemented for Implicit Ritz.")
 
     averaged = getattr(affine, "averaged_stiffness", None)
-    if averaged is None:
-        raise ValueError("affine_stress_batch does not expose averaged_stiffness.")
     Dq = np.asarray(averaged, dtype=np.float64).copy()
-    for q in range(Kq.shape[0]):
-        Kq[q] = 0.5 * (Kq[q] + Kq[q].T)
+    
+    G = 0.5 * (G + G.T)
+    for q in range(q_count):
+        raw_Kq[q] = 0.5 * (raw_Kq[q] + raw_Kq[q].T)
         Dq[q] = 0.5 * (Dq[q] + Dq[q].T)
+        
+    import scipy.linalg
+    try:
+        R = scipy.linalg.cholesky(G, lower=False)
+        invR = scipy.linalg.inv(R)
+    except scipy.linalg.LinAlgError:
+        print("[IMPLICIT-RITZ] Gram matrix ill-conditioned, falling back to SVD.", flush=True)
+        U, s, _ = scipy.linalg.svd(G)
+        keep = s > 1e-15
+        invR = U[:, keep] @ np.diag(1.0 / np.sqrt(s[keep]))
+        
+    Kq_ortho = np.zeros_like(raw_Kq)
+    Bq_ortho = np.zeros_like(raw_Bq)
+    for q in range(q_count):
+        Kq_ortho[q] = invR.T @ raw_Kq[q] @ invR
+        Bq_ortho[q] = invR.T @ raw_Bq[q]
 
-    fiber_voxels = int(np.count_nonzero(phase_flat != 0))
     metadata = {
         "assembly_wall_s": float(time.perf_counter() - t0),
-        "assembly_mode": "batched_affine_cpu",
-        "assembly_backend": "numpy",
-        "nvox": int(nvox),
-        "basis_rank": int(r),
-        "contraction_dtype": str(basis_values.dtype),
-        "basis_layout": basis_layout,
-        "matrix_voxels": int(nvox - fiber_voxels),
-        "fiber_voxels": fiber_voxels,
-        "unique_fiber_orientations": int(
-            getattr(affine, "unique_fiber_orientations", 0)
-        ),
-        "orientation_kernel": str(getattr(affine, "orientation_kernel", "voxelwise")),
-        "affine_passes": int(q_count),
-        "affine_q_block_size": q_block_size,
-        "affine_stress_wall_s": affine_stress_wall_s,
-        "ritz_contraction_wall_s": contraction_wall_s,
-        "stress_workspace_peak_bytes": stress_workspace_peak_bytes,
-        "contraction_workspace_peak_bytes": contraction_workspace_peak_bytes,
-        "contraction_mode": contraction_mode,
-        "full_volume_equivalent_passes": float(active_voxel_passes) / float(nvox),
-        "coefficient_names": list(coefficient_names),
+        "raw_Kq": raw_Kq,
+        "raw_Bq": raw_Bq,
+        "G": G,
+        "invR": invR,
     }
-    return Kq, Bq, Dq, metadata
+    return Kq_ortho, Bq_ortho, Dq, metadata
 
 
 def _extend_reduced_operators(
     *,
-    existing: dict[str, np.ndarray],
+    existing: dict[str, Any],
     old_basis: np.ndarray | list[np.ndarray],
     new_basis: np.ndarray | list[np.ndarray],
     affine_stress_batch: Any,
     affine_q_block_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """Append only the new rows and columns of the affine Ritz operators."""
-    started = time.perf_counter()
-    K_old = np.asarray(existing["Kq"], dtype=np.float64)
-    B_old = np.asarray(existing["Bq"], dtype=np.float64)
+    t0 = time.perf_counter()
+    raw_K_old = np.asarray(existing["raw_Kq"], dtype=np.float64)
+    raw_B_old = np.asarray(existing["raw_Bq"], dtype=np.float64)
+    G_old = np.asarray(existing["G"], dtype=np.float64)
     Dq = np.asarray(existing["Dq"], dtype=np.float64).copy()
-    old_rank = int(K_old.shape[1])
+    
+    old_rank = int(raw_K_old.shape[1])
     count = int(len(new_basis))
-    if old_rank != len(old_basis):
-        raise ValueError("existing operator rank and old_basis are inconsistent.")
-    if count < 1:
-        raise ValueError("new_basis must contain at least one field.")
-
     new_rank = old_rank + count
     nvox = int(np.asarray(new_basis[0]).size // 6)
-    new_values_cpu, basis_layout = _reduced_field_values(
-        new_basis,
-        count=count,
-        nvox=nvox,
-    )
-    coefficient_names = tuple(
-        getattr(affine_stress_batch, "coefficient_names", COEFF_NAMES)
-    )
+    
+    new_values, basis_layout = _reduced_field_values(new_basis, count=count, nvox=nvox)
+    old_values, _ = _reduced_field_values(old_basis, count=old_rank, nvox=nvox)
+    
+    coefficient_names = tuple(getattr(affine_stress_batch, "coefficient_names", COEFF_NAMES))
     q_count = len(coefficient_names)
-    Kq = np.zeros((q_count, new_rank, new_rank), dtype=np.float64)
-    Bq = np.zeros((q_count, new_rank, 6), dtype=np.float64)
-    Kq[:, :old_rank, :old_rank] = K_old
-    Bq[:, :old_rank] = B_old
-    new_values = new_values_cpu
-    if old_rank:
-        old_values, old_layout = _reduced_field_values(
-            old_basis,
-            count=old_rank,
-            nvox=nvox,
-        )
-        if old_layout != basis_layout:
-            raise ValueError("old and new bases use different field layouts.")
-    else:
-        old_values = np.empty((0,) + new_values.shape[1:], dtype=new_values.dtype)
-    apply_all = getattr(affine_stress_batch, "apply_all", None)
-    apply_indices = getattr(affine_stress_batch, "apply_indices", None)
-    apply_supported_indices = getattr(
-        affine_stress_batch,
-        "apply_supported_indices",
-        None,
-    )
+    q_block_size = 1
+    
+    raw_Kq = np.zeros((q_count, new_rank, new_rank), dtype=np.float64)
+    raw_Bq = np.zeros((q_count, new_rank, 6), dtype=np.float64)
+    G = np.zeros((new_rank, new_rank), dtype=np.float64)
+    
+    raw_Kq[:, :old_rank, :old_rank] = raw_K_old
+    raw_Bq[:, :old_rank] = raw_B_old
+    G[:old_rank, :old_rank] = G_old
+    
+    apply_supported_indices = getattr(affine_stress_batch, "apply_supported_indices", None)
     support_blocks = getattr(affine_stress_batch, "support_blocks", None)
-    q_block_size = min(q_count, max(1, int(affine_q_block_size or q_count)))
+    
     affine_stress_wall_s = 0.0
     contraction_wall_s = 0.0
-    stress_workspace_peak_bytes = 0
-    contraction_workspace_peak_bytes = 0
-    contraction_mode = "full_stress_blocks"
-    active_voxel_passes = 0
+    
     if apply_supported_indices is not None and support_blocks is not None:
-        contraction_mode = "phase_supported_blocks"
         for support, support_indices, selector in support_blocks:
-            new_support = _supported_values(new_values, selector, basis_layout)
             old_support = _supported_values(old_values, selector, basis_layout)
-            support_nvox = int(
-                new_support.shape[1]
-                if basis_layout == "voxel_component"
-                else new_support.shape[-1]
-            )
-            if basis_layout == "voxel_component":
-                new_flat = _flatten_supported_values(new_support, basis_layout)
-                old_flat = _flatten_supported_values(old_support, basis_layout)
+            new_support = _supported_values(new_values, selector, basis_layout)
+            
+            contraction_started = time.perf_counter()
+            G[:old_rank, old_rank:] += _gpu_contract_dense(old_support, new_support) / float(nvox)
+            G[old_rank:, old_rank:] += _gpu_contract_dense(new_support, new_support) / float(nvox)
+            contraction_wall_s += float(time.perf_counter() - contraction_started)
+            
             for start in range(0, len(support_indices), q_block_size):
                 q_indices = support_indices[start : start + q_block_size]
-                active_voxel_passes += int(len(q_indices)) * support_nvox
                 stress_started = time.perf_counter()
                 stresses = np.asarray(
                     apply_supported_indices(q_indices, new_support, support)
                 )
                 affine_stress_wall_s += float(time.perf_counter() - stress_started)
-                expected_shape = (len(q_indices),) + new_support.shape
-                if stresses.shape != expected_shape:
-                    raise ValueError(
-                        "affine supported action returned an incompatible shape."
-                    )
-                stress_workspace_peak_bytes = max(
-                    stress_workspace_peak_bytes, int(stresses.nbytes)
-                )
-                stress_flat = stresses.reshape(len(q_indices), count, -1)
+                
                 contraction_started = time.perf_counter()
-                cross_all = np.zeros(
-                    (old_rank, len(q_indices), count),
-                    dtype=np.result_type(new_values.dtype, np.float32),
+                for i, q in enumerate(q_indices):
+                    raw_Kq[q, :old_rank, old_rank:] += _gpu_contract_dense(old_support, stresses[i]) / float(nvox)
+                    raw_Kq[q, old_rank:, old_rank:] += _gpu_contract_dense(new_support, stresses[i]) / float(nvox)
+                
+                raw_Bq[q_indices, old_rank:] += np.asarray(
+                    _supported_stress_mean(stresses, basis_layout, nvox),
+                    dtype=np.float64,
                 )
-                new_new_all = np.zeros(
-                    (len(q_indices), count, count),
-                    dtype=np.result_type(new_values.dtype, np.float32),
-                )
-                if basis_layout == "voxel_component":
-                    stress_columns = stress_flat.reshape(
-                        len(q_indices) * count,
-                        -1,
-                    )
-                    cross_all[:] = (old_flat @ stress_columns.T).reshape(
-                        old_rank,
-                        len(q_indices),
-                        count,
-                    )
-                    new_new_all[:] = np.einsum(
-                        "id,qjd->qij",
-                        new_flat,
-                        stress_flat,
-                        optimize=True,
-                    )
-                else:
-                    for component in range(6):
-                        stress_component = np.ascontiguousarray(
-                            stresses[:, :, component, :]
-                        ).reshape(len(q_indices) * count, -1)
-                        contraction_workspace_peak_bytes = max(
-                            contraction_workspace_peak_bytes,
-                            int(stress_component.nbytes),
-                        )
-                        cross_all += (
-                            old_support[:, component, :] @ stress_component.T
-                        ).reshape(old_rank, len(q_indices), count)
-                        products = (
-                            new_support[:, component, :] @ stress_component.T
-                        ).reshape(count, len(q_indices), count)
-                        new_new_all += np.transpose(products, (1, 0, 2))
-                cross_all /= float(nvox)
-                new_new_all /= float(nvox)
                 contraction_wall_s += float(time.perf_counter() - contraction_started)
-                means = _supported_stress_mean(stresses, basis_layout, nvox)
-                for local_q, q in enumerate(q_indices):
-                    Bq[q, old_rank:] = means[local_q]
-                    new_new = new_new_all[local_q]
-                    Kq[q, old_rank:, old_rank:] = 0.5 * (new_new + new_new.T)
-                    if old_rank:
-                        cross = cross_all[:, local_q]
-                        Kq[q, :old_rank, old_rank:] = cross
-                        Kq[q, old_rank:, :old_rank] = cross.T
-                del stresses, stress_flat, cross_all, new_new_all
+                del stresses
     else:
-        full_new_values = (
-            np.transpose(new_values, (0, 2, 1))
-            if basis_layout == "voxel_component"
-            else new_values
-        )
-        full_old_values = (
-            np.transpose(old_values, (0, 2, 1))
-            if basis_layout == "voxel_component"
-            else old_values
-        )
-        new_flat = np.ascontiguousarray(full_new_values).reshape(count, -1)
-        old_flat = np.ascontiguousarray(full_old_values).reshape(old_rank, -1)
-        active_voxel_passes = q_count * nvox
-        for q_start in range(0, q_count, q_block_size):
-            q_end = min(q_start + q_block_size, q_count)
-            q_indices = np.arange(q_start, q_end)
-            stress_started = time.perf_counter()
-            if apply_indices is not None:
-                stresses = np.asarray(apply_indices(q_indices, full_new_values))
-            elif q_start == 0 and q_end == q_count and apply_all is not None:
-                stresses = np.asarray(apply_all(full_new_values))
-            else:
-                stresses = np.stack(
-                    [
-                        np.asarray(affine_stress_batch(q, full_new_values))
-                        for q in q_indices
-                    ]
-                )
-            affine_stress_wall_s += float(time.perf_counter() - stress_started)
-            if stresses.shape != (q_end - q_start,) + full_new_values.shape:
-                raise ValueError("affine_stress_batch returned an incompatible shape.")
-            stress_workspace_peak_bytes = max(
-                stress_workspace_peak_bytes, int(stresses.nbytes)
-            )
-            stress_flat = stresses.reshape(q_end - q_start, count, -1)
-            contraction_started = time.perf_counter()
-            cross_all = old_flat @ stress_flat.reshape(
-                (q_end - q_start) * count,
-                -1,
-            ).T
-            cross_all = cross_all.reshape(
-                old_rank,
-                q_end - q_start,
-                count,
-            ) / float(nvox)
-            new_new_all = np.einsum(
-                "id,qjd->qij",
-                new_flat,
-                stress_flat,
-                optimize=True,
-            ) / float(nvox)
-            contraction_wall_s += float(time.perf_counter() - contraction_started)
-            for local_q, q in enumerate(range(q_start, q_end)):
-                Bq[q, old_rank:] = np.mean(stresses[local_q], axis=2)
-                new_new = new_new_all[local_q]
-                Kq[q, old_rank:, old_rank:] = 0.5 * (new_new + new_new.T)
-                if old_rank:
-                    cross = cross_all[:, local_q]
-                    Kq[q, :old_rank, old_rank:] = cross
-                    Kq[q, old_rank:, :old_rank] = cross.T
-            del stresses, stress_flat, cross_all, new_new_all
+        raise NotImplementedError("Only supported blocks layout is implemented for Implicit Ritz.")
+
+    G[old_rank:, :old_rank] = G[:old_rank, old_rank:].T
+    G = 0.5 * (G + G.T)
+    for q in range(q_count):
+        raw_Kq[q, old_rank:, :old_rank] = raw_Kq[q, :old_rank, old_rank:].T
+        raw_Kq[q] = 0.5 * (raw_Kq[q] + raw_Kq[q].T)
+        
+    import scipy.linalg
+    try:
+        R = scipy.linalg.cholesky(G, lower=False)
+        invR = scipy.linalg.inv(R)
+    except scipy.linalg.LinAlgError:
+        print("[IMPLICIT-RITZ] Gram matrix ill-conditioned, falling back to SVD.", flush=True)
+        U, s, _ = scipy.linalg.svd(G)
+        keep = s > 1e-15
+        invR = U[:, keep] @ np.diag(1.0 / np.sqrt(s[keep]))
+        
+    Kq_ortho = np.zeros_like(raw_Kq)
+    Bq_ortho = np.zeros_like(raw_Bq)
+    for q in range(q_count):
+        Kq_ortho[q] = invR.T @ raw_Kq[q] @ invR
+        Bq_ortho[q] = invR.T @ raw_Bq[q]
 
     metadata = {
-        "assembly_wall_s": float(time.perf_counter() - started),
-        "assembly_mode": "incremental",
-        "assembly_backend": "numpy",
-        "affine_passes": int(q_count),
-        "affine_q_block_size": q_block_size,
-        "affine_stress_wall_s": affine_stress_wall_s,
-        "ritz_contraction_wall_s": contraction_wall_s,
-        "stress_workspace_peak_bytes": stress_workspace_peak_bytes,
-        "contraction_workspace_peak_bytes": contraction_workspace_peak_bytes,
-        "contraction_mode": contraction_mode,
-        "old_rank": old_rank,
-        "appended_rank": count,
-        "basis_rank": new_rank,
-        "contraction_dtype": str(new_values.dtype),
-        "basis_layout": basis_layout,
-        "nvox": nvox,
-        "orientation_kernel": str(
-            getattr(affine_stress_batch, "orientation_kernel", "voxelwise")
-        ),
-        "full_volume_equivalent_passes": float(active_voxel_passes) / float(nvox),
-        "coefficient_names": list(coefficient_names),
+        "assembly_wall_s": float(time.perf_counter() - t0),
+        "raw_Kq": raw_Kq,
+        "raw_Bq": raw_Bq,
+        "G": G,
+        "invR": invR,
     }
-    return Kq, Bq, Dq, metadata
+    return Kq_ortho, Bq_ortho, Dq, metadata
+
 
 
 def _rom_ceff(
