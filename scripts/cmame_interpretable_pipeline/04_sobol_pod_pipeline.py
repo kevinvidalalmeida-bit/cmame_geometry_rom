@@ -681,10 +681,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--training-limit",
         type=int,
-        default=int(pipeline.get("training_limit", 0) or 0),
+        default=None,
         help=(
-            "Operational cap; fixed mode requires a positive value, while "
-            "adaptive mode may use zero for the memory-safe candidate limit."
+            "Operational cap. By default fixed mode uses training_limit and "
+            "adaptive mode uses adaptive_training_limit from the config; zero "
+            "lets adaptive mode use the memory-safe candidate limit."
         ),
     )
     parser.add_argument(
@@ -773,7 +774,11 @@ def parse_args() -> argparse.Namespace:
         help="Route a fixed Sobol set by affine proximity to improve CG warm starts.",
     )
     parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.training_limit is None:
+        key = "adaptive_training_limit" if bool(args.adaptive) else "training_limit"
+        args.training_limit = int(pipeline.get(key, 0) or 0)
+    return args
 
 
 def main() -> int:
@@ -1228,24 +1233,26 @@ def main() -> int:
         curve.to_csv(run_dir / "sobol_pod_error_curve.csv", index=False)
         if not monitor_rom.empty:
             monitor_rom.to_csv(run_dir / "monitor_rom_results.csv", index=False)
+        adaptive_target_reached = (
+            None if fixed_training_protocol else stop_materials is not None
+        )
         if stop_materials is None:
-            selected = sequence.iloc[: len(snapshot_rows)].copy()
-            selected.to_csv(run_dir / "selected_sobol_sequence.csv", index=False)
+            stop_materials = int(len(snapshot_rows))
             write_json(
-                run_dir / "adaptive_incomplete_summary.json",
+                run_dir / "adaptive_limit_warning.json",
                 {
-                    "status": "stopping_not_achieved",
-                    "training_materials": int(len(snapshot_rows)),
+                    "status": "complete_at_limit_without_monitor_pass",
+                    "training_materials": int(stop_materials),
                     "training_limit": int(training_limit),
                     "target_error": float(args.target_error),
                     "last_monitor_summary": last_monitor_stats,
                 },
             )
-            del basis
-            gc.collect()
-            raise RuntimeError(
-                "Adaptive stopping was not achieved before the memory-safe or "
-                f"operational limit of {training_limit} materials."
+            print(
+                "[SOBOL-POD] WARNING: adaptive target was not reached by "
+                f"material {stop_materials}; freezing the best available ROM "
+                "and continuing with independent final validation.",
+                flush=True,
             )
 
         selected = sequence.iloc[:stop_materials].copy()
@@ -1407,6 +1414,16 @@ def main() -> int:
                 else "adaptive_sobol_pod_full_rank"
             ),
             "adaptive": bool(args.adaptive),
+            "adaptive_target_reached": adaptive_target_reached,
+            "adaptive_stop_reason": (
+                "fixed_training_complete"
+                if fixed_training_protocol
+                else (
+                    "monitor_target_reached"
+                    if adaptive_target_reached
+                    else "training_limit_reached_without_monitor_pass"
+                )
+            ),
             **geometry_info,
             "selection_policy": str(args.selection_policy),
             "training_limit": int(training_limit),

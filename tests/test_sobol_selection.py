@@ -50,6 +50,7 @@ def test_default_protocol_uses_only_fixed_training_and_final_validation():
         config["adaptive"], config["monitor_count"], config["training_limit"]
     ) == "fixed"
     assert config["training_limit"] == 14
+    assert config["adaptive_training_limit"] == 0
     assert config["adaptive"] is False
     assert config["monitor_count"] == 5
     assert config["final_validation_count"] == 5

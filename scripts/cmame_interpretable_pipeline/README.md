@@ -71,9 +71,12 @@ python scripts/cmame_interpretable_pipeline/04_sobol_pod_pipeline.py \
   only appending new directions makes the tensor error nonincreasing. Mixed
   precision and finite solver tolerances can introduce small numerical
   perturbations. The ten completed curves contained no observed increases.
-- Training limit: fixed at `14` by default. Fixed mode requires an explicit
-  positive limit; adaptive mode may stop earlier when all five monitor cases
-  meet the configured tolerance.
+- Training limit: fixed mode uses `14` materials. Adaptive mode defaults to
+  `adaptive_training_limit=0`, meaning it continues until all five monitor
+  cases meet the tolerance or the memory-safe candidate limit is reached. An
+  explicit `--training-limit` overrides that behavior. Reaching such a limit
+  freezes and validates the best available ROM with a warning; it is not a
+  fatal pipeline error.
 - Online timing: evaluate the final ROM at `10000` independent material points.
 - Memory controls: POD and affine-stress workspaces are capped at `8 GiB`, ROM
   batches at `1 GiB`, and exact full-rank runs must fit within 80% of available

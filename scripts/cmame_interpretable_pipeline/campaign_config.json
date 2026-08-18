@@ -140,6 +140,7 @@
     "adaptive": false,
     "start_materials": 2,
     "training_limit": 14,
+    "adaptive_training_limit": 0,
     "monitor_count": 5,
     "monitor_seed": 20260822,
     "final_validation_count": 5,

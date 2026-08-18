@@ -135,10 +135,12 @@ def command_for_geometry(
     single_geometry: bool,
 ) -> list[str]:
     pipe = pipeline_config(config).copy()
+    adaptive = bool(pipe.get("adaptive", False))
     if args.smoke:
-        configured_limit = int(pipe.get("training_limit", 0) or 0)
-        pipe["training_limit"] = min(configured_limit, 4) if configured_limit else 4
-        if bool(pipe.get("adaptive", False)):
+        limit_key = "adaptive_training_limit" if adaptive else "training_limit"
+        configured_limit = int(pipe.get(limit_key, 0) or 0)
+        pipe[limit_key] = min(configured_limit, 4) if configured_limit else 4
+        if adaptive:
             pipe["monitor_count"] = min(int(pipe.get("monitor_count", 5)), 2)
         pipe["final_validation_count"] = min(
             int(pipe.get("final_validation_count", 16)), 2
@@ -148,7 +150,7 @@ def command_for_geometry(
         pipe["basis_profile"] = "rom_floor"
         pipe["truth_profile"] = "rom_floor"
 
-    if not bool(pipe.get("adaptive", False)):
+    if not adaptive:
         fixed_limit = int(pipe.get("training_limit", 0) or 0)
         if fixed_limit < 1:
             raise ValueError("Fixed training requires a positive training_limit.")
@@ -207,7 +209,15 @@ def command_for_geometry(
         "--start-materials",
         str(int(pipe.get("start_materials", 2))),
         "--training-limit",
-        str(int(pipe.get("training_limit", 0) or 0)),
+        str(
+            int(
+                pipe.get(
+                    "adaptive_training_limit" if adaptive else "training_limit",
+                    0,
+                )
+                or 0
+            )
+        ),
         "--rom-timing-count",
         str(int(pipe.get("rom_timing_count", 10000))),
         "--rom-timing-seed",
@@ -217,7 +227,7 @@ def command_for_geometry(
     ]
     append_bool(
         command,
-        bool(pipe.get("adaptive", False)),
+        adaptive,
         "--adaptive",
         "--no-adaptive",
     )
