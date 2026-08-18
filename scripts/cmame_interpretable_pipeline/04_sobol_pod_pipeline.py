@@ -270,6 +270,8 @@ def append_sobol_batch(
     compile_operators: bool = True,
     initial_solution_fields: np.ndarray | None = None,
     full_rank_basis_mode: str = "orthonormal",
+    ritz_contraction_dtype: str = "float32",
+    ritz_gram_rank_rtol: float = 1.0e-6,
 ) -> tuple[
     list[dict[str, Any]], dict[str, np.ndarray] | None, np.ndarray | None
 ]:
@@ -375,6 +377,8 @@ def append_sobol_batch(
             affine_stress_batch=affine_stress_batch,
             affine_q_block_size=int(affine_q_block_size),
             gram_rank_reveal=str(full_rank_basis_mode) == "raw-ritz",
+            gram_rank_rtol=float(ritz_gram_rank_rtol),
+            contraction_compute_dtype=str(ritz_contraction_dtype),
         )
         for name in assembly_totals:
             source_name = (
@@ -454,6 +458,12 @@ def append_sobol_batch(
                 "ritz_gram_transform_mode": gram_transform_mode,
                 "ritz_gram_discarded_rank": gram_discarded_rank,
                 "ritz_effective_rank": ritz_effective_rank,
+                "ritz_contraction_compute_dtype": str(
+                    assembly.get("contraction_compute_dtype", ritz_contraction_dtype)
+                    if compile_operators and len(new_fields)
+                    else ritz_contraction_dtype
+                ),
+                "ritz_gram_rank_rtol": float(ritz_gram_rank_rtol),
                 "affine_stress_backend": affine_stress_backend,
                 "gpu_affine_chunks": gpu_affine_chunks,
                 "cpu_affine_chunks": cpu_affine_chunks,
@@ -463,6 +473,30 @@ def append_sobol_batch(
             }
         )
     return records, operators, next_initial_fields
+
+
+def recompile_full_basis(
+    *,
+    basis: common.ContiguousBasis,
+    operator_phase: np.ndarray,
+    operator_ori: np.ndarray,
+    affine_stress_batch: Any,
+    contraction_compute_dtype: str,
+    gram_rank_rtol: float,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Rebuild all raw Ritz blocks in a requested precision without FOM solves."""
+    return common._update_reduced_operators(
+        phase=operator_phase,
+        ori=operator_ori,
+        basis=basis.active_fields,
+        existing=None,
+        new_fields=basis.active_fields,
+        affine_stress_batch=affine_stress_batch,
+        affine_q_block_size=1,
+        gram_rank_reveal=True,
+        gram_rank_rtol=float(gram_rank_rtol),
+        contraction_compute_dtype=str(contraction_compute_dtype),
+    )
 
 
 def solve_truth_pool(
@@ -723,6 +757,18 @@ def parse_args() -> argparse.Namespace:
         help="Keep the explicit POD basis or whiten raw full-rank snapshots in Ritz.",
     )
     parser.add_argument(
+        "--ritz-contraction-dtype",
+        choices=("float32", "float64"),
+        default=str(pipeline.get("ritz_contraction_dtype", "float32")),
+        help="CUDA compute precision for Gram/Ritz contractions.",
+    )
+    parser.add_argument(
+        "--ritz-gram-rank-rtol",
+        type=float,
+        default=float(pipeline.get("ritz_gram_rank_rtol", 1.0e-6)),
+        help="Relative Gram eigenvalue threshold for numerical rank reveal.",
+    )
+    parser.add_argument(
         "--pod-batch-max-gib",
         type=float,
         default=float(pipeline.get("pod_batch_max_gib", 8.0)),
@@ -801,6 +847,11 @@ def main() -> int:
             raise ValueError("start_materials must be positive.")
         if not np.isfinite(float(args.target_error)) or float(args.target_error) <= 0.0:
             raise ValueError("target_error must be finite and positive.")
+        if (
+            not np.isfinite(float(args.ritz_gram_rank_rtol))
+            or float(args.ritz_gram_rank_rtol) <= 0.0
+        ):
+            raise ValueError("ritz_gram_rank_rtol must be finite and positive.")
         if int(args.candidate_seed) == int(args.final_validation_seed):
             raise ValueError(
                 "candidate_seed and final_validation_seed must be distinct."
@@ -988,6 +1039,8 @@ def main() -> int:
                 "basis_tolerance": float(args.basis_tolerance),
                 "basis_dtype": str(args.basis_dtype),
                 "full_rank_basis_mode": str(args.full_rank_basis_mode),
+                "ritz_contraction_dtype": str(args.ritz_contraction_dtype),
+                "ritz_gram_rank_rtol": float(args.ritz_gram_rank_rtol),
                 "basis_storage": "preallocated_contiguous",
                 "basis_projection_passes": (
                     0 if str(args.full_rank_basis_mode) == "raw-ritz" else 1
@@ -1069,6 +1122,9 @@ def main() -> int:
         stop_materials: int | None = None
         last_monitor_stats: dict[str, Any] | None = None
         monitor_rom_total_wall_s = 0.0
+        current_ritz_dtype = str(args.ritz_contraction_dtype)
+        current_gram_rank_rtol = float(args.ritz_gram_rank_rtol)
+        ritz_precision_fallbacks: list[dict[str, Any]] = []
         cumulative = {
             "solve_wall_s": 0.0,
             "snapshot_step_wall_s": 0.0,
@@ -1077,6 +1133,57 @@ def main() -> int:
             "affine_stress_wall_s": 0.0,
             "ritz_contraction_wall_s": 0.0,
         }
+
+        def promote_ritz_to_float64(
+            reason: Exception, training_materials: int, *, probe: str | None = None
+        ) -> float:
+            nonlocal operators, current_ritz_dtype, current_gram_rank_rtol
+            fallback_started = time.perf_counter()
+            operators, fallback_assembly = recompile_full_basis(
+                basis=basis,
+                operator_phase=operator_phase,
+                operator_ori=operator_ori,
+                affine_stress_batch=affine,
+                contraction_compute_dtype="float64",
+                gram_rank_rtol=1.0e-11,
+            )
+            fallback_wall_s = float(time.perf_counter() - fallback_started)
+            current_ritz_dtype = "float64"
+            current_gram_rank_rtol = 1.0e-11
+            fallback_record = {
+                "training_materials": int(training_materials),
+                "reason": str(reason),
+                "rebuild_wall_s": fallback_wall_s,
+                "effective_rank": int(operators["Kq"].shape[1]),
+            }
+            if probe is not None:
+                fallback_record["probe"] = str(probe)
+            ritz_precision_fallbacks.append(fallback_record)
+
+            last_record = snapshot_rows[-1]
+            last_record["snapshot_step_wall_s"] += fallback_wall_s
+            last_record["operator_assembly_wall_s"] += fallback_wall_s
+            last_record["affine_stress_wall_s"] += float(
+                fallback_assembly.get("affine_stress_wall_s", 0.0)
+            )
+            last_record["ritz_contraction_wall_s"] += float(
+                fallback_assembly.get("contraction_wall_s", 0.0)
+            )
+            last_record["ritz_contraction_compute_dtype"] = "float64"
+            last_record["ritz_gram_rank_rtol"] = 1.0e-11
+            last_record["ritz_effective_rank"] = int(operators["Kq"].shape[1])
+            cumulative["snapshot_step_wall_s"] += fallback_wall_s
+            cumulative["operator_assembly_wall_s"] += fallback_wall_s
+            cumulative["affine_stress_wall_s"] += float(
+                fallback_assembly.get("affine_stress_wall_s", 0.0)
+            )
+            cumulative["ritz_contraction_wall_s"] += float(
+                fallback_assembly.get("contraction_wall_s", 0.0)
+            )
+            pd.DataFrame(snapshot_rows).to_csv(
+                run_dir / "snapshot_timing.csv", index=False
+            )
+            return fallback_wall_s
 
         training_started = time.perf_counter()
         for training_materials, candidate_id in enumerate(candidate_ids, start=1):
@@ -1106,6 +1213,8 @@ def main() -> int:
                 ),
                 initial_solution_fields=warm_start_fields,
                 full_rank_basis_mode=str(args.full_rank_basis_mode),
+                ritz_contraction_dtype=current_ritz_dtype,
+                ritz_gram_rank_rtol=current_gram_rank_rtol,
             )
             snapshot_rows.extend(records)
             for record in records:
@@ -1115,7 +1224,8 @@ def main() -> int:
             for record in records:
                 print(
                     f"[SOBOL-POD] snapshot candidate={int(record['candidate_id'])} | "
-                    f"rank={int(record['basis_rank'])} | "
+                    f"raw_rank={int(record['basis_rank'])} | "
+                    f"ritz_rank={int(record['ritz_effective_rank'])} | "
                     f"step={float(record['snapshot_step_wall_s']):.2f}s",
                     flush=True,
                 )
@@ -1166,12 +1276,28 @@ def main() -> int:
                 break
 
             monitor_rom_started = time.perf_counter()
-            frame = reduced._evaluate_rom(
-                results_df=monitor_truth,
-                Kq=operators["Kq"],
-                Bq=operators["Bq"],
-                Dq=operators["Dq"],
-            )
+            try:
+                frame = reduced._evaluate_rom(
+                    results_df=monitor_truth,
+                    Kq=operators["Kq"],
+                    Bq=operators["Bq"],
+                    Dq=operators["Dq"],
+                )
+            except np.linalg.LinAlgError as exc:
+                if current_ritz_dtype != "float32":
+                    raise
+                print(
+                    "[SOBOL-POD] float32 Ritz lost SPD; rebuilding the current "
+                    "basis once with float64 contractions (no regularization).",
+                    flush=True,
+                )
+                promote_ritz_to_float64(exc, training_materials)
+                frame = reduced._evaluate_rom(
+                    results_df=monitor_truth,
+                    Kq=operators["Kq"],
+                    Bq=operators["Bq"],
+                    Dq=operators["Dq"],
+                )
             monitor_rom_wall_s = float(time.perf_counter() - monitor_rom_started)
             monitor_rom_total_wall_s += monitor_rom_wall_s
             frame.insert(0, "monitor_id", monitor["monitor_id"].to_numpy(dtype=int))
@@ -1212,7 +1338,8 @@ def main() -> int:
             )
             print(
                 f"[SOBOL-POD] monitor materials={training_materials} | "
-                f"rank={len(basis)} | error_max={stats['error_max']:.3e} | "
+                f"raw_rank={len(basis)} | ritz_rank={effective_rank} | "
+                f"error_max={stats['error_max']:.3e} | "
                 f"target={float(args.target_error):.1e}",
                 flush=True,
             )
@@ -1224,15 +1351,6 @@ def main() -> int:
             operators["Kq"].shape[1] if operators is not None else len(basis)
         )
 
-        curve = pd.DataFrame(curve_rows)
-        monitor_rom = (
-            pd.concat(monitor_frames, ignore_index=True)
-            if monitor_frames
-            else pd.DataFrame()
-        )
-        curve.to_csv(run_dir / "sobol_pod_error_curve.csv", index=False)
-        if not monitor_rom.empty:
-            monitor_rom.to_csv(run_dir / "monitor_rom_results.csv", index=False)
         adaptive_target_reached = (
             None if fixed_training_protocol else stop_materials is not None
         )
@@ -1255,6 +1373,74 @@ def main() -> int:
                 flush=True,
             )
 
+        final_validation = independent_pool(
+            int(args.final_validation_count),
+            int(args.final_validation_seed),
+            id_column="final_validation_id",
+            label_prefix="final_validation_sobol",
+        )
+        final_validation.to_csv(run_dir / "final_validation_pool.csv", index=False)
+
+        if current_ritz_dtype == "float32":
+            probe_count = min(len(candidates), 64)
+            probe_indices = np.linspace(
+                0, len(candidates) - 1, probe_count, dtype=int
+            )
+            probe_coefficients = np.concatenate(
+                (
+                    np.stack(
+                        [
+                            reduced._material_coefficients(candidates.iloc[index])
+                            for index in probe_indices
+                        ]
+                    ),
+                    np.stack(
+                        [
+                            reduced._material_coefficients(row)
+                            for _, row in final_validation.iterrows()
+                        ]
+                    ),
+                ),
+                axis=0,
+            )
+            try:
+                reduced._rom_ceff_batch(
+                    probe_coefficients,
+                    operators["Kq"],
+                    operators["Bq"],
+                    operators["Dq"],
+                )
+            except np.linalg.LinAlgError as exc:
+                print(
+                    "[SOBOL-POD] final ROM SPD probe failed; rebuilding once "
+                    "with float64 contractions (no regularization).",
+                    flush=True,
+                )
+                fallback_wall_s = promote_ritz_to_float64(
+                    exc,
+                    int(stop_materials),
+                    probe=(
+                        f"{probe_count}_candidate_plus_"
+                        f"{len(final_validation)}_final_validation_materials"
+                    ),
+                )
+                final_basis_rank = int(operators["Kq"].shape[1])
+                if fixed_training_protocol:
+                    curve_rows[-1]["pod_rank"] = final_basis_rank
+                training_stage_wall_s += fallback_wall_s
+                curve_rows[-1]["snapshot_step_wall_s"] = cumulative[
+                    "snapshot_step_wall_s"
+                ]
+                curve_rows[-1]["operator_assembly_wall_s"] = cumulative[
+                    "operator_assembly_wall_s"
+                ]
+                curve_rows[-1]["affine_stress_wall_s"] = cumulative[
+                    "affine_stress_wall_s"
+                ]
+                curve_rows[-1]["ritz_contraction_wall_s"] = cumulative[
+                    "ritz_contraction_wall_s"
+                ]
+
         selected = sequence.iloc[:stop_materials].copy()
         selected.to_csv(run_dir / "selected_sobol_sequence.csv", index=False)
         if bool(args.save_operators) and operators is not None:
@@ -1267,16 +1453,19 @@ def main() -> int:
                 candidate_ids=selected["candidate_id"].to_numpy(dtype=np.int64),
             )
 
+        curve = pd.DataFrame(curve_rows)
+        monitor_rom = (
+            pd.concat(monitor_frames, ignore_index=True)
+            if monitor_frames
+            else pd.DataFrame()
+        )
+        curve.to_csv(run_dir / "sobol_pod_error_curve.csv", index=False)
+        if not monitor_rom.empty:
+            monitor_rom.to_csv(run_dir / "monitor_rom_results.csv", index=False)
+
         del basis
         gc.collect()
 
-        final_validation = independent_pool(
-            int(args.final_validation_count),
-            int(args.final_validation_seed),
-            id_column="final_validation_id",
-            label_prefix="final_validation_sobol",
-        )
-        final_validation.to_csv(run_dir / "final_validation_pool.csv", index=False)
         validation_started = time.perf_counter()
         final_validation_truth = solve_truth_pool(
             run_dir=run_dir,
@@ -1432,6 +1621,11 @@ def main() -> int:
             "basis_rank": final_basis_rank,
             "basis_dtype": str(args.basis_dtype),
             "full_rank_basis_mode": str(args.full_rank_basis_mode),
+            "ritz_contraction_dtype_initial": str(args.ritz_contraction_dtype),
+            "ritz_contraction_dtype_final": current_ritz_dtype,
+            "ritz_gram_rank_rtol_initial": float(args.ritz_gram_rank_rtol),
+            "ritz_gram_rank_rtol_final": float(current_gram_rank_rtol),
+            "ritz_precision_fallbacks": ritz_precision_fallbacks,
             "snapshot_field_transport": f"in_memory_{np.dtype(args.basis_dtype).name}",
             "pod_batch_max_gib": float(args.pod_batch_max_gib),
             "pod_batch_material_limit": 1,

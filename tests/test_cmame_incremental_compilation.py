@@ -46,6 +46,37 @@ def _orthonormal_fields(rng: np.random.Generator, count: int, shape: tuple[int, 
     return [(np.sqrt(dimension) * q[:, index]).reshape(shape) for index in range(count)]
 
 
+def _ill_conditioned_raw_ritz_case(seed: int):
+    rng = np.random.default_rng(seed)
+    shape = (4, 4, 4)
+    rank = 60
+    dimension = 6 * int(np.prod(shape))
+    q, _ = np.linalg.qr(rng.standard_normal((dimension, rank)))
+    orthonormal = (np.sqrt(dimension) * q.T).reshape((rank, 6) + shape)
+    left, _ = np.linalg.qr(rng.standard_normal((rank, rank)))
+    right, _ = np.linalg.qr(rng.standard_normal((rank, rank)))
+    mixing = left @ np.diag(np.geomspace(1.0, 2.5e-4, rank)) @ right.T
+    raw = (mixing @ orthonormal.reshape(rank, -1)).reshape(
+        orthonormal.shape
+    ).astype(np.float32)
+    phase = np.zeros(shape, dtype=np.uint8)
+    phase.reshape(-1)[::3] = 1
+    ori = np.zeros(shape + (3,), dtype=np.float64)
+    ori[..., 0] = 1.0
+    coefficients = reduced._material_coefficients(
+        {
+            "Em": 3.5,
+            "nu_m": 0.35,
+            "Ef_L": 120.0,
+            "Ef_T": 14.0,
+            "G_LT": 5.5,
+            "nu_LT": 0.22,
+            "nu_TT": 0.32,
+        }
+    )
+    return raw, phase, ori, coefficients
+
+
 def test_block_cgs2_preserves_scalar_cgs2_subspace():
     rng = np.random.default_rng(20260816)
     shape = (6, 4, 3, 2)
@@ -178,6 +209,48 @@ def test_raw_ritz_rank_reveal_discards_only_dependent_directions():
     assert metadata["effective_rank"] == 5
     assert metadata["discarded_rank"] == 1
     assert metadata["gram_transform_mode"] == "eigh_rank_reveal"
+
+
+def test_ill_conditioned_float32_raw_ritz_keeps_physical_stiffness_spd():
+    raw, phase, ori, coefficients = _ill_conditioned_raw_ritz_case(20260914)
+    rank = len(raw)
+
+    Kq, _, _, metadata = reduced._assemble_reduced_operators(
+        phase=phase,
+        ori=ori,
+        basis=raw,
+        gram_rank_reveal=True,
+    )
+    stiffness = np.einsum("q,qij->ij", coefficients, Kq, optimize=True)
+    stiffness = 0.5 * (stiffness + stiffness.T)
+
+    assert metadata["gram_condition"] > 1.0e7
+    assert metadata["effective_rank"] == rank
+    assert metadata["contraction_compute_dtype"] == "float64"
+    assert metadata["gram_product_dtype"] == "float64"
+    assert np.linalg.eigvalsh(stiffness)[0] > 0.0
+
+
+def test_float32_ritz_rank_reveal_drops_unresolved_coordinates_and_keeps_spd():
+    raw, phase, ori, coefficients = _ill_conditioned_raw_ritz_case(20260915)
+    rank = len(raw)
+
+    Kq, _, _, metadata = reduced._assemble_reduced_operators(
+        phase=phase,
+        ori=ori,
+        basis=raw,
+        gram_rank_reveal=True,
+        gram_rank_rtol=1.0e-6,
+        contraction_compute_dtype="float32",
+    )
+    stiffness = np.einsum("q,qij->ij", coefficients, Kq, optimize=True)
+    stiffness = 0.5 * (stiffness + stiffness.T)
+
+    assert metadata["effective_rank"] < rank
+    assert metadata["discarded_rank"] == rank - metadata["effective_rank"]
+    assert metadata["gram_transform_mode"] == "eigh_rank_reveal"
+    assert metadata["contraction_compute_dtype"] == "float32"
+    assert np.linalg.eigvalsh(stiffness)[0] > 0.0
 
 
 def test_raw_ritz_incremental_extension_matches_full_assembly():
@@ -483,6 +556,22 @@ def test_float32_incremental_ritz_matches_float64_assembly():
     np.testing.assert_allclose(Bi, Bf, rtol=2.0e-5, atol=2.0e-6)
     np.testing.assert_allclose(Di, Df, rtol=3.0e-13, atol=3.0e-13)
     assert metadata["contraction_dtype"] == "float32"
+    assert metadata["contraction_compute_dtype"] == "float64"
+    assert metadata["gram_product_dtype"] == "float64"
+
+
+def test_cuda_ritz_upload_promotes_float32_storage_to_float64():
+    values = np.arange(48, dtype=np.float32).reshape(2, 6, 4)
+    values_gpu = reduced._gpu_flat_compute(values)
+    if values_gpu is None:
+        pytest.skip("CUDA is unavailable")
+
+    import cupy as cp
+
+    assert values_gpu.dtype == cp.float64
+    stresses_gpu = reduced._gpu_batch_flat_compute(values[None, ...])
+    assert stresses_gpu is not None
+    assert stresses_gpu.dtype == cp.float64
 
 
 def test_phase_orientation_permutation_preserves_ritz_operators():

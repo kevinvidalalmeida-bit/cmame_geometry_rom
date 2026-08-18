@@ -46,7 +46,11 @@ Default choices:
   selected Sobol set does not.
 - FFT precision: training and final validation use the configured `snapshot`
   profile (`float32`, `rtol=1e-5`). Snapshot storage remains contiguous
-  `float32`; reduced operators and online solves remain `float64`.
+  `float32`. The fast CUDA compiler uses `float32` products with `float64`
+  reduced accumulation and a fixed Gram rank threshold of `1e-6`; coordinates
+  below that numerical resolution are discarded without regularization. If an
+  SPD check still fails, the same basis is rebuilt once with `float64`
+  contractions. Reduced operators and online solves remain `float64`.
 - The default fixed mode solves no preliminary monitor or calibration FOMs.
   Reduced operators are compiled once after the 14 training materials.
 - Optional adaptive mode is enabled explicitly with `--adaptive`. It solves an

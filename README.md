@@ -26,8 +26,10 @@ python scripts/cmame_interpretable_pipeline/main.py --stage pipeline
 ```
 
 The optimized offline backend stores the voxel basis contiguously in `float32`,
-reveals rank through the small snapshot Gram matrix, orders voxels for
-orientation-grouped affine kernels, and keeps the reduced algebra in `float64`.
+reveals the numerically resolved rank through the small snapshot Gram matrix,
+orders voxels for orientation-grouped affine kernels, and accumulates reduced
+blocks in `float64`. Ill-conditioned FP32 Ritz coordinates are discarded with
+a fixed tolerance; an SPD failure triggers one unregularized FP64 rebuild.
 Online material batches use vectorized maps and CUDA when available. In the default
 fixed mode no preliminary FFT monitor pool is solved. After the 14 training
 materials are frozen, a new independent five-material FFT set validates the

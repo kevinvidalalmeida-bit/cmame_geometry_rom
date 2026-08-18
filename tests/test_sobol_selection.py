@@ -54,6 +54,8 @@ def test_default_protocol_uses_only_fixed_training_and_final_validation():
     assert config["adaptive"] is False
     assert config["monitor_count"] == 5
     assert config["final_validation_count"] == 5
+    assert config["ritz_contraction_dtype"] == "float32"
+    assert config["ritz_gram_rank_rtol"] == pytest.approx(1.0e-6)
 
 
 def test_fixed_protocol_requires_an_explicit_training_budget():

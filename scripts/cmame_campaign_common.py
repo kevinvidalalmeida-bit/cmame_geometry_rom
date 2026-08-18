@@ -1075,6 +1075,8 @@ def update_reduced_operators(
     affine_stress_batch: Any,
     affine_q_block_size: int | None = None,
     gram_rank_reveal: bool = False,
+    gram_rank_rtol: float = 1.0e-11,
+    contraction_compute_dtype: str | np.dtype = np.float64,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     import rom_reduced_operator as reduced
 
@@ -1086,6 +1088,8 @@ def update_reduced_operators(
             affine_stress_batch=affine_stress_batch,
             affine_q_block_size=affine_q_block_size,
             gram_rank_reveal=bool(gram_rank_reveal),
+            gram_rank_rtol=float(gram_rank_rtol),
+            contraction_compute_dtype=contraction_compute_dtype,
         )
     else:
         old_basis = basis[: -len(new_fields)]
@@ -1096,6 +1100,8 @@ def update_reduced_operators(
             affine_stress_batch=affine_stress_batch,
             affine_q_block_size=affine_q_block_size,
             gram_rank_reveal=bool(gram_rank_reveal),
+            gram_rank_rtol=float(gram_rank_rtol),
+            contraction_compute_dtype=contraction_compute_dtype,
         )
         
     ops = {"Kq": Kq, "Bq": Bq, "Dq": Dq}

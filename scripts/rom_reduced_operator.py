@@ -1137,27 +1137,40 @@ def _gpu_batch_flat64(values: np.ndarray) -> Any | None:
         return None
 
 
-def _gpu_flat_compute(values: np.ndarray) -> Any | None:
-    """Upload a flattened chunk in its field-storage precision."""
+def _ritz_compute_dtype(value: str | np.dtype) -> np.dtype:
+    dtype = np.dtype(value)
+    if dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+        raise ValueError("Ritz contraction dtype must be float32 or float64.")
+    return dtype
+
+
+def _gpu_flat_compute(
+    values: np.ndarray, *, compute_dtype: str | np.dtype = np.float64
+) -> Any | None:
+    """Upload a flattened chunk in the requested Ritz compute precision."""
     try:
         import cupy as cp
         array = np.ascontiguousarray(values)
-        dtype = cp.float32 if array.dtype.itemsize <= 4 else cp.float64
-        return cp.asarray(array.reshape(array.shape[0], -1), dtype=dtype)
+        dtype = _ritz_compute_dtype(compute_dtype)
+        cp_dtype = cp.float32 if dtype == np.dtype(np.float32) else cp.float64
+        return cp.asarray(array.reshape(array.shape[0], -1), dtype=cp_dtype)
     except Exception:
         return None
 
 
-def _gpu_batch_flat_compute(values: np.ndarray) -> Any | None:
-    """Upload batched stresses in field precision for mixed Ritz GEMMs."""
+def _gpu_batch_flat_compute(
+    values: np.ndarray, *, compute_dtype: str | np.dtype = np.float64
+) -> Any | None:
+    """Upload batched stresses in the requested Ritz compute precision."""
     try:
         import cupy as cp
         array = np.ascontiguousarray(values)
         if array.ndim < 3:
             raise ValueError("batched contraction expects at least three dimensions")
-        dtype = cp.float32 if array.dtype.itemsize <= 4 else cp.float64
+        dtype = _ritz_compute_dtype(compute_dtype)
+        cp_dtype = cp.float32 if dtype == np.dtype(np.float32) else cp.float64
         flat = array.reshape(array.shape[0], array.shape[1], -1)
-        return cp.asarray(flat, dtype=dtype)
+        return cp.asarray(flat, dtype=cp_dtype)
     except Exception:
         return None
 
@@ -1167,6 +1180,8 @@ def _contract_preloaded_batch(
     right: np.ndarray,
     left_gpu: Any | None = None,
     right_gpu: Any | None = None,
+    *,
+    compute_dtype: str | np.dtype = np.float64,
 ) -> np.ndarray:
     """Return ``left @ right[q].T`` for all affine coefficients at once.
 
@@ -1189,15 +1204,16 @@ def _contract_preloaded_batch(
 
         owns_left = left_gpu is None
         owns_right = right_gpu is None
-        compute_dtype = (
+        requested_dtype = _ritz_compute_dtype(compute_dtype)
+        cp_compute_dtype = (
             cp.float32
-            if left_flat.dtype.itemsize <= 4 and right_flat.dtype.itemsize <= 4
+            if requested_dtype == np.dtype(np.float32)
             else cp.float64
         )
         if left_gpu is None:
-            left_gpu = cp.asarray(left_flat, dtype=compute_dtype)
+            left_gpu = cp.asarray(left_flat, dtype=cp_compute_dtype)
         if right_gpu is None:
-            right_gpu = cp.asarray(right_flat, dtype=compute_dtype)
+            right_gpu = cp.asarray(right_flat, dtype=cp_compute_dtype)
         result = cp.einsum("am,qbm->qab", left_gpu, right_gpu, optimize=True)
         result = cp.asnumpy(result)
         if owns_left:
@@ -1379,9 +1395,12 @@ def _transform_raw_operators_with_rank_policy(
     G: np.ndarray,
     *,
     allow_rank_reveal: bool,
+    rank_rtol: float = 1.0e-11,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float | int | str]]:
     T, gram_meta = _orthonormal_transform_from_gram(
-        G, allow_rank_reveal=bool(allow_rank_reveal)
+        G,
+        rank_rtol=float(rank_rtol),
+        allow_rank_reveal=bool(allow_rank_reveal),
     )
     rank = int(T.shape[0])
     Kq = np.empty((raw_Kq.shape[0], rank, rank), dtype=np.float64)
@@ -1402,6 +1421,8 @@ def _assemble_dense_operators(
     affine_stress_batch: Any | None,
     preserve_raw_coordinates: bool = False,
     gram_rank_reveal: bool = False,
+    gram_rank_rtol: float = 1.0e-11,
+    contraction_compute_dtype: str | np.dtype = np.float64,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Compatibility assembly for non phase-contiguous layouts."""
     t0 = time.perf_counter()
@@ -1413,17 +1434,22 @@ def _assemble_dense_operators(
     coefficient_names = tuple(getattr(affine, "coefficient_names", COEFF_NAMES))
     q_count = len(coefficient_names)
     values = _basis_chunk(basis, nvox=nvox, start=0, end=nvox)
+    compute_dtype = _ritz_compute_dtype(contraction_compute_dtype)
     raw_Kq = np.zeros((q_count, r, r), dtype=np.float64)
     raw_Bq = np.zeros((q_count, r, 6), dtype=np.float64)
     G = _contract_component_major(values, values) / float(nvox)
     stress_started = time.perf_counter()
-    stresses = np.asarray(affine.apply_all(values))
+    stresses = np.asarray(affine.apply_all(np.asarray(values, dtype=compute_dtype)))
     affine_stress_wall_s = float(time.perf_counter() - stress_started)
     contraction_started = time.perf_counter()
-    values_gpu = _gpu_flat_compute(values)
-    stresses_gpu = _gpu_batch_flat_compute(stresses)
+    values_gpu = _gpu_flat_compute(values, compute_dtype=compute_dtype)
+    stresses_gpu = _gpu_batch_flat_compute(stresses, compute_dtype=compute_dtype)
     raw_Kq[:] = _contract_preloaded_batch(
-        values, stresses, values_gpu, stresses_gpu
+        values,
+        stresses,
+        values_gpu,
+        stresses_gpu,
+        compute_dtype=compute_dtype,
     ) / float(nvox)
     raw_Bq[:] = np.sum(stresses, axis=3, dtype=np.float64) / float(nvox)
     if values_gpu is not None:
@@ -1455,12 +1481,15 @@ def _assemble_dense_operators(
             raw_Bq,
             G,
             allow_rank_reveal=bool(gram_rank_reveal),
+            rank_rtol=float(gram_rank_rtol),
         )
     metadata = {
         "assembly_wall_s": float(time.perf_counter() - t0),
         "assembly_mode": "batched_affine_cpu",
         "contraction_mode": "dense_full_support",
         "contraction_dtype": str(values.dtype),
+        "contraction_compute_dtype": str(compute_dtype),
+        "gram_product_dtype": "float64",
         "affine_stress_wall_s": affine_stress_wall_s,
         "contraction_wall_s": contraction_wall_s,
         "stress_workspace_peak_bytes": int(stresses.nbytes),
@@ -1482,18 +1511,21 @@ def _assemble_reduced_operators(
     affine_stress_batch: Any | None = None,
     affine_q_block_size: int | None = None,
     gram_rank_reveal: bool = False,
+    gram_rank_rtol: float = 1.0e-11,
+    contraction_compute_dtype: str | np.dtype = np.float64,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Stream an exact reduced Ritz assembly without stacking the global basis.
 
-    Large fields remain in their storage precision (normally float32).  Only
-    small spatial chunks are materialized, while all inner products and final
-    reduced operators are accumulated in float64.
+    Large fields remain in their storage precision (normally float32). Only
+    small spatial chunks are materialized; products use the requested compute
+    precision and reduced blocks are accumulated in float64.
     """
     t0 = time.perf_counter()
     nvox = int(np.asarray(phase).size)
     r = _basis_rank_nvox(basis, nvox)
     if r < 1:
         raise ValueError("basis must contain at least one field")
+    compute_dtype = _ritz_compute_dtype(contraction_compute_dtype)
     external_affine = affine_stress_batch is not None
     affine = affine_stress_batch or affine_stress_batch_factory(phase, ori)
     apply_chunk = getattr(affine, "apply_supported_chunk", None)
@@ -1507,6 +1539,8 @@ def _assemble_reduced_operators(
             affine_stress_batch=affine,
             preserve_raw_coordinates=external_affine and isinstance(basis, list),
             gram_rank_reveal=bool(gram_rank_reveal),
+            gram_rank_rtol=float(gram_rank_rtol),
+            contraction_compute_dtype=compute_dtype,
         )
 
     coefficient_names = tuple(getattr(affine, "coefficient_names", COEFF_NAMES))
@@ -1521,7 +1555,8 @@ def _assemble_reduced_operators(
     ).dtype
     chunk_voxels = _stream_chunk_voxels(
         ranks=(r,), q_block_size=q_block_size, nvox=nvox,
-        storage_itemsize=int(first_dtype.itemsize), max_chunk_voxels=1_000_000,
+        storage_itemsize=max(int(first_dtype.itemsize), int(compute_dtype.itemsize)),
+        max_chunk_voxels=1_000_000,
     )
 
     raw_Kq = np.zeros((q_count, r, r), dtype=np.float64)
@@ -1547,7 +1582,7 @@ def _assemble_reduced_operators(
             global_end = min(global_start + chunk_voxels, support_stop)
             values = _basis_chunk(basis, nvox=nvox, start=global_start, end=global_end)
             contraction_started = time.perf_counter()
-            values_gpu = _gpu_flat_compute(values)
+            values_gpu = _gpu_flat_compute(values, compute_dtype=compute_dtype)
             if values_gpu is not None:
                 import cupy as cp
                 basis_gpu_uploads += 1
@@ -1580,7 +1615,12 @@ def _assemble_reduced_operators(
                         apply_chunk_gpu = None
                         stresses_gpu = None
                 if stresses_gpu is None:
-                    stresses = apply_chunk(q_indices, values, support, support_offset)
+                    stresses = apply_chunk(
+                        q_indices,
+                        np.asarray(values, dtype=compute_dtype),
+                        support,
+                        support_offset,
+                    )
                     cpu_affine_chunks += 1
                     stress_workspace_peak_bytes = max(
                         stress_workspace_peak_bytes, int(stresses.nbytes)
@@ -1594,9 +1634,15 @@ def _assemble_reduced_operators(
                     raw_Kq[q_indices] += contracted / float(nvox)
                     raw_Bq[q_indices] += summed / float(nvox)
                 else:
-                    uploaded_stresses = _gpu_batch_flat_compute(stresses)
+                    uploaded_stresses = _gpu_batch_flat_compute(
+                        stresses, compute_dtype=compute_dtype
+                    )
                     raw_Kq[q_indices] += _contract_preloaded_batch(
-                        values, stresses, values_gpu, uploaded_stresses
+                        values,
+                        stresses,
+                        values_gpu,
+                        uploaded_stresses,
+                        compute_dtype=compute_dtype,
                     ) / float(nvox)
                     raw_Bq[q_indices] += (
                         np.sum(stresses, axis=3, dtype=np.float64) / float(nvox)
@@ -1624,13 +1670,15 @@ def _assemble_reduced_operators(
         raw_Bq,
         G,
         allow_rank_reveal=bool(gram_rank_reveal),
+        rank_rtol=float(gram_rank_rtol),
     )
     metadata = {
         "assembly_wall_s": float(time.perf_counter() - t0),
         "assembly_mode": "phase_supported_blocks",
         "contraction_mode": "phase_supported_blocks",
         "contraction_dtype": str(first_dtype),
-        "gram_product_dtype": str(first_dtype),
+        "gram_product_dtype": str(compute_dtype),
+        "contraction_compute_dtype": str(compute_dtype),
         "reduced_accumulation_dtype": "float64",
         "affine_stress_wall_s": affine_stress_wall_s,
         "contraction_wall_s": contraction_wall_s,
@@ -1655,6 +1703,7 @@ def _assemble_reduced_operators(
     }
     return Kq, Bq, Dq, metadata
 
+
 def _extend_reduced_operators(
     *,
     existing: dict[str, Any],
@@ -1663,9 +1712,12 @@ def _extend_reduced_operators(
     affine_stress_batch: Any,
     affine_q_block_size: int | None = None,
     gram_rank_reveal: bool = False,
+    gram_rank_rtol: float = 1.0e-11,
+    contraction_compute_dtype: str | np.dtype = np.float64,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Exact streaming extension of raw Ritz blocks, followed by re-whitening."""
     t0 = time.perf_counter()
+    compute_dtype = _ritz_compute_dtype(contraction_compute_dtype)
     if "raw_Kq" not in existing or "raw_Bq" not in existing or "G" not in existing:
         if isinstance(old_basis, np.ndarray) or isinstance(new_basis, np.ndarray):
             old_array = np.asarray(old_basis)
@@ -1691,6 +1743,8 @@ def _extend_reduced_operators(
             affine_stress_batch=affine_stress_batch,
             affine_q_block_size=affine_q_block_size,
             gram_rank_reveal=bool(gram_rank_reveal),
+            gram_rank_rtol=float(gram_rank_rtol),
+            contraction_compute_dtype=compute_dtype,
         )
         metadata.update({
             "assembly_mode": "incremental",
@@ -1735,7 +1789,8 @@ def _extend_reduced_operators(
     ).dtype
     chunk_voxels = _stream_chunk_voxels(
         ranks=(old_rank, count), q_block_size=q_block_size, nvox=nvox,
-        storage_itemsize=int(first_dtype.itemsize), max_chunk_voxels=1_000_000,
+        storage_itemsize=max(int(first_dtype.itemsize), int(compute_dtype.itemsize)),
+        max_chunk_voxels=1_000_000,
     )
 
     raw_Kq = np.zeros((q_count, new_rank, new_rank), dtype=np.float64)
@@ -1765,8 +1820,8 @@ def _extend_reduced_operators(
             old_values = _basis_chunk(old_basis, nvox=nvox, start=global_start, end=global_end)
             new_values = _basis_chunk(new_basis, nvox=nvox, start=global_start, end=global_end)
             contraction_started = time.perf_counter()
-            old_gpu = _gpu_flat_compute(old_values)
-            new_gpu = _gpu_flat_compute(new_values)
+            old_gpu = _gpu_flat_compute(old_values, compute_dtype=compute_dtype)
+            new_gpu = _gpu_flat_compute(new_values, compute_dtype=compute_dtype)
             if old_gpu is not None and new_gpu is not None:
                 import cupy as cp
                 basis_gpu_uploads += 2
@@ -1810,7 +1865,10 @@ def _extend_reduced_operators(
                         stresses_gpu = None
                 if stresses_gpu is None:
                     stresses = apply_chunk(
-                        q_indices, new_values, support, support_offset
+                        q_indices,
+                        np.asarray(new_values, dtype=compute_dtype),
+                        support,
+                        support_offset,
                     )
                     cpu_affine_chunks += 1
                     stress_workspace_peak_bytes = max(
@@ -1831,15 +1889,25 @@ def _extend_reduced_operators(
                     )
                     raw_Bq[q_indices, old_rank:] += summed / float(nvox)
                 else:
-                    uploaded_stresses = _gpu_batch_flat_compute(stresses)
+                    uploaded_stresses = _gpu_batch_flat_compute(
+                        stresses, compute_dtype=compute_dtype
+                    )
                     raw_Kq[q_indices, :old_rank, old_rank:] += (
                         _contract_preloaded_batch(
-                            old_values, stresses, old_gpu, uploaded_stresses
+                            old_values,
+                            stresses,
+                            old_gpu,
+                            uploaded_stresses,
+                            compute_dtype=compute_dtype,
                         ) / float(nvox)
                     )
                     raw_Kq[q_indices, old_rank:, old_rank:] += (
                         _contract_preloaded_batch(
-                            new_values, stresses, new_gpu, uploaded_stresses
+                            new_values,
+                            stresses,
+                            new_gpu,
+                            uploaded_stresses,
+                            compute_dtype=compute_dtype,
                         ) / float(nvox)
                     )
                     raw_Bq[q_indices, old_rank:] += (
@@ -1869,13 +1937,15 @@ def _extend_reduced_operators(
         raw_Bq,
         G,
         allow_rank_reveal=bool(gram_rank_reveal),
+        rank_rtol=float(gram_rank_rtol),
     )
     metadata = {
         "assembly_wall_s": float(time.perf_counter() - t0),
         "assembly_mode": "incremental",
         "contraction_mode": "phase_supported_blocks",
         "contraction_dtype": str(first_dtype),
-        "gram_product_dtype": str(first_dtype),
+        "gram_product_dtype": str(compute_dtype),
+        "contraction_compute_dtype": str(compute_dtype),
         "reduced_accumulation_dtype": "float64",
         "affine_stress_wall_s": affine_stress_wall_s,
         "contraction_wall_s": contraction_wall_s,
@@ -1899,6 +1969,7 @@ def _extend_reduced_operators(
         **gram_meta,
     }
     return Kq, Bq, Dq, metadata
+
 
 def _solve_spd_reduced(K: np.ndarray, B: np.ndarray) -> np.ndarray:
     """Solve K a = -B in float64 without modifying the Ritz operator."""
