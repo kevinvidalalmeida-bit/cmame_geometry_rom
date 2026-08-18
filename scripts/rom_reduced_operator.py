@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy import linalg as scipy_linalg
 
 try:
     from numba import get_num_threads as _numba_get_num_threads
@@ -46,6 +47,16 @@ COEFF_NAMES = [
     "fiber_G_LT",
 ]
 
+DUAL_COEFF_NAMES = [
+    "matrix_inv_E",
+    "matrix_nu_over_E",
+    "fiber_inv_E_L",
+    "fiber_inv_E_T",
+    "fiber_nu_LT_over_E_L",
+    "fiber_nu_TT_over_E_T",
+    "fiber_inv_2G_LT",
+]
+
 ENGINEERING_COLUMNS = [
     "E1",
     "E2",
@@ -57,6 +68,16 @@ ENGINEERING_COLUMNS = [
     "nu13",
     "nu23",
 ]
+
+MATERIAL_PARAMETER_COLUMNS = (
+    "Em",
+    "nu_m",
+    "Ef_L",
+    "Ef_T",
+    "G_LT",
+    "nu_LT",
+    "nu_TT",
+)
 
 
 if _NUMBA_TRIANGULAR_AVAILABLE:
@@ -191,6 +212,372 @@ def _fiber_local_bases_axis0() -> list[np.ndarray]:
     return [c_tt, c_tt_cross, c_lt, c_ll, g_lt]
 
 
+def _isotropic_compliance_bases() -> tuple[np.ndarray, np.ndarray]:
+    """Two isotropic compliance bases in Mandel notation."""
+    inv_e = np.eye(6, dtype=float)
+    nu_over_e = np.zeros((6, 6), dtype=float)
+    nu_over_e[:3, :3] = -1.0
+    np.fill_diagonal(nu_over_e[:3, :3], 0.0)
+    nu_over_e[3, 3] = nu_over_e[4, 4] = nu_over_e[5, 5] = 1.0
+    return inv_e, nu_over_e
+
+
+def _fiber_local_compliance_bases_axis0() -> list[np.ndarray]:
+    """Five transversely isotropic compliance bases in Mandel notation."""
+    inv_e_l = np.zeros((6, 6), dtype=float)
+    inv_e_t = np.zeros((6, 6), dtype=float)
+    nu_lt_over_e_l = np.zeros((6, 6), dtype=float)
+    nu_tt_over_e_t = np.zeros((6, 6), dtype=float)
+    inv_2g_lt = np.zeros((6, 6), dtype=float)
+
+    inv_e_l[0, 0] = 1.0
+    inv_e_t[1, 1] = inv_e_t[2, 2] = 1.0
+    inv_e_t[3, 3] = 1.0
+
+    nu_lt_over_e_l[0, 1] = nu_lt_over_e_l[1, 0] = -1.0
+    nu_lt_over_e_l[0, 2] = nu_lt_over_e_l[2, 0] = -1.0
+
+    nu_tt_over_e_t[1, 2] = nu_tt_over_e_t[2, 1] = -1.0
+    nu_tt_over_e_t[3, 3] = 1.0
+
+    inv_2g_lt[4, 4] = inv_2g_lt[5, 5] = 1.0
+    return [
+        inv_e_l,
+        inv_e_t,
+        nu_lt_over_e_l,
+        nu_tt_over_e_t,
+        inv_2g_lt,
+    ]
+
+
+def phase_orientation_voxel_order(phase: np.ndarray, ori: np.ndarray) -> np.ndarray:
+    """Return a deterministic phase/orientation order for contiguous kernels."""
+    phase_flat = np.asarray(phase).reshape(-1)
+    ori_flat = np.asarray(ori).reshape(-1, 3)
+    matrix_idx = np.flatnonzero(phase_flat == 0)
+    fiber_idx = np.flatnonzero(phase_flat != 0)
+    if not len(fiber_idx):
+        return matrix_idx.astype(np.int64, copy=False)
+    rounded = np.round(ori_flat[fiber_idx], decimals=12)
+    _, group_ids = np.unique(rounded, axis=0, return_inverse=True)
+    fiber_order = np.argsort(group_ids, kind="stable")
+    return np.concatenate((matrix_idx, fiber_idx[fiber_order])).astype(np.int64, copy=False)
+
+
+def _contiguous_selector(indices: np.ndarray) -> slice | np.ndarray:
+    if not len(indices):
+        return slice(0, 0)
+    start = int(indices[0])
+    if int(indices[-1]) - start + 1 == len(indices):
+        return slice(start, start + len(indices))
+    return indices
+
+
+def _affine_tensor_batch_factory(
+    phase: np.ndarray,
+    ori: np.ndarray,
+    *,
+    matrix_bases: tuple[np.ndarray, np.ndarray],
+    fiber_local_bases: list[np.ndarray],
+    coefficient_names: list[str],
+) -> Any:
+    """Build a phase/orientation-aware affine fourth-order tensor map."""
+    phase_flat = np.asarray(phase).reshape(-1)
+    ori_flat = np.asarray(ori, dtype=float).reshape(-1, 3)
+    matrix_idx = np.flatnonzero(phase_flat == 0)
+    fiber_idx = np.flatnonzero(phase_flat != 0)
+    matrix_selector = _contiguous_selector(matrix_idx)
+    fiber_selector = _contiguous_selector(fiber_idx)
+    fiber_group_ids = np.empty(0, dtype=np.int32)
+    fiber_bases_by_group = np.empty((0, 5, 6, 6), dtype=np.float64)
+    if len(fiber_idx):
+        rounded = np.round(ori_flat[fiber_idx], decimals=12)
+        unique_oris, inverse = np.unique(rounded, axis=0, return_inverse=True)
+        group_bases: list[np.ndarray] = []
+        for axis in unique_oris:
+            rotation = rotation_matrix_from_vector(axis)
+            group_bases.append(np.stack(
+                [rotate_C_mandel(basis, rotation) for basis in fiber_local_bases],
+                axis=0,
+            ))
+        fiber_group_ids = np.asarray(inverse, dtype=np.int32)
+        fiber_bases_by_group = np.stack(group_bases, axis=0)
+
+    q_count = len(coefficient_names)
+    nvox = max(1, int(phase_flat.size))
+    averaged_stiffness = np.zeros((q_count, 6, 6), dtype=np.float64)
+    matrix_fraction = float(len(matrix_idx)) / float(nvox)
+    for q, matrix_basis in enumerate(matrix_bases):
+        averaged_stiffness[q] = matrix_fraction * matrix_basis
+    if len(fiber_idx):
+        group_counts = np.bincount(
+            fiber_group_ids,
+            minlength=len(fiber_bases_by_group),
+        ).astype(np.float64)
+        averaged_stiffness[2:] = np.einsum(
+            "g,gqab->qab",
+            group_counts / float(nvox),
+            fiber_bases_by_group,
+            optimize=True,
+        )
+    matrix_bases_by_dtype = {
+        np.dtype(np.float32): np.asarray(matrix_bases, dtype=np.float32),
+        np.dtype(np.float64): np.asarray(matrix_bases, dtype=np.float64),
+    }
+    fiber_bases_by_dtype = {
+        np.dtype(np.float32): np.asarray(fiber_bases_by_group, dtype=np.float32),
+        np.dtype(np.float64): np.asarray(fiber_bases_by_group, dtype=np.float64),
+    }
+    stiffness_matrix_fast_path = tuple(coefficient_names) == tuple(COEFF_NAMES)
+    fiber_group_runs: tuple[tuple[int, int, int], ...] = ()
+    if (
+        len(fiber_group_ids)
+        and isinstance(fiber_selector, slice)
+        and np.all(fiber_group_ids[1:] >= fiber_group_ids[:-1])
+    ):
+        starts = np.concatenate(
+            (np.array([0], dtype=np.int64), np.flatnonzero(np.diff(fiber_group_ids)) + 1)
+        )
+        ends = np.concatenate((starts[1:], np.array([len(fiber_group_ids)])))
+        fiber_group_runs = tuple(
+            (int(fiber_group_ids[start]), int(start), int(end))
+            for start, end in zip(starts, ends, strict=True)
+        )
+
+    def apply(q: int, strains: np.ndarray) -> np.ndarray:
+        values = np.asarray(strains)
+        dtype = values.dtype if values.dtype in matrix_bases_by_dtype else np.dtype(np.float64)
+        values = np.asarray(values, dtype=dtype)
+        stress = np.zeros_like(values)
+        if q < 2:
+            if len(matrix_idx):
+                stress[:, :, matrix_selector] = np.einsum(
+                    "ab,lbn->lan",
+                    matrix_bases_by_dtype[dtype][q],
+                    values[:, :, matrix_selector],
+                    optimize=True,
+                )
+        else:
+            local_q = int(q) - 2
+            if len(fiber_idx):
+                voxel_stiffness = fiber_bases_by_dtype[dtype][:, local_q][fiber_group_ids]
+                stress[:, :, fiber_selector] = np.einsum(
+                    "nab,lbn->lan",
+                    voxel_stiffness,
+                    values[:, :, fiber_selector],
+                    optimize=True,
+                )
+        return stress
+
+    def apply_indices(q_indices: Any, strains: np.ndarray) -> np.ndarray:
+        selected = np.asarray(q_indices, dtype=np.intp).reshape(-1)
+        if np.any((selected < 0) | (selected >= q_count)):
+            raise ValueError("affine coefficient index is out of range.")
+        values = np.asarray(strains)
+        dtype = values.dtype if values.dtype in matrix_bases_by_dtype else np.dtype(np.float64)
+        values = np.asarray(values, dtype=dtype)
+        if not isinstance(matrix_selector, slice) or not isinstance(fiber_selector, slice):
+            return np.stack([apply(int(q), values) for q in selected])
+        stresses = np.zeros((len(selected),) + values.shape, dtype=dtype)
+        if len(matrix_idx):
+            matrix_values = values[:, :, matrix_selector]
+            if stiffness_matrix_fast_path:
+                for output_index, q in enumerate(selected):
+                    if q == 0:
+                        normal_sum = np.sum(matrix_values[:, :3], axis=1, dtype=dtype)
+                        stresses[output_index, :, :3, matrix_selector] = normal_sum[:, None]
+                    elif q == 1:
+                        np.multiply(
+                            matrix_values,
+                            dtype.type(2.0),
+                            out=stresses[output_index, :, :, matrix_selector],
+                        )
+            else:
+                matrix_outputs = np.flatnonzero(selected < 2)
+                matrix_indices = selected[matrix_outputs]
+                if len(matrix_outputs):
+                    matrix_applied = np.einsum(
+                        "qab,lbn->qlan",
+                        matrix_bases_by_dtype[dtype][matrix_indices],
+                        matrix_values,
+                        optimize=True,
+                    )
+                    stresses[matrix_outputs, :, :, matrix_selector] = matrix_applied
+        if len(fiber_idx):
+            fiber_values = values[:, :, fiber_selector]
+            output_indices = np.flatnonzero(selected >= 2)
+            local_indices = selected[output_indices] - 2
+            contiguous_outputs = bool(len(output_indices)) and np.array_equal(
+                output_indices,
+                np.arange(output_indices[0], output_indices[-1] + 1),
+            )
+            if fiber_group_runs and contiguous_outputs:
+                fiber_stresses = stresses[:, :, :, fiber_selector]
+                output_slice = slice(int(output_indices[0]), int(output_indices[-1]) + 1)
+                group_bases = fiber_bases_by_dtype[dtype]
+                for group, start, end in fiber_group_runs:
+                    np.einsum(
+                        "qab,lbn->qlan",
+                        group_bases[group, local_indices],
+                        fiber_values[:, :, start:end],
+                        optimize=True,
+                        out=fiber_stresses[output_slice, :, :, start:end],
+                    )
+            else:
+                for output_index, local_q in zip(
+                    output_indices, local_indices, strict=True
+                ):
+                    voxel_stiffness = fiber_bases_by_dtype[dtype][:, local_q][fiber_group_ids]
+                    np.einsum(
+                        "nab,lbn->lan",
+                        voxel_stiffness,
+                        fiber_values,
+                        optimize=True,
+                        out=stresses[output_index, :, :, fiber_selector],
+                    )
+        return stresses
+
+    def apply_supported_indices(
+        q_indices: Any,
+        strains: np.ndarray,
+        support: str,
+    ) -> np.ndarray:
+        """Apply coefficients only where they are nonzero in the sorted phase field."""
+        selected = np.asarray(q_indices, dtype=np.intp).reshape(-1)
+        values = np.asarray(strains)
+        dtype = values.dtype if values.dtype in matrix_bases_by_dtype else np.dtype(np.float64)
+        values = np.asarray(values, dtype=dtype)
+        component_major = values.ndim == 3 and values.shape[1] == 6
+        voxel_major = values.ndim == 3 and values.shape[-1] == 6
+        if not component_major and not voxel_major:
+            raise ValueError("supported strains must have a six-component axis.")
+        stresses = np.zeros((len(selected),) + values.shape, dtype=dtype)
+        if support == "matrix":
+            if np.any((selected < 0) | (selected >= 2)):
+                raise ValueError("matrix support only accepts coefficients 0 and 1.")
+            support_voxels = values.shape[-1] if component_major else values.shape[1]
+            if support_voxels != len(matrix_idx):
+                raise ValueError("matrix support has an incompatible voxel count.")
+            if stiffness_matrix_fast_path:
+                for output_index, q in enumerate(selected):
+                    if q == 0 and component_major:
+                        normal_sum = np.sum(values[:, :3], axis=1, dtype=dtype)
+                        stresses[output_index, :, :3] = normal_sum[:, None]
+                    elif q == 0:
+                        normal_sum = np.sum(values[:, :, :3], axis=2, dtype=dtype)
+                        stresses[output_index, :, :, :3] = normal_sum[:, :, None]
+                    else:
+                        np.multiply(values, dtype.type(2.0), out=stresses[output_index])
+            else:
+                if component_major:
+                    stresses[:] = np.einsum(
+                        "qab,lbn->qlan",
+                        matrix_bases_by_dtype[dtype][selected],
+                        values,
+                        optimize=True,
+                    )
+                else:
+                    stresses[:] = np.einsum(
+                        "qab,lnb->qlna",
+                        matrix_bases_by_dtype[dtype][selected],
+                        values,
+                        optimize=True,
+                    )
+            return stresses
+        if support != "fiber":
+            raise ValueError("support must be 'matrix' or 'fiber'.")
+        if np.any((selected < 2) | (selected >= q_count)):
+            raise ValueError("fiber support only accepts coefficients 2 and above.")
+        support_voxels = values.shape[-1] if component_major else values.shape[1]
+        if support_voxels != len(fiber_idx):
+            raise ValueError("fiber support has an incompatible voxel count.")
+        local_indices = selected - 2
+        if fiber_group_runs:
+            group_bases = fiber_bases_by_dtype[dtype]
+            for group, start, end in fiber_group_runs:
+                if component_major:
+                    np.einsum(
+                        "qab,lbn->qlan",
+                        group_bases[group, local_indices],
+                        values[:, :, start:end],
+                        optimize=True,
+                        out=stresses[:, :, :, start:end],
+                    )
+                else:
+                    np.einsum(
+                        "qab,lnb->qlna",
+                        group_bases[group, local_indices],
+                        values[:, start:end, :],
+                        optimize=True,
+                        out=stresses[:, :, start:end, :],
+                    )
+        else:
+            for output_index, local_q in enumerate(local_indices):
+                voxel_stiffness = fiber_bases_by_dtype[dtype][:, local_q][fiber_group_ids]
+                if component_major:
+                    np.einsum(
+                        "nab,lbn->lan",
+                        voxel_stiffness,
+                        values,
+                        optimize=True,
+                        out=stresses[output_index],
+                    )
+                else:
+                    np.einsum(
+                        "nab,lnb->lna",
+                        voxel_stiffness,
+                        values,
+                        optimize=True,
+                        out=stresses[output_index],
+                    )
+        return stresses
+
+    def apply_all(strains: np.ndarray) -> np.ndarray:
+        return apply_indices(np.arange(q_count), strains)
+
+    apply.averaged_stiffness = averaged_stiffness
+    apply.unique_fiber_orientations = int(len(fiber_bases_by_group))
+    apply.orientation_kernel = "grouped" if fiber_group_runs else "voxelwise"
+    apply.coefficient_names = tuple(coefficient_names)
+    apply.apply_indices = apply_indices
+    apply.apply_all = apply_all
+    if isinstance(matrix_selector, slice) and isinstance(fiber_selector, slice):
+        apply.support_blocks = (
+            ("matrix", np.arange(0, 2, dtype=np.intp), matrix_selector),
+            ("fiber", np.arange(2, q_count, dtype=np.intp), fiber_selector),
+        )
+        apply.apply_supported_indices = apply_supported_indices
+    return apply
+
+
+def affine_stress_batch_factory(
+    phase: np.ndarray,
+    ori: np.ndarray,
+) -> Any:
+    """Build the affine stiffness action used by primal Ritz compilation."""
+    return _affine_tensor_batch_factory(
+        phase,
+        ori,
+        matrix_bases=_isotropic_bases(),
+        fiber_local_bases=_fiber_local_bases_axis0(),
+        coefficient_names=COEFF_NAMES,
+    )
+
+
+def affine_compliance_batch_factory(
+    phase: np.ndarray,
+    ori: np.ndarray,
+) -> Any:
+    """Build the affine compliance action used by dual Ritz compilation."""
+    return _affine_tensor_batch_factory(
+        phase,
+        ori,
+        matrix_bases=_isotropic_compliance_bases(),
+        fiber_local_bases=_fiber_local_compliance_bases_axis0(),
+        coefficient_names=DUAL_COEFF_NAMES,
+    )
+
+
 def _material_coefficients(row: dict[str, Any]) -> np.ndarray:
     em = float(row["Em"])
     nu_m = float(row["nu_m"])
@@ -218,6 +605,107 @@ def _material_coefficients(row: dict[str, Any]) -> np.ndarray:
         dtype=float,
     )
     return coeffs
+
+
+def _dual_material_coefficients(row: dict[str, Any]) -> np.ndarray:
+    """Seven exact affine coefficients of the phase compliance field."""
+    em = float(row["Em"])
+    ef_l = float(row["Ef_L"])
+    ef_t = float(row["Ef_T"])
+    g_lt = float(row["G_LT"])
+    return np.asarray(
+        [
+            1.0 / em,
+            float(row["nu_m"]) / em,
+            1.0 / ef_l,
+            1.0 / ef_t,
+            float(row["nu_LT"]) / ef_l,
+            float(row["nu_TT"]) / ef_t,
+            1.0 / (2.0 * g_lt),
+        ],
+        dtype=np.float64,
+    )
+
+
+def _material_coefficients_batch(parameters: np.ndarray) -> np.ndarray:
+    """Vectorized seven-term affine coefficients for material batches."""
+    values = np.asarray(parameters, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != len(MATERIAL_PARAMETER_COLUMNS):
+        raise ValueError(
+            "parameters must have columns " + ", ".join(MATERIAL_PARAMETER_COLUMNS)
+        )
+    Em, nu_m, Ef_L, Ef_T, G_LT, nu_LT, nu_TT = values.T
+    lam_m = Em * nu_m / ((1.0 + nu_m) * (1.0 - 2.0 * nu_m))
+    mu_m = Em / (2.0 * (1.0 + nu_m))
+    compliance = np.zeros((len(values), 6, 6), dtype=np.float64)
+    compliance[:, 0, 0] = 1.0 / Ef_L
+    compliance[:, 1, 1] = 1.0 / Ef_T
+    compliance[:, 2, 2] = 1.0 / Ef_T
+    compliance[:, 0, 1] = compliance[:, 1, 0] = -nu_LT / Ef_L
+    compliance[:, 0, 2] = compliance[:, 2, 0] = -nu_LT / Ef_L
+    compliance[:, 1, 2] = compliance[:, 2, 1] = -nu_TT / Ef_T
+    compliance[:, 3, 3] = 2.0 * (1.0 + nu_TT) / Ef_T
+    compliance[:, 4, 4] = 1.0 / G_LT
+    compliance[:, 5, 5] = 1.0 / G_LT
+    voigt = np.linalg.inv(compliance)
+    factors = np.array(
+        (1.0, 1.0, 1.0, np.sqrt(2.0), np.sqrt(2.0), np.sqrt(2.0))
+    )
+    mandel = voigt * factors[None, :, None] * factors[None, None, :]
+    return np.column_stack(
+        (
+            lam_m,
+            mu_m,
+            mandel[:, 1, 1],
+            mandel[:, 1, 2],
+            mandel[:, 0, 1],
+            mandel[:, 0, 0],
+            mandel[:, 4, 4] / 2.0,
+        )
+    )
+
+
+def _dual_material_coefficients_batch(parameters: np.ndarray) -> np.ndarray:
+    """Vectorized seven-term affine compliance coefficients."""
+    values = np.asarray(parameters, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != len(MATERIAL_PARAMETER_COLUMNS):
+        raise ValueError(
+            "parameters must have columns " + ", ".join(MATERIAL_PARAMETER_COLUMNS)
+        )
+    em, nu_m, ef_l, ef_t, g_lt, nu_lt, nu_tt = values.T
+    return np.column_stack(
+        (
+            1.0 / em,
+            nu_m / em,
+            1.0 / ef_l,
+            1.0 / ef_t,
+            nu_lt / ef_l,
+            nu_tt / ef_t,
+            1.0 / (2.0 * g_lt),
+        )
+    )
+
+
+def _engineering_constants_batch(C_mandel: np.ndarray) -> np.ndarray:
+    """Return engineering constants in ``ENGINEERING_COLUMNS`` order."""
+    matrices = np.asarray(C_mandel, dtype=np.float64)
+    if matrices.ndim != 3 or matrices.shape[1:] != (6, 6):
+        raise ValueError("C_mandel must have shape (count, 6, 6).")
+    matrices = 0.5 * (matrices + np.swapaxes(matrices, -1, -2))
+    compliance = np.linalg.inv(matrices)
+    return np.column_stack(
+        (
+            1.0 / compliance[:, 0, 0],
+            1.0 / compliance[:, 1, 1],
+            1.0 / compliance[:, 2, 2],
+            1.0 / (2.0 * compliance[:, 5, 5]),
+            1.0 / (2.0 * compliance[:, 4, 4]),
+            1.0 / (2.0 * compliance[:, 3, 3]),
+            -compliance[:, 0, 1] / compliance[:, 0, 0],
+            -compliance[:, 0, 2] / compliance[:, 0, 0],
+            -compliance[:, 1, 2] / compliance[:, 1, 1],
+        )
+    )
 
 
 def _check_local_basis(row: dict[str, Any]) -> float:
@@ -303,101 +791,237 @@ def _orthonormalize(fields: list[np.ndarray], tol: float) -> list[np.ndarray]:
     return basis
 
 
-def _apply_dense(C: np.ndarray, values: np.ndarray) -> np.ndarray:
-    return np.einsum("ab,jbn->jan", C, values, optimize=True)
-
-
-def _accumulate_block(
+def _reduced_field_values(
+    fields: np.ndarray | list[np.ndarray],
     *,
-    C: np.ndarray,
+    count: int,
+    nvox: int,
+) -> tuple[np.ndarray, str]:
+    """Normalize reduced fields while preserving a phase-contiguous layout."""
+    values = np.asarray(fields)
+    if values.ndim == 3 and values.shape == (count, nvox, 6):
+        return values, "voxel_component"
+    if values.ndim >= 3 and values.shape[0] == count:
+        return values.reshape(count, 6, nvox), "component_voxel"
+    stacked = np.stack([np.asarray(field) for field in fields])
+    if stacked.ndim == 3 and stacked.shape == (count, nvox, 6):
+        return stacked, "voxel_component"
+    return stacked.reshape(count, 6, nvox), "component_voxel"
+
+
+def _supported_values(
     values: np.ndarray,
-    total_voxels: int,
-    Kq: np.ndarray,
-    Bq: np.ndarray,
-    Dq: np.ndarray,
-    q: int,
-) -> None:
-    if values.shape[2] == 0:
-        return
-    # Pre-compute C @ values once and reuse for both Kq and Bq
-    Cv = np.einsum("ab,jbn->jan", C, values, optimize=True)  # (r, 6, n_vox)
-    Kq[q] += np.einsum("ian,jan->ij", values, Cv, optimize=True)
-    Bq[q] += np.sum(Cv, axis=2)  # equivalent to einsum("ian,am->im", values, C)
-    Dq[q] += C * values.shape[2]
-    if total_voxels <= 0:
-        raise ValueError("total_voxels debe ser positivo.")
+    selector: slice,
+    layout: str,
+) -> np.ndarray:
+    return values[:, selector, :] if layout == "voxel_component" else values[:, :, selector]
+
+
+def _flatten_supported_values(values: np.ndarray, layout: str) -> np.ndarray:
+    if layout != "voxel_component":
+        return np.ascontiguousarray(values).reshape(len(values), -1)
+    if values.shape[1] == 0:
+        return np.empty((len(values), 0), dtype=values.dtype)
+    return np.lib.stride_tricks.as_strided(
+        values,
+        shape=(len(values), int(values.shape[1] * values.shape[2])),
+        strides=(values.strides[0], values.strides[2]),
+        writeable=False,
+    )
+
+
+def _supported_stress_mean(stresses: np.ndarray, layout: str, nvox: int) -> np.ndarray:
+    voxel_axis = 2 if layout == "voxel_component" else 3
+    return np.sum(stresses, axis=voxel_axis) / float(nvox)
 
 
 def _assemble_reduced_operators(
     *,
     phase: np.ndarray,
     ori: np.ndarray,
-    basis: list[np.ndarray],
+    basis: np.ndarray | list[np.ndarray],
+    affine_stress_batch: Any | None = None,
+    affine_q_block_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Assemble all affine Ritz operators with one batched CPU contraction."""
     t0 = time.perf_counter()
     phase_flat = np.asarray(phase).reshape(-1)
-    ori_flat = np.asarray(ori, dtype=float).reshape(-1, 3)
     nvox = int(phase_flat.size)
     r = len(basis)
-    values_all = np.stack([field.reshape(6, nvox) for field in basis], axis=0)
-
-    Kq_sum = np.zeros((len(COEFF_NAMES), r, r), dtype=np.float64)
-    Bq_sum = np.zeros((len(COEFF_NAMES), r, 6), dtype=np.float64)
-    Dq_sum = np.zeros((len(COEFF_NAMES), 6, 6), dtype=np.float64)
-
-    matrix_mask = phase_flat == 0
-    matrix_values = values_all[:, :, matrix_mask]
-    for q, C in enumerate(_isotropic_bases()):
-        _accumulate_block(
-            C=C,
-            values=matrix_values,
-            total_voxels=nvox,
-            Kq=Kq_sum,
-            Bq=Bq_sum,
-            Dq=Dq_sum,
-            q=q,
-        )
-
-    fiber_indices = np.flatnonzero(phase_flat != 0)
-    unique_orientation_count = 0
-    fiber_bases = _fiber_local_bases_axis0()
-    if len(fiber_indices):
-        rounded = np.round(ori_flat[fiber_indices], decimals=12)
-        unique_oris, inverse = np.unique(rounded, axis=0, return_inverse=True)
-        unique_orientation_count = int(len(unique_oris))
-        for group_id, axis in enumerate(unique_oris):
-            indices = fiber_indices[inverse == group_id]
-            if len(indices) == 0:
-                continue
-            values = values_all[:, :, indices]
-            R = rotation_matrix_from_vector(axis)
-            for local_q, local_basis in enumerate(fiber_bases, start=2):
-                C = rotate_C_mandel(local_basis, R)
-                _accumulate_block(
-                    C=C,
-                    values=values,
-                    total_voxels=nvox,
-                    Kq=Kq_sum,
-                    Bq=Bq_sum,
-                    Dq=Dq_sum,
-                    q=local_q,
+    if r < 1:
+        raise ValueError("basis must contain at least one field.")
+    affine = affine_stress_batch
+    if affine is None:
+        affine = affine_stress_batch_factory(phase, ori)
+    basis_values, basis_layout = _reduced_field_values(
+        basis,
+        count=r,
+        nvox=nvox,
+    )
+    apply_all = getattr(affine, "apply_all", None)
+    apply_indices = getattr(affine, "apply_indices", None)
+    apply_supported_indices = getattr(affine, "apply_supported_indices", None)
+    support_blocks = getattr(affine, "support_blocks", None)
+    coefficient_names = tuple(getattr(affine, "coefficient_names", COEFF_NAMES))
+    q_count = len(coefficient_names)
+    q_block_size = min(q_count, max(1, int(affine_q_block_size or q_count)))
+    Kq = np.zeros((q_count, r, r), dtype=np.float64)
+    Bq = np.zeros((q_count, r, 6), dtype=np.float64)
+    affine_stress_wall_s = 0.0
+    contraction_wall_s = 0.0
+    stress_workspace_peak_bytes = 0
+    contraction_workspace_peak_bytes = 0
+    contraction_mode = "full_stress_blocks"
+    active_voxel_passes = 0
+    if apply_supported_indices is not None and support_blocks is not None:
+        contraction_mode = "phase_supported_blocks"
+        for support, support_indices, selector in support_blocks:
+            support_values = _supported_values(
+                basis_values,
+                selector,
+                basis_layout,
+            )
+            support_nvox = int(
+                support_values.shape[1]
+                if basis_layout == "voxel_component"
+                else support_values.shape[-1]
+            )
+            for start in range(0, len(support_indices), q_block_size):
+                q_indices = support_indices[start : start + q_block_size]
+                active_voxel_passes += int(len(q_indices)) * support_nvox
+                stress_started = time.perf_counter()
+                stresses = np.asarray(
+                    apply_supported_indices(q_indices, support_values, support)
                 )
+                affine_stress_wall_s += float(time.perf_counter() - stress_started)
+                expected_shape = (len(q_indices),) + support_values.shape
+                if stresses.shape != expected_shape:
+                    raise ValueError(
+                        "affine supported action returned an incompatible shape."
+                    )
+                stress_workspace_peak_bytes = max(
+                    stress_workspace_peak_bytes, int(stresses.nbytes)
+                )
+                stress_flat = stresses.reshape(len(q_indices), r, -1)
+                contraction_started = time.perf_counter()
+                if basis_layout == "voxel_component":
+                    support_flat = _flatten_supported_values(
+                        support_values,
+                        basis_layout,
+                    )
+                    Kq[q_indices] = np.asarray(
+                        np.einsum(
+                            "id,qjd->qij",
+                            support_flat,
+                            stress_flat,
+                            optimize=True,
+                        )
+                        / float(nvox),
+                        dtype=np.float64,
+                    )
+                else:
+                    supported_K = np.zeros(
+                        (len(q_indices), r, r),
+                        dtype=np.result_type(basis_values.dtype, np.float32),
+                    )
+                    for component in range(6):
+                        stress_component = np.ascontiguousarray(
+                            stresses[:, :, component, :]
+                        ).reshape(len(q_indices) * r, -1)
+                        contraction_workspace_peak_bytes = max(
+                            contraction_workspace_peak_bytes,
+                            int(stress_component.nbytes),
+                        )
+                        products = (
+                            support_values[:, component, :] @ stress_component.T
+                        ).reshape(r, len(q_indices), r)
+                        supported_K += np.transpose(products, (1, 0, 2))
+                    Kq[q_indices] = np.asarray(
+                        supported_K / float(nvox),
+                        dtype=np.float64,
+                    )
+                Bq[q_indices] = np.asarray(
+                    _supported_stress_mean(stresses, basis_layout, nvox),
+                    dtype=np.float64,
+                )
+                contraction_wall_s += float(time.perf_counter() - contraction_started)
+                del stresses, stress_flat
+    else:
+        full_basis_values = (
+            np.transpose(basis_values, (0, 2, 1))
+            if basis_layout == "voxel_component"
+            else basis_values
+        )
+        basis_flat = np.ascontiguousarray(full_basis_values).reshape(r, -1)
+        active_voxel_passes = q_count * nvox
+        for q_start in range(0, q_count, q_block_size):
+            q_end = min(q_start + q_block_size, q_count)
+            q_indices = np.arange(q_start, q_end)
+            stress_started = time.perf_counter()
+            if apply_indices is not None:
+                stresses = np.asarray(apply_indices(q_indices, full_basis_values))
+            elif q_start == 0 and q_end == q_count and apply_all is not None:
+                stresses = np.asarray(apply_all(full_basis_values))
+            else:
+                stresses = np.stack(
+                    [np.asarray(affine(q, full_basis_values)) for q in q_indices]
+                )
+            affine_stress_wall_s += float(time.perf_counter() - stress_started)
+            if stresses.shape != (q_end - q_start,) + full_basis_values.shape:
+                raise ValueError("affine_stress_batch returned an incompatible shape.")
+            stress_workspace_peak_bytes = max(
+                stress_workspace_peak_bytes, int(stresses.nbytes)
+            )
+            stress_flat = stresses.reshape(q_end - q_start, r, -1)
+            contraction_started = time.perf_counter()
+            Kq[q_start:q_end] = np.asarray(
+                np.einsum(
+                    "id,qjd->qij",
+                    basis_flat,
+                    stress_flat,
+                    optimize=True,
+                )
+                / float(nvox),
+                dtype=np.float64,
+            )
+            Bq[q_start:q_end] = np.asarray(
+                np.mean(stresses, axis=3), dtype=np.float64
+            )
+            contraction_wall_s += float(time.perf_counter() - contraction_started)
+            del stresses, stress_flat
 
-    Kq = Kq_sum / float(nvox)
-    Bq = Bq_sum / float(nvox)
-    Dq = Dq_sum / float(nvox)
+    averaged = getattr(affine, "averaged_stiffness", None)
+    if averaged is None:
+        raise ValueError("affine_stress_batch does not expose averaged_stiffness.")
+    Dq = np.asarray(averaged, dtype=np.float64).copy()
     for q in range(Kq.shape[0]):
         Kq[q] = 0.5 * (Kq[q] + Kq[q].T)
         Dq[q] = 0.5 * (Dq[q] + Dq[q].T)
 
+    fiber_voxels = int(np.count_nonzero(phase_flat != 0))
     metadata = {
         "assembly_wall_s": float(time.perf_counter() - t0),
+        "assembly_mode": "batched_affine_cpu",
+        "assembly_backend": "numpy",
         "nvox": int(nvox),
         "basis_rank": int(r),
-        "matrix_voxels": int(np.sum(matrix_mask)),
-        "fiber_voxels": int(len(fiber_indices)),
-        "unique_fiber_orientations": int(unique_orientation_count),
-        "coefficient_names": COEFF_NAMES,
+        "contraction_dtype": str(basis_values.dtype),
+        "basis_layout": basis_layout,
+        "matrix_voxels": int(nvox - fiber_voxels),
+        "fiber_voxels": fiber_voxels,
+        "unique_fiber_orientations": int(
+            getattr(affine, "unique_fiber_orientations", 0)
+        ),
+        "orientation_kernel": str(getattr(affine, "orientation_kernel", "voxelwise")),
+        "affine_passes": int(q_count),
+        "affine_q_block_size": q_block_size,
+        "affine_stress_wall_s": affine_stress_wall_s,
+        "ritz_contraction_wall_s": contraction_wall_s,
+        "stress_workspace_peak_bytes": stress_workspace_peak_bytes,
+        "contraction_workspace_peak_bytes": contraction_workspace_peak_bytes,
+        "contraction_mode": contraction_mode,
+        "full_volume_equivalent_passes": float(active_voxel_passes) / float(nvox),
+        "coefficient_names": list(coefficient_names),
     }
     return Kq, Bq, Dq, metadata
 
@@ -405,10 +1029,10 @@ def _assemble_reduced_operators(
 def _extend_reduced_operators(
     *,
     existing: dict[str, np.ndarray],
-    old_basis: list[np.ndarray],
-    new_basis: list[np.ndarray],
+    old_basis: np.ndarray | list[np.ndarray],
+    new_basis: np.ndarray | list[np.ndarray],
     affine_stress_batch: Any,
-    basis_block_size: int = 12,
+    affine_q_block_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Append only the new rows and columns of the affine Ritz operators."""
     started = time.perf_counter()
@@ -424,54 +1048,214 @@ def _extend_reduced_operators(
 
     new_rank = old_rank + count
     nvox = int(np.asarray(new_basis[0]).size // 6)
-    new_values = np.stack(
-        [np.asarray(field, dtype=np.float64).reshape(6, nvox) for field in new_basis]
+    new_values_cpu, basis_layout = _reduced_field_values(
+        new_basis,
+        count=count,
+        nvox=nvox,
     )
-    new_flat = new_values.reshape(count, -1)
-    old_flat = np.stack(
-        [np.asarray(field, dtype=np.float64).reshape(-1) for field in old_basis]
+    coefficient_names = tuple(
+        getattr(affine_stress_batch, "coefficient_names", COEFF_NAMES)
     )
-    Kq = np.zeros((len(COEFF_NAMES), new_rank, new_rank), dtype=np.float64)
-    Bq = np.zeros((len(COEFF_NAMES), new_rank, 6), dtype=np.float64)
+    q_count = len(coefficient_names)
+    Kq = np.zeros((q_count, new_rank, new_rank), dtype=np.float64)
+    Bq = np.zeros((q_count, new_rank, 6), dtype=np.float64)
     Kq[:, :old_rank, :old_rank] = K_old
     Bq[:, :old_rank] = B_old
-    block_size = max(1, int(basis_block_size))
-    stresses = np.stack(
-        [
-            np.asarray(affine_stress_batch(q, new_values), dtype=np.float64)
-            for q in range(len(COEFF_NAMES))
-        ]
+    new_values = new_values_cpu
+    if old_rank:
+        old_values, old_layout = _reduced_field_values(
+            old_basis,
+            count=old_rank,
+            nvox=nvox,
+        )
+        if old_layout != basis_layout:
+            raise ValueError("old and new bases use different field layouts.")
+    else:
+        old_values = np.empty((0,) + new_values.shape[1:], dtype=new_values.dtype)
+    apply_all = getattr(affine_stress_batch, "apply_all", None)
+    apply_indices = getattr(affine_stress_batch, "apply_indices", None)
+    apply_supported_indices = getattr(
+        affine_stress_batch,
+        "apply_supported_indices",
+        None,
     )
-    if stresses.shape != (len(COEFF_NAMES),) + new_values.shape:
-        raise ValueError("affine_stress_batch returned an incompatible shape.")
-    stress_flat = stresses.reshape(len(COEFF_NAMES), count, -1)
-    cross_all = old_flat @ stress_flat.reshape(len(COEFF_NAMES) * count, -1).T
-    cross_all /= float(nvox)
-    cross_all = cross_all.reshape(old_rank, len(COEFF_NAMES), count)
-    new_new_all = np.einsum(
-        "id,qjd->qij", new_flat, stress_flat, optimize=True
-    ) / float(nvox)
-
-    for q in range(len(COEFF_NAMES)):
-        stress = stresses[q]
-        if stress.shape != new_values.shape:
-            raise ValueError("affine_stress_batch returned an incompatible shape.")
-        Bq[q, old_rank:] = np.mean(stress, axis=2)
-        new_new = new_new_all[q]
-        Kq[q, old_rank:, old_rank:] = 0.5 * (new_new + new_new.T)
-        cross = cross_all[:, q]
-        Kq[q, :old_rank, old_rank:] = cross
-        Kq[q, old_rank:, :old_rank] = cross.T
+    support_blocks = getattr(affine_stress_batch, "support_blocks", None)
+    q_block_size = min(q_count, max(1, int(affine_q_block_size or q_count)))
+    affine_stress_wall_s = 0.0
+    contraction_wall_s = 0.0
+    stress_workspace_peak_bytes = 0
+    contraction_workspace_peak_bytes = 0
+    contraction_mode = "full_stress_blocks"
+    active_voxel_passes = 0
+    if apply_supported_indices is not None and support_blocks is not None:
+        contraction_mode = "phase_supported_blocks"
+        for support, support_indices, selector in support_blocks:
+            new_support = _supported_values(new_values, selector, basis_layout)
+            old_support = _supported_values(old_values, selector, basis_layout)
+            support_nvox = int(
+                new_support.shape[1]
+                if basis_layout == "voxel_component"
+                else new_support.shape[-1]
+            )
+            if basis_layout == "voxel_component":
+                new_flat = _flatten_supported_values(new_support, basis_layout)
+                old_flat = _flatten_supported_values(old_support, basis_layout)
+            for start in range(0, len(support_indices), q_block_size):
+                q_indices = support_indices[start : start + q_block_size]
+                active_voxel_passes += int(len(q_indices)) * support_nvox
+                stress_started = time.perf_counter()
+                stresses = np.asarray(
+                    apply_supported_indices(q_indices, new_support, support)
+                )
+                affine_stress_wall_s += float(time.perf_counter() - stress_started)
+                expected_shape = (len(q_indices),) + new_support.shape
+                if stresses.shape != expected_shape:
+                    raise ValueError(
+                        "affine supported action returned an incompatible shape."
+                    )
+                stress_workspace_peak_bytes = max(
+                    stress_workspace_peak_bytes, int(stresses.nbytes)
+                )
+                stress_flat = stresses.reshape(len(q_indices), count, -1)
+                contraction_started = time.perf_counter()
+                cross_all = np.zeros(
+                    (old_rank, len(q_indices), count),
+                    dtype=np.result_type(new_values.dtype, np.float32),
+                )
+                new_new_all = np.zeros(
+                    (len(q_indices), count, count),
+                    dtype=np.result_type(new_values.dtype, np.float32),
+                )
+                if basis_layout == "voxel_component":
+                    stress_columns = stress_flat.reshape(
+                        len(q_indices) * count,
+                        -1,
+                    )
+                    cross_all[:] = (old_flat @ stress_columns.T).reshape(
+                        old_rank,
+                        len(q_indices),
+                        count,
+                    )
+                    new_new_all[:] = np.einsum(
+                        "id,qjd->qij",
+                        new_flat,
+                        stress_flat,
+                        optimize=True,
+                    )
+                else:
+                    for component in range(6):
+                        stress_component = np.ascontiguousarray(
+                            stresses[:, :, component, :]
+                        ).reshape(len(q_indices) * count, -1)
+                        contraction_workspace_peak_bytes = max(
+                            contraction_workspace_peak_bytes,
+                            int(stress_component.nbytes),
+                        )
+                        cross_all += (
+                            old_support[:, component, :] @ stress_component.T
+                        ).reshape(old_rank, len(q_indices), count)
+                        products = (
+                            new_support[:, component, :] @ stress_component.T
+                        ).reshape(count, len(q_indices), count)
+                        new_new_all += np.transpose(products, (1, 0, 2))
+                cross_all /= float(nvox)
+                new_new_all /= float(nvox)
+                contraction_wall_s += float(time.perf_counter() - contraction_started)
+                means = _supported_stress_mean(stresses, basis_layout, nvox)
+                for local_q, q in enumerate(q_indices):
+                    Bq[q, old_rank:] = means[local_q]
+                    new_new = new_new_all[local_q]
+                    Kq[q, old_rank:, old_rank:] = 0.5 * (new_new + new_new.T)
+                    if old_rank:
+                        cross = cross_all[:, local_q]
+                        Kq[q, :old_rank, old_rank:] = cross
+                        Kq[q, old_rank:, :old_rank] = cross.T
+                del stresses, stress_flat, cross_all, new_new_all
+    else:
+        full_new_values = (
+            np.transpose(new_values, (0, 2, 1))
+            if basis_layout == "voxel_component"
+            else new_values
+        )
+        full_old_values = (
+            np.transpose(old_values, (0, 2, 1))
+            if basis_layout == "voxel_component"
+            else old_values
+        )
+        new_flat = np.ascontiguousarray(full_new_values).reshape(count, -1)
+        old_flat = np.ascontiguousarray(full_old_values).reshape(old_rank, -1)
+        active_voxel_passes = q_count * nvox
+        for q_start in range(0, q_count, q_block_size):
+            q_end = min(q_start + q_block_size, q_count)
+            q_indices = np.arange(q_start, q_end)
+            stress_started = time.perf_counter()
+            if apply_indices is not None:
+                stresses = np.asarray(apply_indices(q_indices, full_new_values))
+            elif q_start == 0 and q_end == q_count and apply_all is not None:
+                stresses = np.asarray(apply_all(full_new_values))
+            else:
+                stresses = np.stack(
+                    [
+                        np.asarray(affine_stress_batch(q, full_new_values))
+                        for q in q_indices
+                    ]
+                )
+            affine_stress_wall_s += float(time.perf_counter() - stress_started)
+            if stresses.shape != (q_end - q_start,) + full_new_values.shape:
+                raise ValueError("affine_stress_batch returned an incompatible shape.")
+            stress_workspace_peak_bytes = max(
+                stress_workspace_peak_bytes, int(stresses.nbytes)
+            )
+            stress_flat = stresses.reshape(q_end - q_start, count, -1)
+            contraction_started = time.perf_counter()
+            cross_all = old_flat @ stress_flat.reshape(
+                (q_end - q_start) * count,
+                -1,
+            ).T
+            cross_all = cross_all.reshape(
+                old_rank,
+                q_end - q_start,
+                count,
+            ) / float(nvox)
+            new_new_all = np.einsum(
+                "id,qjd->qij",
+                new_flat,
+                stress_flat,
+                optimize=True,
+            ) / float(nvox)
+            contraction_wall_s += float(time.perf_counter() - contraction_started)
+            for local_q, q in enumerate(range(q_start, q_end)):
+                Bq[q, old_rank:] = np.mean(stresses[local_q], axis=2)
+                new_new = new_new_all[local_q]
+                Kq[q, old_rank:, old_rank:] = 0.5 * (new_new + new_new.T)
+                if old_rank:
+                    cross = cross_all[:, local_q]
+                    Kq[q, :old_rank, old_rank:] = cross
+                    Kq[q, old_rank:, :old_rank] = cross.T
+            del stresses, stress_flat, cross_all, new_new_all
 
     metadata = {
         "assembly_wall_s": float(time.perf_counter() - started),
         "assembly_mode": "incremental",
+        "assembly_backend": "numpy",
+        "affine_passes": int(q_count),
+        "affine_q_block_size": q_block_size,
+        "affine_stress_wall_s": affine_stress_wall_s,
+        "ritz_contraction_wall_s": contraction_wall_s,
+        "stress_workspace_peak_bytes": stress_workspace_peak_bytes,
+        "contraction_workspace_peak_bytes": contraction_workspace_peak_bytes,
+        "contraction_mode": contraction_mode,
         "old_rank": old_rank,
         "appended_rank": count,
         "basis_rank": new_rank,
+        "contraction_dtype": str(new_values.dtype),
+        "basis_layout": basis_layout,
         "nvox": nvox,
-        "basis_block_size": block_size,
-        "coefficient_names": COEFF_NAMES,
+        "orientation_kernel": str(
+            getattr(affine_stress_batch, "orientation_kernel", "voxelwise")
+        ),
+        "full_volume_equivalent_passes": float(active_voxel_passes) / float(nvox),
+        "coefficient_names": list(coefficient_names),
     }
     return Kq, Bq, Dq, metadata
 
@@ -486,7 +1270,16 @@ def _rom_ceff(
     K = np.tensordot(coeffs, Kq, axes=(0, 0))
     B = np.tensordot(coeffs, Bq, axes=(0, 0))
     D = np.tensordot(coeffs, Dq, axes=(0, 0))
-    amplitudes = np.linalg.solve(K, -B)
+    try:
+        amplitudes = scipy_linalg.solve(
+            K,
+            -B,
+            assume_a="pos",
+            overwrite_a=True,
+            check_finite=False,
+        )
+    except np.linalg.LinAlgError:
+        amplitudes = np.linalg.solve(K, -B)
     C = D + B.T @ amplitudes
     C = 0.5 * (C + C.T)
     return C, amplitudes, float(time.perf_counter() - t0)
@@ -512,10 +1305,50 @@ def _rom_ceff_batch(
     K = np.einsum("nq,qij->nij", coeffs, Kq, optimize=True)
     B = np.einsum("nq,qij->nij", coeffs, Bq, optimize=True)
     D = np.einsum("nq,qij->nij", coeffs, Dq, optimize=True)
-    amplitudes = np.linalg.solve(K, -B)
+    try:
+        amplitudes = scipy_linalg.solve(
+            K,
+            -B,
+            assume_a="pos",
+            overwrite_a=True,
+            check_finite=False,
+        )
+    except (np.linalg.LinAlgError, ValueError):
+        amplitudes = np.linalg.solve(K, -B)
     C = D + np.einsum("nri,nrj->nij", B, amplitudes, optimize=True)
     C = 0.5 * (C + np.swapaxes(C, -1, -2))
     return C, amplitudes, float(time.perf_counter() - started)
+
+
+class GpuAffineBatchEvaluator:
+    """Keep affine operators resident on CUDA for repeated dense ROM batches."""
+
+    def __init__(self, Kq: np.ndarray, Bq: np.ndarray, Dq: np.ndarray) -> None:
+        import cupy as cp
+
+        started = time.perf_counter()
+        self.cp = cp
+        self.Kq = cp.asarray(Kq, dtype=cp.float64)
+        self.Bq = cp.asarray(Bq, dtype=cp.float64)
+        self.Dq = cp.asarray(Dq, dtype=cp.float64)
+        cp.cuda.Stream.null.synchronize()
+        self.operator_transfer_wall_s = float(time.perf_counter() - started)
+
+    def evaluate(self, coeffs_batch: np.ndarray) -> tuple[np.ndarray, float]:
+        cp = self.cp
+        started = time.perf_counter()
+        coeffs = cp.asarray(coeffs_batch, dtype=cp.float64)
+        if coeffs.ndim != 2 or coeffs.shape[1] != self.Kq.shape[0]:
+            raise ValueError("coeffs_batch must have shape (n_candidates, n_coefficients).")
+        K = cp.einsum("nq,qij->nij", coeffs, self.Kq, optimize=True)
+        B = cp.einsum("nq,qij->nij", coeffs, self.Bq, optimize=True)
+        D = cp.einsum("nq,qij->nij", coeffs, self.Dq, optimize=True)
+        amplitudes = cp.linalg.solve(K, -B)
+        C = D + cp.einsum("nri,nrj->nij", B, amplitudes, optimize=True)
+        C = 0.5 * (C + cp.swapaxes(C, -1, -2))
+        result = cp.asnumpy(C)
+        cp.cuda.Stream.null.synchronize()
+        return result, float(time.perf_counter() - started)
 
 
 class IncrementalAffineBatchEvaluator:
@@ -721,7 +1554,7 @@ def _evaluate_rom(
         material_ids[idx] = int(row["material_id"])
         material_labels.append(str(row.get("material_label", "")))
 
-    # Batched ROM solve — single dense contraction + batched np.linalg.solve
+    # Build all affine systems once and use the batched SPD solver.
     C_rom_all, amplitudes_all, batch_online_s = _rom_ceff_batch(
         coeffs_all, Kq, Bq, Dq
     )

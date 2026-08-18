@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scripts.applications.cmame_inclusion_benchmark import hashin_shtrikman_bounds, isotropic_moduli
+from scripts.cmame_campaign_common import hashin_shtrikman_bounds, isotropic_moduli
 
 
 def test_hashin_shtrikman_bounds_are_ordered_and_between_phases() -> None:

@@ -1,0 +1,36 @@
+{
+  "campaign_id": "geometry_material_feasibility_vf05_15_ar05",
+  "paths": {
+    "out_root": "results/cmame_method/geometry_material_feasibility_vf05_15_ar05",
+    "venv_path": "~/Documentos/ANDRES/COMPUTATIONAL_WORKSPACEV4/.venv",
+    "source_master_fibers": "results/cmame_method/interpretable_vf05_25_ar5_20/geometries/geometry_03/continuous_fibers_master.csv"
+  },
+  "geometry_family": {
+    "volume_fractions": [0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15],
+    "held_out_volume_fraction": 0.10,
+    "aspect_ratio": 5.0,
+    "fiber_diameter_um": 1.0,
+    "box_factor": 2.0,
+    "resolution_vox_per_um": 6.0,
+    "target_A2": [0.3333333333333333, 0.3333333333333333, 0.3333333333333333],
+    "vf_tolerance": 0.006,
+    "A2_tolerance": 0.12
+  },
+  "experiment": {
+    "snapshot_material_count": 15,
+    "snapshot_material_seed": 20260831,
+    "validation_material_count": 100,
+    "validation_material_seed": 20260901,
+    "solver_profile": "snapshot",
+    "basis_dtype": "float32",
+    "basis_rank_tolerance": 1e-7,
+    "basis_energy_fraction": 0.999999,
+    "basis_rank_cap": 0,
+    "operator_energy_targets": [0.99, 0.999, 0.9999, 0.99999],
+    "operator_max_modes": 8,
+    "interpolator": "pchip",
+    "fft_backend": "gpu",
+    "blas_threads": "auto",
+    "affine_q_block_size": 7
+  }
+}

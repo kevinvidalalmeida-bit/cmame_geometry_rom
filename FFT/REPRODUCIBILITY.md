@@ -32,11 +32,12 @@ configurados por el perfil de entorno:
 | Fraccion de fibra voxelizada | `SAM_VF_TOLERANCE=0.005` |
 | Error relativo de `A2` continuo | `SAM_A2_TOLERANCE=0.01` |
 | Error relativo de `A2` voxelizado | `SAM_VOXEL_A2_TOLERANCE=0.01` |
-| Penetracion maxima | `SAM_OVERLAP_TOLERANCE=0.05` voxel |
+| Penetracion maxima relativa | `SAM_OVERLAP_TOLERANCE_RELATIVE=1/120` |
 
-Con cinco voxeles por diametro, `SAM_OVERLAP_TOLERANCE=0.05` equivale a 1% de
-un diametro. En casos densos el generador usa insercion por lotes, compactacion
-y relajacion colectiva antes de voxelizar.
+Con seis voxeles por diametro, esta cota relativa equivale a `0.05` voxel o
+`0.833%` de un diametro. Todas las geometrias usan la misma ruta: insercion a
+diametro reducido, restauracion FIRE al diametro fisico, seleccion del grafo
+por densidad medida y rescate acotado de contactos antes de voxelizar.
 
 ## Perfil CPU/GPU
 

@@ -719,6 +719,23 @@ def _pairs_to_csr_numba(pairs: Array, n_fibers: int) -> Tuple[Array, Array]:
     return offsets, neighbors
 
 
+@njit(cache=True)
+def _complete_neighbor_csr_numba(n_fibers: int) -> Tuple[Array, Array]:
+    """Build a compact all-to-all CSR graph without materializing pair rows."""
+    offsets = np.empty(n_fibers + 1, dtype=np.int32)
+    for fiber_idx in range(n_fibers + 1):
+        offsets[fiber_idx] = fiber_idx * max(0, n_fibers - 1)
+
+    neighbors = np.empty(max(0, n_fibers * (n_fibers - 1)), dtype=np.int32)
+    cursor = 0
+    for fiber_idx in range(n_fibers):
+        for neighbor_idx in range(n_fibers):
+            if neighbor_idx != fiber_idx:
+                neighbors[cursor] = neighbor_idx
+                cursor += 1
+    return offsets, neighbors
+
+
 @njit(parallel=True, cache=True)
 def _apply_forces_per_fiber_numba(
     centers: Array,
@@ -2702,6 +2719,8 @@ class SAMLiteGenerator:
         collision_diameter_scale: Optional[float] = None,
         apply_orientation: bool = True,
         pair_rebuild_interval: int = 1,
+        static_neighbor_min_density: float = 0.45,
+        static_neighbor_max_mib: float = 64.0,
         dt_initial: float = 0.10,
         dt_max: float = 0.80,
         alpha_initial: float = 0.10,
@@ -2749,9 +2768,20 @@ class SAMLiteGenerator:
 
         center_velocity = np.zeros((n, 3), dtype=float)
         rotation_velocity = np.zeros((n, 3), dtype=float)
-        pair_cache = None
+        neighbors_initialized = False
         neighbor_offsets = np.zeros(n + 1, dtype=np.int32)
         neighbor_indices = np.empty(0, dtype=np.int32)
+        neighbor_strategy = "center_cull"
+        neighbor_density = 0.0
+        neighbor_builds = 0
+        all_pair_count = n * (n - 1) // 2
+        complete_csr_mib = (
+            n * (n - 1) * np.dtype(np.int32).itemsize / 1024.0**2
+        )
+        allow_static_neighbors = (
+            all_pair_count > 0
+            and complete_csr_mib <= max(0.0, float(static_neighbor_max_mib))
+        )
         pair_build_s = 0.0
         pair_forces_s = 0.0
         apply_updates_s = 0.0
@@ -2771,19 +2801,36 @@ class SAMLiteGenerator:
         def evaluate_forces(
             iteration: int,
         ) -> Tuple[Array, Array, float, float]:
-            nonlocal pair_cache, neighbor_offsets, neighbor_indices
+            nonlocal neighbors_initialized, neighbor_offsets, neighbor_indices
+            nonlocal neighbor_strategy, neighbor_density, neighbor_builds
             nonlocal pair_build_s, pair_forces_s, force_evaluations
 
             if (
-                pair_cache is None
-                or iteration % rebuild_interval == 0
+                not neighbors_initialized
+                or (
+                    neighbor_strategy == "center_cull"
+                    and iteration % rebuild_interval == 0
+                )
             ):
                 pair_t0 = time.perf_counter()
-                pair_cache = self.build_neighbor_pairs_vec()
-                neighbor_offsets, neighbor_indices = _pairs_to_csr_numba(
-                    pair_cache,
-                    n,
-                )
+                pairs = self.build_neighbor_pairs_vec()
+                neighbor_density = len(pairs) / max(all_pair_count, 1)
+                if (
+                    not neighbors_initialized
+                    and allow_static_neighbors
+                    and neighbor_density >= float(static_neighbor_min_density)
+                ):
+                    neighbor_offsets, neighbor_indices = (
+                        _complete_neighbor_csr_numba(n)
+                    )
+                    neighbor_strategy = "static_all_pairs"
+                else:
+                    neighbor_offsets, neighbor_indices = _pairs_to_csr_numba(
+                        pairs,
+                        n,
+                    )
+                neighbors_initialized = True
+                neighbor_builds += 1
                 pair_build_s += time.perf_counter() - pair_t0
 
             center_force = np.zeros((n, 3), dtype=float)
@@ -3014,7 +3061,8 @@ class SAMLiteGenerator:
                     alpha = alpha_start
                     n_positive = 0
                     restarts += 1
-                    pair_cache = None
+                    if neighbor_strategy == "center_cull":
+                        neighbors_initialized = False
                     (
                         center_force,
                         rotation_force,
@@ -3039,6 +3087,15 @@ class SAMLiteGenerator:
             max_overlap = float(best_overlap)
             a2_error = float(best_a2_error)
 
+        # The cached sparse graph accelerates migration; acceptance still uses
+        # an exact all-pair contact check at the returned configuration.
+        max_overlap = float(self.measure_max_overlap())
+        a2_error = float(self.orientation_error())
+        converged = bool(
+            max_overlap <= overlap_limit
+            and (not apply_orientation or a2_error <= self.tol_A)
+        )
+
         return {
             "iters": float(iterations),
             "converged": float(converged),
@@ -3047,11 +3104,144 @@ class SAMLiteGenerator:
             "best_score": float(best_score),
             "restarts": float(restarts),
             "force_evaluations": float(force_evaluations),
+            "neighbor_builds": float(neighbor_builds),
+            "neighbor_density": float(neighbor_density),
+            "static_neighbor_graph": float(
+                neighbor_strategy == "static_all_pairs"
+            ),
             "pair_build_s": float(pair_build_s),
             "pair_forces_s": float(pair_forces_s),
             "apply_updates_s": float(apply_updates_s),
             "final_dt": float(dt),
             "wall_s": float(time.perf_counter() - t0),
+        }
+
+    def compact_collision_diameter_fire_rescue(
+        self,
+        *,
+        max_iter: int = 2500,
+        target_overlap: Optional[float] = None,
+        max_restarts: int = 3,
+        restart_patience: int = 250,
+        pair_rebuild_interval: int = 4,
+        max_fiber_removals: int = 0,
+        removal_batch: int = 8,
+        max_rescue_passes: int = 3,
+        verbose: bool = False,
+    ) -> Dict[str, float]:
+        """Restore the physical diameter, then remove only blocking contacts."""
+        t0 = time.perf_counter()
+        overlap_limit = (
+            self.tol_overlap
+            if target_overlap is None
+            else max(0.0, float(target_overlap))
+        )
+        initial_scale = float(self.collision_diameter_scale)
+        total_iters = 0
+        total_restarts = 0
+        total_force_evaluations = 0
+        total_neighbor_builds = 0
+        total_pair_build_s = 0.0
+        total_pair_forces_s = 0.0
+        total_apply_updates_s = 0.0
+        total_relax_s = 0.0
+        static_neighbor_calls = 0
+        fire_calls = 0
+        removed_fibers = 0
+        best_score = math.inf
+        final_info: Dict[str, float] = {}
+
+        def run_fire(iteration_budget: int) -> Dict[str, float]:
+            nonlocal total_iters, total_restarts, total_force_evaluations
+            nonlocal total_neighbor_builds, total_pair_build_s
+            nonlocal total_pair_forces_s, total_apply_updates_s
+            nonlocal total_relax_s, static_neighbor_calls, fire_calls
+            nonlocal best_score
+            info = self.relax_collective_fire(
+                max_iter=max(1, int(iteration_budget)),
+                target_overlap=overlap_limit,
+                collision_diameter_scale=1.0,
+                apply_orientation=True,
+                pair_rebuild_interval=max(1, int(pair_rebuild_interval)),
+                max_restarts=max_restarts,
+                restart_patience=restart_patience,
+                verbose=verbose,
+            )
+            fire_calls += 1
+            total_iters += int(info.get("iters", 0.0))
+            total_restarts += int(info.get("restarts", 0.0))
+            total_force_evaluations += int(
+                info.get("force_evaluations", 0.0)
+            )
+            total_neighbor_builds += int(info.get("neighbor_builds", 0.0))
+            total_pair_build_s += float(info.get("pair_build_s", 0.0))
+            total_pair_forces_s += float(info.get("pair_forces_s", 0.0))
+            total_apply_updates_s += float(info.get("apply_updates_s", 0.0))
+            total_relax_s += float(info.get("wall_s", 0.0))
+            static_neighbor_calls += int(info.get("static_neighbor_graph", 0.0))
+            best_score = min(best_score, float(info.get("best_score", math.inf)))
+            return info
+
+        final_info = run_fire(max_iter)
+        removal_limit = max(0, int(max_fiber_removals))
+        passes = max(0, int(max_rescue_passes))
+        batch_limit = max(1, int(removal_batch))
+
+        for _ in range(passes):
+            if bool(final_info.get("converged", 0.0)):
+                break
+            remaining_removals = max(
+                0,
+                removal_limit - self._compaction_removed_fibers,
+            )
+            if remaining_removals == 0:
+                break
+            removed_now = self.drop_worst_overlapping_fibers(
+                target_overlap=overlap_limit,
+                max_remove=min(batch_limit, remaining_removals),
+            )
+            if removed_now == 0:
+                break
+            removed_fibers += removed_now
+            self._compaction_removed_fibers += removed_now
+            final_info = run_fire(max_iter)
+
+        final_overlap = float(self.measure_max_overlap())
+        final_a2_error = float(self.orientation_error())
+        converged = bool(
+            final_overlap <= overlap_limit
+            and final_a2_error <= self.tol_A
+        )
+        return {
+            "iters": float(total_iters),
+            "relax_iters": float(total_iters),
+            "converged": float(converged),
+            "final_overlap": final_overlap,
+            "final_A2_error_rel": final_a2_error,
+            "best_score": float(best_score),
+            "restarts": float(total_restarts),
+            "force_evaluations": float(total_force_evaluations),
+            "neighbor_builds": float(total_neighbor_builds),
+            "static_neighbor_calls": float(static_neighbor_calls),
+            "pair_build_s": float(total_pair_build_s),
+            "pair_forces_s": float(total_pair_forces_s),
+            "apply_updates_s": float(total_apply_updates_s),
+            "initial_scale": initial_scale,
+            "final_scale": 1.0,
+            "stages": float(fire_calls),
+            "successful_stages": float(converged),
+            "subdivisions": 0.0,
+            "stage_failures": float(fire_calls - int(converged)),
+            "initial_relax_passes": 0.0,
+            "shake_attempts": float(total_restarts),
+            "shaken_fibers": 0.0,
+            "reinsert_candidates": 0.0,
+            "reinserted_fibers": 0.0,
+            "reinsert_failures": 0.0,
+            "removed_fibers": float(removed_fibers),
+            "relax_s": float(total_relax_s),
+            "wall_s": float(time.perf_counter() - t0),
+            "collective_fire": 1.0,
         }
 
     def compact_collision_diameter_fire(
@@ -3245,14 +3435,8 @@ class SAMLiteGenerator:
         )
         max_passes = max(1, int(max_passes_per_stage))
         initial_scale = float(self.collision_diameter_scale)
-        aspect_ratio = self.fiber_length / max(self.fiber_diameter, 1e-12)
         if rotation_gain is None:
-            if aspect_ratio >= 24.0:
-                rotation_gain = 8.0
-            elif aspect_ratio >= 18.0:
-                rotation_gain = 12.0
-            else:
-                rotation_gain = 20.0
+            rotation_gain = 12.0
         scale_step_floor = (
             max(0.001, 0.5 * target_overlap / max(self._full_d_eff, 1e-12))
             if min_scale_step is None
@@ -3284,7 +3468,7 @@ class SAMLiteGenerator:
             return max(self.tau_rotate, gain * rotation_mobility_scale)
 
         initial_tau_rotate = compaction_tau_rotate(initial_scale)
-        active_fraction = 0.35 if aspect_ratio >= 24.0 else 1.0
+        active_fraction = 1.0
         total_iters = 0
         total_relax_s = 0.0
         total_pair_build_s = 0.0
