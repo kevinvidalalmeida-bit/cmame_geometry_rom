@@ -238,6 +238,33 @@ def _save_solution_fields_if_requested(
 
     load_ids = [int(value) for value in p.get("solution_field_load_ids", list(range(6)))]
     solutions = prob.output.get("sol_primal")
+    streamed_payload = prob.output.get("solution_fields_primal")
+    if (
+        consume_in_memory
+        and isinstance(streamed_payload, dict)
+        and bool(streamed_payload.get("streamed", False))
+    ):
+        saved_load_ids = [int(value) for value in streamed_payload.get("load_ids", [])]
+        requested_field_dtype = p.get("solution_field_dtype", p.get("solver_real_dtype", "float32"))
+        field_dtype = np.dtype(requested_field_dtype)
+        metadata = {
+            "load_ids": saved_load_ids,
+            "grid_shape": [int(v) for v in Ngrid],
+            "field_shape": list(streamed_payload.get("field_shape", [6, *[int(v) for v in Ngrid]])),
+            "field": "zero-mean compatible fluctuation strain in Mandel/Kelvin order used by FFTHomPy",
+            "macro_subtracted": True,
+            "saved_total_fields": False,
+            "dtype": str(field_dtype),
+            "load_description": "load0..load5 = E11,E22,E33,E23,E13,E12 unitarios en notacion Mandel",
+            "streamed": True,
+        }
+        p["_solution_fields_consumed"] = tuple(saved_load_ids)
+        return {
+            "solution_field_path": "",
+            "solution_field_format": "memory_consumer",
+            **metadata,
+        }
+
     if solutions is None:
         raise RuntimeError(
             "No hay sol_primal; activa store_solution_fields para guardar campos tangenciales."
@@ -343,8 +370,42 @@ def _save_solution_sensitivities_if_requested(
         return {}
 
     payload = prob.output.get("affine_sensitivity_primal")
-    if not isinstance(payload, dict) or "fields" not in payload:
+    if not isinstance(payload, dict):
         raise RuntimeError("No hay sensibilidades afines; activa solution_sensitivity_*.")
+
+    if "fields" not in payload:
+        if not bool(payload.get("streamed", False)):
+            raise RuntimeError("No hay campos de sensibilidad afines en memoria.")
+        coefficient_names = [
+            str(value) for value in payload.get("coefficient_names", AFFINE_SENSITIVITY_NAMES)
+        ]
+        load_ids = [int(value) for value in payload.get("load_ids", list(range(6)))]
+        consumed = tuple(
+            (int(q), int(load_id))
+            for q, load_id in payload.get("consumed", ())
+        )
+        p["_solution_sensitivities_consumed"] = consumed
+        requested_field_dtype = p.get(
+            "solution_sensitivity_dtype",
+            p.get("solution_field_dtype", p.get("solver_real_dtype", "float32")),
+        )
+        field_dtype = np.dtype(requested_field_dtype)
+        metadata = {
+            "coefficient_names": coefficient_names,
+            "load_ids": load_ids,
+            "grid_shape": [int(v) for v in Ngrid],
+            "field_shape": list(payload.get("field_shape", [6, *[int(v) for v in Ngrid]])),
+            "field": "zero-mean exact discrete sensitivity strain d(fluctuation)/dgamma_q",
+            "dtype": str(field_dtype),
+            "load_description": "load0..load5 = E11,E22,E33,E23,E13,E12 unitarios en notacion Mandel",
+            "sensitivity_summary": prob.output.get("affine_sensitivity_summary_primal", {}),
+            "streamed": True,
+        }
+        return {
+            "solution_sensitivity_path": "",
+            "solution_sensitivity_format": "memory_consumer",
+            **metadata,
+        }
 
     fields = np.asarray(payload["fields"])
     coefficient_names = [str(value) for value in payload.get("coefficient_names", AFFINE_SENSITIVITY_NAMES)]
@@ -726,6 +787,145 @@ def _build_affine_sensitivity_cfields_gpu(
             (1, 2, 0),
         )
     return cfields
+
+
+def _build_affine_sensitivity_operator_specs_gpu(
+    phase: np.ndarray,
+    ori: np.ndarray,
+    dtype: np.dtype,
+    *,
+    quantization: float = 1.0e4,
+    assign_chunk_voxels: int = _CFIELD_ASSIGN_CHUNK_VOXELS,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Build indexed sym21 operators for dA/dgamma_q on GPU.
+
+    The exact sensitivity solve only needs the action of each affine derivative
+    on a strain field.  For float32/CuPy we can reuse the indexed material
+    kernel instead of materializing seven dense (21, *N) coefficient fields.
+    """
+    if cp is None:
+        raise RuntimeError("CuPy no esta disponible para construir sensibilidades GPU.")
+    if np.dtype(dtype) != np.dtype(np.float32):
+        raise ValueError("Las sensibilidades indexadas GPU requieren float32.")
+
+    phase_arr = np.asarray(phase, dtype=np.uint8)
+    ori_arr = np.asarray(ori, dtype=np.float64)
+    Nx, Ny, Nz = phase_arr.shape
+    matrix_bases, fiber_bases = _affine_stiffness_bases()
+
+    zero = cp.zeros((1, 21), dtype=cp.float32)
+    matrix_index = cp.zeros((Nx, Ny, Nz), dtype=cp.int32)
+    matrix_idx = np.argwhere(phase_arr == 0).astype(np.int32, copy=False)
+    if matrix_idx.size:
+        matrix_idx_gpu = cp.asarray(matrix_idx, dtype=cp.int32)
+        matrix_index[
+            matrix_idx_gpu[:, 0],
+            matrix_idx_gpu[:, 1],
+            matrix_idx_gpu[:, 2],
+        ] = cp.int32(1)
+
+    specs: list[dict[str, Any]] = []
+    for q, basis in enumerate(matrix_bases):
+        values = cp.asarray(_matrix_sym21_values(basis, np, np.float32), dtype=cp.float32)
+        table = cp.ascontiguousarray(cp.concatenate((zero, values[None, :]), axis=0))
+        specs.append(
+            {
+                "storage": "sym21_indexed",
+                "name": AFFINE_SENSITIVITY_NAMES[q],
+                "index": matrix_index,
+                "table": table,
+                "phase": "matrix",
+            }
+        )
+
+    fiber_index = cp.zeros((Nx, Ny, Nz), dtype=cp.int32)
+    fiber_mask = phase_arr != 0
+    if not np.any(fiber_mask):
+        for local_q, _basis in enumerate(fiber_bases):
+            specs.append(
+                {
+                    "storage": "sym21_indexed",
+                    "name": AFFINE_SENSITIVITY_NAMES[2 + local_q],
+                    "index": fiber_index,
+                    "table": zero,
+                    "phase": "fiber",
+                }
+            )
+        bytes_estimate = _estimate_shared_array_bytes(specs)
+        return specs, 0, bytes_estimate
+
+    fiber_idx = np.argwhere(fiber_mask).astype(np.int32, copy=False)
+    inv_idx, means = _group_quantized_orientations(
+        ori_arr[fiber_mask],
+        quantization,
+    )
+    n_unique = int(len(means))
+    group_bases_cpu = np.empty((n_unique, len(fiber_bases), 21), dtype=np.float32)
+    for group_id, axis in enumerate(means):
+        rotation = rotation_matrix_from_vector(axis)
+        for local_q, basis in enumerate(fiber_bases):
+            group_bases_cpu[group_id, local_q] = _matrix_sym21_values(
+                rotate_C_mandel(basis, rotation),
+                np,
+                np.float32,
+            )
+
+    inv_idx_gpu = cp.asarray(inv_idx, dtype=cp.int32)
+    fiber_idx_gpu = cp.asarray(fiber_idx, dtype=cp.int32)
+    chunk_size = max(1, int(assign_chunk_voxels))
+    n_fiber = int(fiber_idx.shape[0])
+    for start in range(0, n_fiber, chunk_size):
+        end = min(start + chunk_size, n_fiber)
+        group_fi = fiber_idx_gpu[start:end]
+        fiber_index[group_fi[:, 0], group_fi[:, 1], group_fi[:, 2]] = (
+            inv_idx_gpu[start:end] + cp.int32(1)
+        )
+
+    group_bases_gpu = cp.asarray(group_bases_cpu, dtype=cp.float32)
+    for local_q in range(len(fiber_bases)):
+        table = cp.ascontiguousarray(
+            cp.concatenate((zero, group_bases_gpu[:, local_q, :]), axis=0)
+        )
+        specs.append(
+            {
+                "storage": "sym21_indexed",
+                "name": AFFINE_SENSITIVITY_NAMES[2 + local_q],
+                "index": fiber_index,
+                "table": table,
+                "phase": "fiber",
+            }
+        )
+
+    bytes_estimate = _estimate_shared_array_bytes(specs)
+    return specs, n_unique, bytes_estimate
+
+
+def _estimate_shared_array_bytes(items: Any) -> int:
+    """Estimate unique array payload bytes for nested specs."""
+    seen: set[int] = set()
+    total = 0
+
+    def visit(value: Any) -> None:
+        nonlocal total
+        if isinstance(value, dict):
+            for nested in value.values():
+                visit(nested)
+            return
+        if isinstance(value, (list, tuple)):
+            for nested in value:
+                visit(nested)
+            return
+        nbytes = getattr(value, "nbytes", None)
+        if nbytes is None:
+            return
+        marker = id(value)
+        if marker in seen:
+            return
+        seen.add(marker)
+        total += int(nbytes)
+
+    visit(items)
+    return int(total)
 
 
 def _build_cfield_gpu(
@@ -1196,15 +1396,37 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
 
     affine_sensitivity_cfields = None
     affine_sensitivity_build_s = 0.0
+    affine_sensitivity_storage = "none"
+    affine_sensitivity_unique_orientations = 0
+    affine_sensitivity_bytes = 0
     if solution_sensitivity_requested:
         sens_t0 = time.perf_counter()
-        if use_gpu:
+        use_indexed_sensitivities = (
+            use_gpu
+            and real_dtype == np.dtype(np.float32)
+            and bool(p.get("affine_sensitivity_indexed", True))
+        )
+        if use_indexed_sensitivities:
+            affine_sensitivity_cfields, affine_sensitivity_unique_orientations, affine_sensitivity_bytes = (
+                _build_affine_sensitivity_operator_specs_gpu(
+                    phase,
+                    ori,
+                    real_dtype,
+                    assign_chunk_voxels=cfield_assign_chunk_voxels,
+                )
+            )
+            affine_sensitivity_storage = "sym21_indexed"
+            sync_s = _sync_cupy_for_timing(gpu_timing_sync)
+            gpu_timing_sync_s += sync_s
+        elif use_gpu:
             affine_sensitivity_cfields = _build_affine_sensitivity_cfields_gpu(
                 phase,
                 ori,
                 real_dtype,
                 assign_chunk_voxels=cfield_assign_chunk_voxels,
             )
+            affine_sensitivity_storage = "sym21_full_gpu"
+            affine_sensitivity_bytes = _estimate_shared_array_bytes(affine_sensitivity_cfields)
             sync_s = _sync_cupy_for_timing(gpu_timing_sync)
             gpu_timing_sync_s += sync_s
         else:
@@ -1214,6 +1436,8 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
                 real_dtype,
                 assign_chunk_voxels=cfield_assign_chunk_voxels,
             )
+            affine_sensitivity_storage = "sym21_full_cpu"
+            affine_sensitivity_bytes = _estimate_shared_array_bytes(affine_sensitivity_cfields)
         affine_sensitivity_build_s = time.perf_counter() - sens_t0
         record_gpu_memory("after_affine_sensitivity_cfields")
 
@@ -1302,6 +1526,17 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             'fast_macro_add': bool(fast_macro_add),
             'check_macro_mean': bool(check_macro_mean),
             'store_solution_fields': bool(store_solution_fields),
+            'solution_field_consumer': (
+                p.get("solution_field_consumer")
+                if callable(p.get("solution_field_consumer")) and solution_sensitivity_requested
+                else None
+            ),
+            'solution_field_dtype': str(
+                p.get("solution_field_dtype", p.get("solver_real_dtype", solver_real_dtype))
+            ),
+            'solution_field_stream_before_sensitivity': bool(
+                callable(p.get("solution_field_consumer")) and solution_sensitivity_requested
+            ),
             'load_batch_size': int(load_batch_size),
             'postprocess_batch_size': int(postprocess_batch_size),
             'postprocess_assembly': str(postprocess_assembly),
@@ -1312,6 +1547,7 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             'partial_load_output': bool(p.get('partial_load_output', False)),
             'affine_sensitivity_cfields': affine_sensitivity_cfields,
             'affine_sensitivity_names': list(AFFINE_SENSITIVITY_NAMES),
+            'affine_sensitivity_consumer': p.get("solution_sensitivity_consumer"),
             'affine_sensitivity_batch_size': int(
                 p.get('solution_sensitivity_batch_size', load_batch_size)
             ),
@@ -1545,6 +1781,10 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             "cfield_storage": str(cfield_storage),
             "affine_sensitivity_requested": bool(solution_sensitivity_requested),
             "affine_sensitivity_build_s": float(affine_sensitivity_build_s),
+            "affine_sensitivity_storage": str(affine_sensitivity_storage),
+            "affine_sensitivity_indexed": bool(affine_sensitivity_storage == "sym21_indexed"),
+            "affine_sensitivity_unique_orientations": int(affine_sensitivity_unique_orientations),
+            "affine_sensitivity_payload_mib": float(affine_sensitivity_bytes) / (1024 ** 2),
             "cfield_rotation_batch_size": int(cfield_rotation_batch_size),
             "cfield_assign_chunk_voxels": int(cfield_assign_chunk_voxels),
             "cfield_indexed": bool(cfield_indexed),

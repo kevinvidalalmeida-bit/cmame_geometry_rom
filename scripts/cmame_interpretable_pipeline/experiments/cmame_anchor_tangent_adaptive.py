@@ -36,7 +36,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -523,16 +523,21 @@ def solve_ordered_fields(
     initial_solution_fields: Any = None,
     return_raw_fields: bool = False,
     return_sensitivity_fields: bool = False,
+    field_block_consumer: Callable[[np.ndarray], None] | None = None,
+    sensitivity_block_consumer: Callable[[int, str, np.ndarray], None] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]] | tuple[np.ndarray, dict[str, Any], np.ndarray]:
     """Solve the FOM for one material, returning reordered fields (6, 6, nvox)."""
     nvox = int(voxel_order.size)
     fields = np.empty((6, 6, nvox), dtype=basis_dtype)
     raw_fields = np.empty((6, 6, nvox), dtype=basis_dtype) if return_raw_fields else None
+    field_loads_seen: set[int] = set()
     sensitivity_fields = (
         np.empty((len(reduced.COEFF_NAMES), 6, 6, nvox), dtype=basis_dtype)
         if return_sensitivity_fields
         else None
     )
+    sensitivity_blocks: dict[int, np.ndarray] = {}
+    sensitivity_loads_seen: dict[int, set[int]] = {}
 
     def consume(load_id: int, field: np.ndarray) -> None:
         arr = np.asarray(field).reshape(6, nvox)
@@ -544,6 +549,9 @@ def solve_ordered_fields(
             axis=1,
             out=fields[int(load_id)],
         )
+        field_loads_seen.add(int(load_id))
+        if field_block_consumer is not None and field_loads_seen == set(range(6)):
+            field_block_consumer(fields)
 
     def consume_sensitivity(
         coefficient_index: int,
@@ -551,16 +559,33 @@ def solve_ordered_fields(
         load_id: int,
         field: np.ndarray,
     ) -> None:
-        del coefficient_name
-        if sensitivity_fields is None:
+        if sensitivity_fields is None and sensitivity_block_consumer is None:
             raise RuntimeError("sensitivity consumer called without storage.")
         arr = np.asarray(field).reshape(6, nvox)
+        q = int(coefficient_index)
+        iL = int(load_id)
+        if return_sensitivity_fields and sensitivity_fields is not None:
+            out = sensitivity_fields[q, iL]
+        else:
+            block = sensitivity_blocks.get(q)
+            if block is None:
+                block = np.empty((6, 6, nvox), dtype=basis_dtype)
+                sensitivity_blocks[q] = block
+                sensitivity_loads_seen[q] = set()
+            out = block[iL]
         np.take(
             arr,
             voxel_order,
             axis=1,
-            out=sensitivity_fields[int(coefficient_index), int(load_id)],
+            out=out,
         )
+        if sensitivity_block_consumer is not None:
+            sensitivity_loads_seen.setdefault(q, set()).add(iL)
+            if sensitivity_loads_seen[q] == set(range(6)):
+                block = sensitivity_blocks.pop(q)
+                sensitivity_loads_seen.pop(q, None)
+                sensitivity_block_consumer(q, str(coefficient_name), block)
+                del block
 
     material_dir = run_dir / "training_truth" / f"material_{int(material['material_id']):04d}"
     with open(Path("/dev/null"), "w", encoding="utf-8") as sink:
@@ -580,7 +605,9 @@ def solve_ordered_fields(
                     initial_solution_fields=initial_solution_fields,
                     solution_sensitivity_dtype=basis_dtype,
                     solution_sensitivity_consumer=(
-                        consume_sensitivity if return_sensitivity_fields else None
+                        consume_sensitivity
+                        if return_sensitivity_fields or sensitivity_block_consumer is not None
+                        else None
                     ),
                 )
         else:
@@ -597,7 +624,9 @@ def solve_ordered_fields(
                 initial_solution_fields=initial_solution_fields,
                 solution_sensitivity_dtype=basis_dtype,
                 solution_sensitivity_consumer=(
-                    consume_sensitivity if return_sensitivity_fields else None
+                    consume_sensitivity
+                    if return_sensitivity_fields or sensitivity_block_consumer is not None
+                    else None
                 ),
             )
     if return_raw_fields and return_sensitivity_fields:
@@ -1047,8 +1076,35 @@ def main() -> int:
         # -------------------------------------------------------------------
         # 2. FOM solve for anchor
         # -------------------------------------------------------------------
-        if str(args.tangent_method) == "sensitivity":
-            anchor_fields, anchor_record, sensitivity_fields = solve_ordered_fields(
+        old_rank = len(basis_fields)
+        appended_fields: list[np.ndarray] = []
+        basis_wall_s = 0.0
+        basis_streamed = str(args.tangent_method) == "sensitivity"
+
+        if basis_streamed:
+            def append_streamed_block(label: str, block: np.ndarray) -> None:
+                nonlocal basis_wall_s
+                started = time.perf_counter()
+                new_fields = append_block_orthonormal(
+                    existing_basis=basis_fields,
+                    new_fields=[block],
+                    tolerance=float(args.basis_tolerance),
+                )
+                appended_fields.extend(new_fields)
+                basis_wall_s += float(time.perf_counter() - started)
+                print(
+                    f"[ANCHOR-TANGENT-ADAPTIVE]   streamed basis block "
+                    f"{label}: +{len(new_fields)}",
+                    flush=True,
+                )
+
+            def consume_anchor_block(block: np.ndarray) -> None:
+                append_streamed_block("anchor", block)
+
+            def consume_sensitivity_block(q: int, name: str, block: np.ndarray) -> None:
+                append_streamed_block(f"d{name}/dgamma_{q}", block)
+
+            anchor_fields, anchor_record = solve_ordered_fields(
                 run_dir=run_dir,
                 geometry=geometry,
                 runtime=runtime,
@@ -1058,9 +1114,11 @@ def main() -> int:
                 basis_dtype=dtype,
                 voxel_order=voxel_order,
                 quiet_solver=bool(args.quiet_solver),
-                return_sensitivity_fields=True,
+                field_block_consumer=consume_anchor_block,
+                sensitivity_block_consumer=consume_sensitivity_block,
             )
             anchor_raw_fields = None
+            sensitivity_fields = None
         else:
             anchor_fields, anchor_record, anchor_raw_fields = solve_ordered_fields(
                 run_dir=run_dir,
@@ -1086,10 +1144,8 @@ def main() -> int:
         # -------------------------------------------------------------------
         # 3. Build tangent snapshots
         # -------------------------------------------------------------------
-        tangent_blocks = [anchor_fields]  # anchor itself
+        tangent_blocks = [] if basis_streamed else [anchor_fields]  # anchor itself
         if str(args.tangent_method) == "sensitivity":
-            if sensitivity_fields is None:
-                raise RuntimeError("Exact sensitivity fields were not returned.")
             step_df = pd.DataFrame([
                 {
                     "anchor_id": int(anchor_idx),
@@ -1107,9 +1163,6 @@ def main() -> int:
                 index=False,
             )
             all_step_dfs.append(step_df)
-            for q, _name in enumerate(reduced.COEFF_NAMES):
-                tangent_blocks.append(sensitivity_fields[q])
-            del sensitivity_fields
             gc.collect()
         else:
             fd_mode = str(args.fd_mode)
@@ -1172,15 +1225,15 @@ def main() -> int:
         # -------------------------------------------------------------------
         # 4. Enrich the basis using double-pass MGS
         # -------------------------------------------------------------------
-        basis_started = time.perf_counter()
-        old_rank = len(basis_fields)
-        appended_fields = append_block_orthonormal(
-            existing_basis=basis_fields,
-            new_fields=tangent_blocks,
-            tolerance=float(args.basis_tolerance),
-        )
+        if not basis_streamed:
+            basis_started = time.perf_counter()
+            appended_fields = append_block_orthonormal(
+                existing_basis=basis_fields,
+                new_fields=tangent_blocks,
+                tolerance=float(args.basis_tolerance),
+            )
+            basis_wall_s = float(time.perf_counter() - basis_started)
         new_rank = len(basis_fields)
-        basis_wall_s = float(time.perf_counter() - basis_started)
         print(
             f"[ANCHOR-TANGENT-ADAPTIVE]   basis: {old_rank} → {new_rank} "
             f"(+{new_rank - old_rank}) in {basis_wall_s:.2f}s",

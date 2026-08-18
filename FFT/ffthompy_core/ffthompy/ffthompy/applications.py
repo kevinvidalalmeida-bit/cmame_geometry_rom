@@ -7,7 +7,7 @@ from ffthompy.general.solver import linear_solver
 from ffthompy.general.solver_pp import CallBack, CallBack_GA
 from ffthompy.general.base import Timer
 from ffthompy.tensors import Tensor, DFT, Operator
-from ffthompy.tensors.fft import cupy_synchronize, to_host_array
+from ffthompy.tensors.fft import cupy_synchronize, get_array_module, to_backend_array, to_host_array
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import sys
 import sysconfig
@@ -541,12 +541,52 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
     par = dict(pb.solver)
 
     field_shape = tuple(int(v) for v in np.asarray(Nbar, dtype=int).tolist())
-    fields = np.empty((q_count, len(load_ids), D) + field_shape, dtype=np.dtype(real_dtype))
+    consumer = pb.solve.get('affine_sensitivity_consumer', None)
+    streaming = callable(consumer)
+    fields = None if streaming else np.empty(
+        (q_count, len(load_ids), D) + field_shape,
+        dtype=np.dtype(real_dtype),
+    )
     solver_infos = []
+    consumed = []
 
-    for q, cfield in enumerate(cfields):
-        cfield_array = cfield
-        cfield_shape = tuple(int(value) for value in np.shape(cfield_array))
+    def make_sensitivity_tensor(q, spec):
+        if isinstance(spec, dict):
+            storage = str(spec.get('storage', spec.get('multype', ''))).strip().lower()
+            if storage in {'sym21_indexed', 'indexed_sym21'}:
+                index = spec.get('index', None)
+                table = spec.get('table', None)
+                if index is None or table is None:
+                    raise ValueError("Descriptor sym21_indexed sin index/table.")
+                index_shape = tuple(int(value) for value in getattr(index, 'shape', ()))
+                if index_shape == field_shape:
+                    val = index[None, ...]
+                elif index_shape == (1,) + field_shape:
+                    val = index
+                else:
+                    raise ValueError(
+                        "Indice dA/dgamma incompatible: "
+                        "se esperaba (*N) o (1, *N)."
+                    )
+                tensor = Tensor(
+                    name='dA_dgamma_{0}'.format(q),
+                    val=val,
+                    order=1,
+                    N=Nbar,
+                    Y=pb.Y,
+                    multype='sym21_indexed',
+                    Fourier=False,
+                    origin=0,
+                    fft_form=fft_form,
+                )
+                tensor.material_table = table
+                return tensor
+            if 'cfield' in spec:
+                spec = spec['cfield']
+            else:
+                raise ValueError("Descriptor dA/dgamma no soportado: {0}".format(storage))
+
+        cfield_shape = tuple(int(value) for value in np.shape(spec))
         if cfield_shape[:1] == (21,):
             multype = 'sym21'
             order = 1
@@ -558,9 +598,9 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
                 "Campo dA/dgamma incompatible: "
                 "se esperaba (21, *N) o (6, 6, *N)."
             )
-        dA = Tensor(
+        return Tensor(
             name='dA_dgamma_{0}'.format(q),
-            val=cfield_array,
+            val=spec,
             order=order,
             N=Nbar,
             Y=pb.Y,
@@ -569,6 +609,17 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
             origin=0,
             fft_form=fft_form,
         )
+
+    def emit_or_store(q, storage_index, load_id, value):
+        host_value = to_host_array(value).astype(np.dtype(real_dtype), copy=False)
+        if streaming:
+            consumer(int(q), str(names[q]), int(load_id), host_value)
+            consumed.append((int(q), int(load_id)))
+        else:
+            fields[int(q), int(storage_index)] = host_value
+
+    for q, cfield in enumerate(cfields):
+        dA = make_sensitivity_tensor(q, cfield)
 
         for start in range(0, len(load_ids), batch_size):
             chunk_load_ids = load_ids[start:start + batch_size]
@@ -585,7 +636,7 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
                     par=par,
                     callback=None,
                 )
-                fields[q, start] = to_host_array(X.val).astype(np.dtype(real_dtype), copy=False)
+                emit_or_store(q, start, load_id, X.val)
                 solver_infos.append({
                     'coefficient_index': int(q),
                     'coefficient_name': str(names[q]),
@@ -594,7 +645,15 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
                 })
                 continue
 
-            val = np.stack([to_host_array(solutions[iL].val) for iL in chunk_load_ids], axis=1)
+            solution_values = [solutions[iL].val for iL in chunk_load_ids]
+            xp = get_array_module(dA.val, *solution_values)
+            if xp is np:
+                val = np.stack([to_host_array(value) for value in solution_values], axis=1)
+            else:
+                val = xp.stack(
+                    [to_backend_array(value, prefer_backend='cupy') for value in solution_values],
+                    axis=1,
+                )
             sol_batch = solutions[int(chunk_load_ids[0])].copy(
                 name='sol_total_batch',
                 val=val,
@@ -615,7 +674,7 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
             )
             x_host = to_host_array(X.val).astype(np.dtype(real_dtype), copy=False)
             for local, load_id in enumerate(chunk_load_ids):
-                fields[q, start + local] = x_host[:, local]
+                emit_or_store(q, start + local, load_id, x_host[:, local])
             solver_infos.append({
                 'coefficient_index': int(q),
                 'coefficient_name': str(names[q]),
@@ -651,12 +710,43 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
         'all_converged': bool(all(convergence_flags)) if convergence_flags else False,
         'final_norm_res_rel_max': float(max(rel_residuals)) if rel_residuals else np.nan,
         'cg_iterations_max': int(max(iterations)) if iterations else -1,
+        'streamed': bool(streaming),
     }
-    return {
-        'fields': fields,
+    output = {
         'coefficient_names': names,
         'load_ids': [int(value) for value in load_ids],
-    }, summary
+        'field_shape': [int(D)] + [int(value) for value in field_shape],
+        'streamed': bool(streaming),
+    }
+    if streaming:
+        output['consumed'] = consumed
+    else:
+        output['fields'] = fields
+    return output, summary
+
+
+def stream_primal_solution_fields_before_sensitivity(D, Nbar, pb, solutions, load_ids):
+    consumer = pb.solve.get('solution_field_consumer', None)
+    if not callable(consumer):
+        return
+    field_dtype = np.dtype(pb.solve.get('solution_field_dtype', _solver_real_dtype(pb)))
+    field_shape = tuple(int(v) for v in np.asarray(Nbar, dtype=int).tolist())
+    consumed = []
+    for load_id in load_ids:
+        load_id = int(load_id)
+        if not hasattr(solutions[load_id], 'val'):
+            raise RuntimeError("No hay solucion primal para emitir campos en streaming.")
+        total = to_host_array(solutions[load_id].val).astype(field_dtype, copy=False)
+        fluctuation = total.copy()
+        fluctuation[load_id] -= field_dtype.type(1.0)
+        consumer(load_id, fluctuation)
+        consumed.append(load_id)
+    pb.output['solution_fields_primal'] = {
+        'load_ids': consumed,
+        'field_shape': [int(D)] + [int(value) for value in field_shape],
+        'dtype': str(field_dtype),
+        'streamed': True,
+    }
 
 
 def _is_free_threaded_python():
@@ -992,6 +1082,15 @@ def elasticity(problem):
             )
             pb.output.setdefault('solver_timing', {})[primaldual] = profile_summary
             _print_timing_summary(profile_summary)
+
+        if (
+            primaldual == 'primal'
+            and pb.solve.get('affine_sensitivity_cfields', None) is not None
+            and bool(pb.solve.get('solution_field_stream_before_sensitivity', False))
+        ):
+            stream_primal_solution_fields_before_sensitivity(
+                D, Nbar, pb, solutions, load_ids_to_solve
+            )
 
         affine_sensitivity_summary = {}
         if (
