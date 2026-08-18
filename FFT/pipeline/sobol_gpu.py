@@ -190,22 +190,12 @@ SAM_CUPY_MIN_CANDIDATE_PAIRS = env_int(
     50_000,
 )
 SAM_COMPACTION = env_bool("SAM_COMPACTION", True)
-SAM_COMPACTION_MIN_VF = env_float("SAM_COMPACTION_MIN_VF", 0.25)
-SAM_COMPACTION_MIN_PACKING_LOAD = env_float(
-    "SAM_COMPACTION_MIN_PACKING_LOAD",
-    3.0,
-)
-SAM_COMPACTION_START_SCALE = env_float("SAM_COMPACTION_START_SCALE", 0.65)
-SAM_COMPACTION_MID_START_SCALE = env_float("SAM_COMPACTION_MID_START_SCALE", 0.75)
-SAM_COMPACTION_TOPUP_SCALE = env_float("SAM_COMPACTION_TOPUP_SCALE", 0.65)
+SAM_COMPACTION_START_SCALE = env_float("SAM_COMPACTION_START_SCALE", 0.50)
+SAM_COMPACTION_TOPUP_SCALE = env_float("SAM_COMPACTION_TOPUP_SCALE", 0.50)
 SAM_COMPACTION_STAGES = env_int("SAM_COMPACTION_STAGES", 6)
 SAM_COMPACTION_MAX_ITER = env_int("SAM_COMPACTION_MAX_ITER", 120)
 SAM_COMPACTION_PASSES = env_int("SAM_COMPACTION_PASSES", 2)
 SAM_COLLECTIVE_FIRE = env_bool("SAM_COLLECTIVE_FIRE", True)
-SAM_COLLECTIVE_FIRE_MIN_PACKING_LOAD = env_float(
-    "SAM_COLLECTIVE_FIRE_MIN_PACKING_LOAD",
-    3.0,
-)
 SAM_COLLECTIVE_FIRE_MAX_ITER = env_int(
     "SAM_COLLECTIVE_FIRE_MAX_ITER",
     2500,
@@ -218,7 +208,22 @@ SAM_COLLECTIVE_FIRE_RESTART_PATIENCE = env_int(
     "SAM_COLLECTIVE_FIRE_RESTART_PATIENCE",
     250,
 )
-SAM_OVERLAP_TOLERANCE = env_float("SAM_OVERLAP_TOLERANCE", 0.05)
+SAM_COLLECTIVE_FIRE_PAIR_REBUILD_INTERVAL = env_int(
+    "SAM_COLLECTIVE_FIRE_PAIR_REBUILD_INTERVAL",
+    4,
+)
+SAM_COLLECTIVE_FIRE_RESCUE_PASSES = env_int(
+    "SAM_COLLECTIVE_FIRE_RESCUE_PASSES",
+    3,
+)
+SAM_COLLECTIVE_FIRE_REMOVAL_BATCH = env_int(
+    "SAM_COLLECTIVE_FIRE_REMOVAL_BATCH",
+    8,
+)
+SAM_OVERLAP_TOLERANCE_RELATIVE = env_float(
+    "SAM_OVERLAP_TOLERANCE_RELATIVE",
+    1.0 / 120.0,
+)
 SAM_REJECT_OVERLAP_MISS = env_bool("SAM_REJECT_OVERLAP_MISS", True)
 SAM_OVERLAP_RESCUE = env_bool("SAM_OVERLAP_RESCUE", True)
 SAM_OVERLAP_RESCUE_PASSES = env_int("SAM_OVERLAP_RESCUE_PASSES", 2)
@@ -574,7 +579,10 @@ def completed_design_matches_config(
         ("sam_vf_tolerance", "sam_vf_tolerance"),
         ("sam_A2_tolerance", "sam_A2_tolerance"),
         ("sam_voxel_A2_tolerance", "sam_voxel_A2_tolerance"),
-        ("sam_overlap_tolerance", "sam_overlap_tolerance"),
+        (
+            "sam_overlap_tolerance_relative",
+            "sam_overlap_tolerance_relative",
+        ),
     )
     for row_key, config_key in float_fields:
         try:
@@ -666,20 +674,12 @@ def make_run_config() -> Dict[str, Any]:
             SAM_CUPY_MIN_CANDIDATE_PAIRS
         ),
         "sam_compaction": bool(SAM_COMPACTION),
-        "sam_compaction_min_vf": float(SAM_COMPACTION_MIN_VF),
-        "sam_compaction_min_packing_load": float(
-            SAM_COMPACTION_MIN_PACKING_LOAD
-        ),
         "sam_compaction_start_scale": float(SAM_COMPACTION_START_SCALE),
-        "sam_compaction_mid_start_scale": float(SAM_COMPACTION_MID_START_SCALE),
         "sam_compaction_topup_scale": float(SAM_COMPACTION_TOPUP_SCALE),
         "sam_compaction_stages": int(SAM_COMPACTION_STAGES),
         "sam_compaction_max_iter": int(SAM_COMPACTION_MAX_ITER),
         "sam_compaction_passes": int(SAM_COMPACTION_PASSES),
         "sam_collective_fire": bool(SAM_COLLECTIVE_FIRE),
-        "sam_collective_fire_min_packing_load": float(
-            SAM_COLLECTIVE_FIRE_MIN_PACKING_LOAD
-        ),
         "sam_collective_fire_max_iter": int(
             SAM_COLLECTIVE_FIRE_MAX_ITER
         ),
@@ -689,7 +689,18 @@ def make_run_config() -> Dict[str, Any]:
         "sam_collective_fire_restart_patience": int(
             SAM_COLLECTIVE_FIRE_RESTART_PATIENCE
         ),
-        "sam_overlap_tolerance": float(SAM_OVERLAP_TOLERANCE),
+        "sam_collective_fire_pair_rebuild_interval": int(
+            SAM_COLLECTIVE_FIRE_PAIR_REBUILD_INTERVAL
+        ),
+        "sam_collective_fire_rescue_passes": int(
+            SAM_COLLECTIVE_FIRE_RESCUE_PASSES
+        ),
+        "sam_collective_fire_removal_batch": int(
+            SAM_COLLECTIVE_FIRE_REMOVAL_BATCH
+        ),
+        "sam_overlap_tolerance_relative": float(
+            SAM_OVERLAP_TOLERANCE_RELATIVE
+        ),
         "sam_reject_overlap_miss": bool(SAM_REJECT_OVERLAP_MISS),
         "sam_overlap_rescue": bool(SAM_OVERLAP_RESCUE),
         "sam_overlap_rescue_passes": int(SAM_OVERLAP_RESCUE_PASSES),
@@ -808,28 +819,9 @@ def build_generation_params(
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
     vf_target = float(design_row["Vf_target"])
-    aspect_ratio = float(design_row["L_um"]) / max(
-        float(design_row["d_um"]),
-        1e-12,
+    compaction_start_scale = float(
+        config.get("sam_compaction_start_scale", 0.50)
     )
-    packing_load = aspect_ratio * vf_target
-    use_compaction = bool(config.get("sam_compaction", True)) and (
-        vf_target >= float(config.get("sam_compaction_min_vf", 0.30))
-        or packing_load
-        >= float(config.get("sam_compaction_min_packing_load", 3.0))
-    )
-    if aspect_ratio >= 24.0:
-        compaction_start_scale = 0.45
-    elif aspect_ratio >= 18.0:
-        compaction_start_scale = 0.50
-    elif aspect_ratio >= 12.0:
-        compaction_start_scale = float(
-            config.get("sam_compaction_start_scale", 0.64)
-        )
-    else:
-        compaction_start_scale = float(
-            config.get("sam_compaction_mid_start_scale", 0.72)
-        )
     return {
         "gap_um": 0,
         "resol": float(design_row["res"]),
@@ -873,8 +865,7 @@ def build_generation_params(
         "sam_cupy_min_candidate_pairs": int(
             config.get("sam_cupy_min_candidate_pairs", 50_000)
         ),
-        "sam_compaction": use_compaction,
-        "sam_packing_load": float(packing_load),
+        "sam_compaction": bool(config.get("sam_compaction", True)),
         "sam_compaction_start_scale": compaction_start_scale,
         "sam_compaction_topup_scale": float(compaction_start_scale),
         "sam_compaction_stages": int(config["sam_compaction_stages"]),
@@ -882,9 +873,6 @@ def build_generation_params(
         "sam_compaction_passes": int(config["sam_compaction_passes"]),
         "sam_collective_fire": bool(
             config.get("sam_collective_fire", True)
-        ),
-        "sam_collective_fire_min_packing_load": float(
-            config.get("sam_collective_fire_min_packing_load", 3.0)
         ),
         "sam_collective_fire_max_iter": int(
             config.get("sam_collective_fire_max_iter", 2500)
@@ -895,7 +883,18 @@ def build_generation_params(
         "sam_collective_fire_restart_patience": int(
             config.get("sam_collective_fire_restart_patience", 250)
         ),
-        "sam_overlap_tolerance": float(config["sam_overlap_tolerance"]),
+        "sam_collective_fire_pair_rebuild_interval": int(
+            config.get("sam_collective_fire_pair_rebuild_interval", 4)
+        ),
+        "sam_collective_fire_rescue_passes": int(
+            config.get("sam_collective_fire_rescue_passes", 3)
+        ),
+        "sam_collective_fire_removal_batch": int(
+            config.get("sam_collective_fire_removal_batch", 8)
+        ),
+        "sam_overlap_tolerance_relative": float(
+            config["sam_overlap_tolerance_relative"]
+        ),
         "sam_overlap_rescue": bool(config["sam_overlap_rescue"]),
         "sam_overlap_rescue_passes": int(config["sam_overlap_rescue_passes"]),
         "sam_overlap_rescue_max_iter": int(
@@ -1028,10 +1027,6 @@ def generate_single_seed_geometry(
             "t_gen_started_epoch_s": float(started_epoch_s),
             "t_gen_completed_epoch_s": float(time.time()),
             "generator_num_cores": int(config["generator_num_cores"]),
-            "sam_packing_load": float(
-                float(design_row.get("AR", np.nan))
-                * float(design_row.get("Vf_target", np.nan))
-            ),
         }
 
         if isinstance(gen_info, dict):
@@ -1072,6 +1067,15 @@ def generate_single_seed_geometry(
                     "sam_vf_ok": bool(gen_info.get("sam_vf_ok", True)),
                     "sam_overlap_tolerance": float(
                         gen_info.get("sam_overlap_tolerance", np.nan)
+                    ),
+                    "sam_overlap_tolerance_relative": float(
+                        gen_info.get(
+                            "sam_overlap_tolerance_relative",
+                            np.nan,
+                        )
+                    ),
+                    "sam_final_overlap_relative": float(
+                        gen_info.get("sam_final_overlap_relative", np.nan)
                     ),
                     "sam_overlap_ok": bool(gen_info.get("sam_overlap_ok", True)),
                     "sam_A2_tolerance": float(
@@ -1171,12 +1175,6 @@ def generate_single_seed_geometry(
                         gen_info.get(
                             "sam_collective_fire_mode",
                             "disabled",
-                        )
-                    ),
-                    "sam_collective_fire_min_packing_load": float(
-                        gen_info.get(
-                            "sam_collective_fire_min_packing_load",
-                            np.nan,
                         )
                     ),
                     "sam_collective_fire_calls": int(
@@ -1627,27 +1625,6 @@ class GlobalGeometryManager:
         )
 
     def _outstanding_limit(self, did: int, window: int) -> int:
-        if did == self.active_design_id:
-            return int(window)
-
-        row = self.design_rows[did]
-        packing_load = float(row["AR"]) * float(row["Vf_target"])
-        hard_threshold = float(
-            self.config.get("sam_collective_fire_min_packing_load", 3.0)
-        )
-        if packing_load >= hard_threshold:
-            return max(
-                1,
-                min(
-                    int(window),
-                    int(
-                        self.config.get(
-                            "hard_geometry_prefetch_per_design",
-                            10,
-                        )
-                    ),
-                ),
-            )
         return int(window)
 
     def _submit_next_locked(self, did: int) -> bool:
@@ -2422,6 +2399,14 @@ def build_seed_row(
         "sam_vf_tolerance": result.get("sam_vf_tolerance", np.nan),
         "sam_vf_ok": result.get("sam_vf_ok", np.nan),
         "sam_overlap_tolerance": result.get("sam_overlap_tolerance", np.nan),
+        "sam_overlap_tolerance_relative": result.get(
+            "sam_overlap_tolerance_relative",
+            np.nan,
+        ),
+        "sam_final_overlap_relative": result.get(
+            "sam_final_overlap_relative",
+            np.nan,
+        ),
         "sam_overlap_ok": result.get("sam_overlap_ok", np.nan),
         "sam_A2_tolerance": result.get("sam_A2_tolerance", np.nan),
         "sam_voxel_A2_tolerance": result.get(
@@ -2492,10 +2477,6 @@ def build_seed_row(
         ),
         "sam_collective_fire_used": result.get(
             "sam_collective_fire_used",
-            np.nan,
-        ),
-        "sam_collective_fire_min_packing_load": result.get(
-            "sam_collective_fire_min_packing_load",
             np.nan,
         ),
         "sam_collective_fire_calls": result.get(
@@ -3322,7 +3303,9 @@ def run_single_design_two_phase_online_stop(
         config["sam_voxel_A2_tolerance"]
     )
     final_row["sam_reject_A2_miss"] = bool(config["sam_reject_A2_miss"])
-    final_row["sam_overlap_tolerance"] = float(config["sam_overlap_tolerance"])
+    final_row["sam_overlap_tolerance_relative"] = float(
+        config["sam_overlap_tolerance_relative"]
+    )
     final_row["sam_reject_overlap_miss"] = bool(
         config["sam_reject_overlap_miss"]
     )

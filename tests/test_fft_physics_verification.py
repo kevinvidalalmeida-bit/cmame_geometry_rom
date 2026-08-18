@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -11,8 +12,115 @@ for path in (ROOT / "FFT", ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from pipeline.fft_solver import solve_homogenization
-import schur_energy_indicators as qoi
+from pipeline.fft_solver import _save_solution_fields_if_requested, solve_homogenization
+
+
+MANDEL_PAIRS = ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1))
+MANDEL_FACTORS = np.array((1.0, 1.0, 1.0, np.sqrt(2.0), np.sqrt(2.0), np.sqrt(2.0)))
+
+
+def test_solution_fields_can_return_in_memory_without_disk(tmp_path: Path):
+    solutions = []
+    expected = []
+    for load_id in range(6):
+        fluctuation = np.full((6, 2, 2, 2), 0.01 * (load_id + 1))
+        total = fluctuation.copy()
+        total[load_id] += 1.0
+        solutions.append(SimpleNamespace(val=total))
+        expected.append(fluctuation.astype(np.float32))
+
+    params = {
+        "solution_field_return_in_memory": True,
+        "solution_field_dtype": "float32",
+    }
+    metadata = _save_solution_fields_if_requested(
+        prob=SimpleNamespace(output={"sol_primal": solutions}),
+        Ngrid=np.array((2, 2, 2)),
+        p=params,
+    )
+
+    assert metadata["solution_field_format"] == "memory"
+    assert not list(tmp_path.iterdir())
+    actual = params["_solution_fields_result"]
+    assert len(actual) == 6
+    for actual_field, expected_field in zip(actual, expected, strict=True):
+        assert actual_field.dtype == np.float32
+        np.testing.assert_allclose(actual_field, expected_field, rtol=2.0e-6)
+
+
+def test_solution_fields_can_stream_to_consumer_without_retention(tmp_path: Path):
+    solutions = []
+    consumed = {}
+    for load_id in range(6):
+        total = np.zeros((6, 2, 2, 2), dtype=np.float64)
+        total[load_id] = 1.0 + 0.02 * (load_id + 1)
+        solutions.append(SimpleNamespace(val=total))
+
+    params = {
+        "solution_field_consumer": lambda load_id, field: consumed.__setitem__(
+            load_id, field.copy()
+        ),
+        "solution_field_dtype": "float32",
+    }
+    metadata = _save_solution_fields_if_requested(
+        prob=SimpleNamespace(output={"sol_primal": solutions}),
+        Ngrid=np.array((2, 2, 2)),
+        p=params,
+    )
+
+    assert metadata["solution_field_format"] == "memory_consumer"
+    assert params["_solution_fields_consumed"] == tuple(range(6))
+    assert "_solution_fields_result" not in params
+    assert not list(tmp_path.iterdir())
+    for load_id, field in consumed.items():
+        assert field.dtype == np.float32
+        np.testing.assert_allclose(field[load_id], 0.02 * (load_id + 1), rtol=2e-6)
+
+
+def _frequency_unit_vectors(shape: tuple[int, int, int]) -> tuple[np.ndarray, np.ndarray]:
+    grids = np.meshgrid(*[np.fft.fftfreq(size) for size in shape], indexing="ij")
+    frequency = np.asarray(grids, dtype=float)
+    norm = np.sqrt(np.sum(frequency * frequency, axis=0))
+    nonzero = norm > 0.0
+    unit = np.zeros_like(frequency)
+    unit[:, nonzero] = frequency[:, nonzero] / norm[nonzero]
+    return unit, nonzero
+
+
+def _mandel_to_tensor(field: np.ndarray, shape: tuple[int, int, int]) -> np.ndarray:
+    values = np.asarray(field).reshape(6, *shape)
+    tensor = np.empty((3, 3, *shape), dtype=values.dtype)
+    for component, (ii, jj) in enumerate(MANDEL_PAIRS):
+        tensor[ii, jj] = values[component] / MANDEL_FACTORS[component]
+        tensor[jj, ii] = tensor[ii, jj]
+    return tensor
+
+
+def _tensor_to_mandel(tensor: np.ndarray) -> np.ndarray:
+    shape = tensor.shape[2:]
+    values = np.empty((6, int(np.prod(shape))), dtype=tensor.dtype)
+    for component, (ii, jj) in enumerate(MANDEL_PAIRS):
+        values[component] = (MANDEL_FACTORS[component] * tensor[ii, jj]).reshape(-1)
+    return values
+
+
+def _project_compatible(
+    field: np.ndarray,
+    *,
+    shape: tuple[int, int, int],
+    unit: np.ndarray,
+    nonzero: np.ndarray,
+) -> np.ndarray:
+    fourier = np.fft.fftn(_mandel_to_tensor(field, shape), axes=(2, 3, 4))
+    traction = np.einsum("ijxyz,jxyz->ixyz", fourier, unit, optimize=True)
+    parallel = unit * np.einsum("ixyz,ixyz->xyz", traction, unit, optimize=True)[None]
+    displacement = 2.0 * (traction - parallel) + parallel
+    projected = 0.5 * (
+        np.einsum("ixyz,jxyz->ijxyz", unit, displacement, optimize=True)
+        + np.einsum("ixyz,jxyz->ijxyz", displacement, unit, optimize=True)
+    )
+    projected[:, :, ~nonzero] = 0.0
+    return _tensor_to_mandel(np.fft.ifftn(projected, axes=(2, 3, 4)).real)
 
 
 def isotropic_mandel(E: float, nu: float) -> np.ndarray:
@@ -107,9 +215,9 @@ def test_compatibility_equilibrium_and_hill_mandel(tmp_path: Path):
     fluctuation = np.einsum("l,lcxyz->cxyz", macro, fluctuations, optimize=True)
     assert np.linalg.norm(fluctuation.mean(axis=(1, 2, 3))) < 1.0e-12
     shape = tuple(int(value) for value in phase.shape)
-    nvec, nonzero = qoi._frequency_unit_vectors(shape)
-    compatible = qoi._project_compatible(
-        fluctuation.reshape(6, -1), shape=shape, nvec=nvec, nonzero=nonzero
+    nvec, nonzero = _frequency_unit_vectors(shape)
+    compatible = _project_compatible(
+        fluctuation.reshape(6, -1), shape=shape, unit=nvec, nonzero=nonzero
     ).reshape(fluctuation.shape)
     compatibility_error = np.linalg.norm(fluctuation - compatible) / np.linalg.norm(fluctuation)
     assert compatibility_error < 2.0e-9
@@ -120,8 +228,8 @@ def test_compatibility_equilibrium_and_hill_mandel(tmp_path: Path):
     fiber = ~matrix
     stress[:, matrix] = C0 @ total_strain[:, matrix]
     stress[:, fiber] = C1 @ total_strain[:, fiber]
-    residual = qoi._project_compatible(
-        stress.reshape(6, -1), shape=shape, nvec=nvec, nonzero=nonzero
+    residual = _project_compatible(
+        stress.reshape(6, -1), shape=shape, unit=nvec, nonzero=nonzero
     )
     equilibrium_error = np.linalg.norm(residual) / np.linalg.norm(stress)
     assert equilibrium_error < 2.0e-9

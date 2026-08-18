@@ -128,14 +128,17 @@ def _load_snapshot_matrix(
     snapshot_ids: list[int],
 ) -> tuple[np.ndarray, tuple[int, ...], float]:
     t0 = time.perf_counter()
-    fields = reduced._load_snapshot_fields(run_dir, snapshot_ids)
+    fields = reduced._load_snapshot_fields(
+        run_dir, snapshot_ids, dtype=np.float32
+    )
     if not fields:
         raise RuntimeError("No se cargaron campos snapshot.")
     snapshot_shape = tuple(int(value) for value in np.asarray(fields[0]).shape)
     matrix = np.stack(
-        [np.asarray(field, dtype=np.float64).reshape(-1) for field in fields],
+        [np.asarray(field, dtype=np.float32).reshape(-1) for field in fields],
         axis=0,
     )
+    del fields
     return matrix, snapshot_shape, float(time.perf_counter() - t0)
 
 
@@ -150,7 +153,27 @@ def _pod_basis_from_snapshot_matrix(
     timings: dict[str, float] = {}
     t0 = time.perf_counter()
     ndof = int(snapshot_matrix.shape[1])
-    gram = (snapshot_matrix @ snapshot_matrix.T) / float(ndof)
+    snapshot_count = int(snapshot_matrix.shape[0])
+    if snapshot_matrix.dtype == np.dtype(np.float64):
+        gram = (snapshot_matrix @ snapshot_matrix.T) / float(ndof)
+    else:
+        # Preserve float32 snapshot storage and accumulate the small Gram
+        # matrix in float64 through bounded spatial tiles.
+        target_bytes = 128 * 1024**2
+        chunk_size = max(
+            4096,
+            min(
+                ndof,
+                target_bytes
+                // max(snapshot_count * np.dtype(np.float64).itemsize, 1),
+            ),
+        )
+        gram = np.zeros((snapshot_count, snapshot_count), dtype=np.float64)
+        for start in range(0, ndof, int(chunk_size)):
+            end = min(start + int(chunk_size), ndof)
+            block = np.asarray(snapshot_matrix[:, start:end], dtype=np.float64)
+            gram += block @ block.T
+        gram /= float(ndof)
     gram = 0.5 * (gram + gram.T)
     timings["gram_wall_s"] = float(time.perf_counter() - t0)
 
@@ -169,7 +192,26 @@ def _pod_basis_from_snapshot_matrix(
     timings["eigendecomposition_wall_s"] = float(time.perf_counter() - t0)
 
     t0 = time.perf_counter()
-    modes_flat = (eigvecs_kept.T @ snapshot_matrix) / np.sqrt(eigvals_kept)[:, None]
+    if snapshot_matrix.dtype == np.dtype(np.float64):
+        modes_flat = (
+            eigvecs_kept.T @ snapshot_matrix
+        ) / np.sqrt(eigvals_kept)[:, None]
+    else:
+        target_bytes = 128 * 1024**2
+        chunk_size = max(
+            4096,
+            min(
+                ndof,
+                target_bytes
+                // max(len(eigvals_kept) * np.dtype(np.float64).itemsize, 1),
+            ),
+        )
+        modes_flat = np.empty((len(eigvals_kept), ndof), dtype=np.float32)
+        scale = np.sqrt(eigvals_kept)[:, None]
+        for start in range(0, ndof, int(chunk_size)):
+            end = min(start + int(chunk_size), ndof)
+            block = (eigvecs_kept.T @ snapshot_matrix[:, start:end]) / scale
+            modes_flat[:, start:end] = np.asarray(block, dtype=np.float32)
     basis = [modes_flat[ii].reshape(snapshot_shape).copy() for ii in range(modes_flat.shape[0])]
     timings["basis_reconstruction_wall_s"] = float(time.perf_counter() - t0)
 

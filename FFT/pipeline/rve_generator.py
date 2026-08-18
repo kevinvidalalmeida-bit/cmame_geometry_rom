@@ -769,6 +769,29 @@ def _export_continuous_fibers_master(
     return df, out_path
 
 
+def resolve_overlap_tolerance(
+    parameters: Dict[str, Any],
+    diameter_vox: float,
+) -> Tuple[float, float]:
+    """Return absolute voxel and diameter-relative overlap tolerances."""
+    diameter = float(diameter_vox)
+    if diameter <= 0.0:
+        raise ValueError("El diametro voxelizado debe ser positivo.")
+
+    relative_value = parameters.get("sam_overlap_tolerance_relative")
+    if relative_value is not None:
+        relative = float(relative_value)
+        absolute = relative * diameter
+    else:
+        absolute = float(
+            parameters.get("sam_overlap_tolerance", 0.01 * diameter)
+        )
+        relative = absolute / diameter
+    if absolute < 0.0:
+        raise ValueError("La tolerancia de solapamiento debe ser no negativa.")
+    return absolute, relative
+
+
 def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
     L_um = p["L_um"]
     d_um = p["d_um"]
@@ -802,18 +825,15 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
     sam_cupy_min_candidate_pairs = int(
         p.get("sam_cupy_min_candidate_pairs", 50_000)
     )
-    sam_tol_overlap = float(p.get("sam_tol_overlap", 0.05))
+    sam_overlap_tolerance, sam_overlap_tolerance_relative = (
+        resolve_overlap_tolerance(p, float(d_um) * float(resol))
+    )
     sam_max_iter_relax = int(p.get("sam_max_iter_relax", 80))
     sam_fast_mode = bool(p.get("sam_fast_mode", True))
     sam_verbose = bool(p.get("sam_verbose", True))
     sam_soft_insert = bool(p.get("sam_soft_insert", False))
-    default_soft_insert_start = 1.10
-    if Vf_target >= 0.35:
-        default_soft_insert_start = 0.60
-    elif Vf_target >= 0.30:
-        default_soft_insert_start = 0.70
     sam_soft_insert_start = float(
-        p.get("sam_soft_insert_start", default_soft_insert_start)
+        p.get("sam_soft_insert_start", 1.10)
     )
     sam_target_mode = str(p.get("sam_target_mode", "calibrated"))
     sam_inflation_samples = int(p.get("sam_inflation_samples", 2))
@@ -828,19 +848,8 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
     sam_voxel_stop_start = float(p.get("sam_voxel_stop_start", 0.60))
     sam_num_threads = int(p.get("sam_num_threads", p.get("num_cores", 1)))
     sam_compaction = bool(p.get("sam_compaction", False))
-    aspect_ratio = float(L_um) / max(float(d_um), 1e-12)
-    default_compaction_scale = 1.0
-    if Vf_target >= 0.30:
-        if aspect_ratio >= 24.0:
-            default_compaction_scale = 0.45
-        elif aspect_ratio >= 18.0:
-            default_compaction_scale = 0.50
-        elif aspect_ratio >= 12.0:
-            default_compaction_scale = 0.65
-        else:
-            default_compaction_scale = 0.75
     sam_compaction_start_scale = float(
-        p.get("sam_compaction_start_scale", default_compaction_scale)
+        p.get("sam_compaction_start_scale", 0.50)
     )
     sam_compaction_topup_scale = float(
         p.get("sam_compaction_topup_scale", sam_compaction_start_scale)
@@ -850,18 +859,14 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
         p.get("sam_compaction_max_iter", max(120, sam_max_iter_relax))
     )
     sam_compaction_passes = int(p.get("sam_compaction_passes", 2))
-    packing_load = float(p.get(
-        "sam_packing_load",
-        aspect_ratio * Vf_target,
-    ))
     sam_collective_fire = bool(p.get("sam_collective_fire", True))
-    sam_collective_fire_min_packing_load = float(
-        p.get("sam_collective_fire_min_packing_load", 3.0)
-    )
     use_collective_fire = (
         sam_compaction
         and sam_collective_fire
-        and packing_load >= sam_collective_fire_min_packing_load
+    )
+    use_hybrid_fire_rescue = (
+        use_collective_fire
+        and sam_compaction_start_scale < 1.0
     )
     sam_collective_fire_max_iter = int(
         p.get("sam_collective_fire_max_iter", 2500)
@@ -872,7 +877,15 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
     sam_collective_fire_restart_patience = int(
         p.get("sam_collective_fire_restart_patience", 250)
     )
-    sam_overlap_tolerance = float(p.get("sam_overlap_tolerance", sam_tol_overlap))
+    sam_collective_fire_pair_rebuild_interval = int(
+        p.get("sam_collective_fire_pair_rebuild_interval", 4)
+    )
+    sam_collective_fire_rescue_passes = int(
+        p.get("sam_collective_fire_rescue_passes", 3)
+    )
+    sam_collective_fire_removal_batch = int(
+        p.get("sam_collective_fire_removal_batch", 8)
+    )
     sam_overlap_rescue = bool(p.get("sam_overlap_rescue", False))
     sam_overlap_rescue_passes = int(p.get("sam_overlap_rescue_passes", 3))
     sam_overlap_rescue_max_iter = int(
@@ -884,17 +897,6 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
     sam_overlap_rescue_max_fibers = int(
         p.get("sam_overlap_rescue_max_fibers", 48)
     )
-    sam_long_fiber_vf_fallback = bool(
-        p.get(
-            "sam_long_fiber_vf_fallback",
-            sam_compaction and Vf_target >= 0.35 and aspect_ratio >= 24.0,
-        )
-    )
-    if sam_long_fiber_vf_fallback:
-        sam_compaction = False
-        use_collective_fire = False
-        sam_max_topups = max(sam_max_topups, 8)
-
     sam_use_local_relax = bool(p.get("sam_use_local_relax", True))
     sam_strict_insertion = bool(
         p.get(
@@ -904,14 +906,7 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
         )
     )
 
-    if Vf_target >= 0.35:
-        sam_max_iter_relax = max(sam_max_iter_relax, 120)
-        sam_compaction_max_iter = max(sam_compaction_max_iter, 160)
-        sam_soft_insert_start = min(sam_soft_insert_start, 0.60)
-        sam_max_topups = max(sam_max_topups, 4)
-        sam_topup_gain = max(sam_topup_gain, 1.25)
-        sam_continuous_vf_cap_factor = max(sam_continuous_vf_cap_factor, 1.18)
-    if sam_compaction or sam_long_fiber_vf_fallback:
+    if sam_compaction:
         sam_target_safety = min(sam_target_safety, 1.0)
 
     L = float(L_um * resol)
@@ -994,14 +989,12 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
         tau_rotate=sam_tau_rotate,
         w_orient=sam_w_orient,
         tol_A=sam_tol_A,
-        tol_overlap=sam_tol_overlap,
+        tol_overlap=sam_overlap_tolerance,
         max_iter_relax=sam_max_iter_relax,
         min_gap=gap,
         fast_mode=sam_fast_mode,
         use_local_relax=sam_use_local_relax,
-        strict_insertion=(
-            sam_strict_insertion or sam_compaction or sam_long_fiber_vf_fallback
-        ),
+        strict_insertion=(sam_strict_insertion or sam_compaction),
         soft_insert=sam_soft_insert,
         soft_insert_start=sam_soft_insert_start,
         seed=seed,
@@ -1013,7 +1006,7 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
         cluster_count=int(p.get("sam_cluster_count", 4)),
         cluster_sigma_rel=float(p.get("sam_cluster_sigma_rel", 0.12)),
     )
-    use_callback = bool(p.get("sam_use_voxel_stop_callback", False)) or sam_compaction
+    use_callback = bool(p.get("sam_use_voxel_stop_callback", False))
     sam_max_fiber_removals = int(
         math.floor(
             sam_vf_tolerance
@@ -1101,13 +1094,20 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
         nonlocal sam_overlap_rescue_attempts, sam_overlap_rescue_reinserted
         nonlocal sam_overlap_rescue_shaken, sam_overlap_rescue_iters
         nonlocal sam_overlap_rescue_removed
-        if use_collective_fire:
+        if use_hybrid_fire_rescue:
+            generator.set_collision_diameter_scale(insertion_scale)
+        elif use_collective_fire:
             generator.set_collision_diameter_scale(1.0)
-        elif sam_compaction or sam_long_fiber_vf_fallback:
+        elif sam_compaction:
             generator.set_collision_diameter_scale(insertion_scale)
 
         run_t0 = time.perf_counter()
-        if use_collective_fire:
+        if use_hybrid_fire_rescue:
+            generator.run(
+                verbose=verbose_run,
+                stop_callback=stop_callback if use_callback else None,
+            )
+        elif use_collective_fire:
             generator.run_collective_sam(
                 batch_vf=min(sam_batch_vf, 0.0125),
                 max_iter_per_batch=max(
@@ -1138,7 +1138,26 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
                 run_stats["n_fibers"] = float(callback_used_fibers)
                 run_stats["final_vf"] = float(generator.current_vf())
 
-        if use_collective_fire:
+        if use_hybrid_fire_rescue:
+            fire_t0 = time.perf_counter()
+            fire_info = generator.compact_collision_diameter_fire_rescue(
+                max_iter=sam_collective_fire_max_iter,
+                target_overlap=sam_overlap_tolerance,
+                max_restarts=sam_collective_fire_max_restarts,
+                restart_patience=sam_collective_fire_restart_patience,
+                pair_rebuild_interval=(
+                    sam_collective_fire_pair_rebuild_interval
+                ),
+                max_fiber_removals=sam_max_fiber_removals,
+                removal_batch=sam_collective_fire_removal_batch,
+                max_rescue_passes=sam_collective_fire_rescue_passes,
+                verbose=False,
+            )
+            fire_wall_s = time.perf_counter() - fire_t0
+            sam_collective_fire_s += fire_wall_s
+            collective_fire_history.append(dict(fire_info))
+            compact_info = dict(fire_info)
+        elif use_collective_fire:
             fire_t0 = time.perf_counter()
             fire_info = {
                 "iters": float(
@@ -1253,10 +1272,7 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
             generator.set_collision_diameter_scale(1.0)
             final_overlap = generator.measure_max_overlap()
             rescue_t0 = time.perf_counter()
-            allow_overlap_rescue = (
-                sam_overlap_rescue
-                and not sam_long_fiber_vf_fallback
-            )
+            allow_overlap_rescue = sam_overlap_rescue
             if allow_overlap_rescue and final_overlap > sam_overlap_tolerance:
                 for rescue_pass in range(max(0, sam_overlap_rescue_passes)):
                     sam_overlap_rescue_attempts += 1
@@ -1361,7 +1377,7 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
     compaction_info = run_and_compact(
         insertion_scale=(
             sam_compaction_start_scale
-            if sam_compaction or sam_long_fiber_vf_fallback
+            if sam_compaction
             else 1.0
         ),
         verbose_run=sam_verbose,
@@ -1411,7 +1427,9 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
                     max_iter=sam_collective_fire_max_iter,
                     target_overlap=sam_overlap_tolerance,
                     apply_orientation=True,
-                    pair_rebuild_interval=1,
+                    pair_rebuild_interval=(
+                        sam_collective_fire_pair_rebuild_interval
+                    ),
                     max_restarts=sam_collective_fire_max_restarts,
                     restart_patience=sam_collective_fire_restart_patience,
                     verbose=False,
@@ -1501,7 +1519,7 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
         compaction_info = run_and_compact(
             insertion_scale=(
                 sam_compaction_topup_scale
-                if sam_compaction or sam_long_fiber_vf_fallback
+                if sam_compaction
                 else 1.0
             ),
             verbose_run=False,
@@ -1643,6 +1661,8 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
             "iters",
             "restarts",
             "force_evaluations",
+            "neighbor_builds",
+            "static_neighbor_calls",
             "pair_build_s",
             "pair_forces_s",
             "apply_updates_s",
@@ -1694,6 +1714,9 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
         "sam_single_fiber_vf_quantum": float(single_fiber_vf_quantum),
         "sam_vf_ok": bool(vf_ok),
         "sam_overlap_tolerance": float(sam_overlap_tolerance),
+        "sam_overlap_tolerance_relative": float(
+            sam_overlap_tolerance_relative
+        ),
         "sam_overlap_ok": bool(overlap_ok),
         "sam_A2_tolerance": float(sam_tol_A),
         "sam_voxel_A2_tolerance": float(sam_voxel_A2_tolerance),
@@ -1714,12 +1737,15 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
         "sam_attempts": int(aggregate_run_stats.get("attempts", 0.0)),
         "sam_relax_iters": int(aggregate_run_stats.get("relax_iters", 0.0)),
         "sam_final_overlap": float(final_overlap),
+        "sam_final_overlap_relative": float(
+            final_overlap / max(d, 1e-12)
+        ),
         "sam_final_A_err": float(a2_err),
         "sam_center_distribution": str(generator.center_distribution),
         "sam_cluster_fraction": float(generator.cluster_fraction),
         "sam_cluster_count": int(generator.cluster_count),
         "sam_cluster_sigma_rel": float(generator.cluster_sigma_rel),
-        "sam_strict_insertion": bool(sam_strict_insertion),
+        "sam_strict_insertion": bool(generator.strict_insertion),
         "sam_stopped_by_callback": bool(run_stats.get("stopped_by_callback", 0.0)),
         "sam_voxel_stop_checks": int(len(voxel_stop_checks)),
         "sam_calibration_s": float(calibration_s),
@@ -1728,12 +1754,14 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
         "sam_collective_fire_configured": bool(sam_collective_fire),
         "sam_collective_fire_used": bool(collective_fire_history),
         "sam_collective_fire_mode": (
-            "sequential_soft_batch"
+            "scaled_insertion_fire_rescue"
+            if use_hybrid_fire_rescue and collective_fire_history
+            else "sequential_soft_batch"
             if collective_fire_history
             else "disabled"
         ),
-        "sam_collective_fire_min_packing_load": float(
-            sam_collective_fire_min_packing_load
+        "sam_collective_fire_pair_rebuild_interval": int(
+            sam_collective_fire_pair_rebuild_interval
         ),
         "sam_collective_fire_calls": int(len(collective_fire_history)),
         "sam_collective_fire_s": float(sam_collective_fire_s),
@@ -1746,6 +1774,15 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
         "sam_collective_fire_force_evaluations": int(
             aggregate_collective_fire_stats.get(
                 "force_evaluations",
+                0.0,
+            )
+        ),
+        "sam_collective_fire_neighbor_builds": int(
+            aggregate_collective_fire_stats.get("neighbor_builds", 0.0)
+        ),
+        "sam_collective_fire_static_neighbor_calls": int(
+            aggregate_collective_fire_stats.get(
+                "static_neighbor_calls",
                 0.0,
             )
         ),
@@ -1862,10 +1899,9 @@ def generate_rve_main(p: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "sam_use_local_relax": bool(sam_use_local_relax),
         "sam_compaction": bool(sam_compaction),
-        "sam_long_fiber_vf_fallback": bool(sam_long_fiber_vf_fallback),
         "sam_generation_strategy": (
-            "reduced_diameter_vf_fallback"
-            if sam_long_fiber_vf_fallback
+            "scaled_insertion_fire_rescue"
+            if use_hybrid_fire_rescue and collective_fire_history
             else "collective_fire"
             if collective_fire_history
             else "staged_compaction"

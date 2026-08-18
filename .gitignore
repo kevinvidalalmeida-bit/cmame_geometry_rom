@@ -4,3 +4,30 @@ __pycache__/
 .pytest_cache/
 *.pyc
 .vscode/
+
+# Python caches can appear under package/test subdirectories.
+**/__pycache__/
+*.py[cod]
+
+# LaTeX build outputs for the manuscript.
+paper/*.abs
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+paper/main.pdf
+paper/figures/sobol_pod_*_error_curve.png
+
+# Local profiling and scratch artifacts.
+*.prof
+profile_*.py
+run_profiling.sh
+screening_results.csv
+databases/
+para chat.zip
+paper/formatos/els-cas-templates/
+paper/formatos/els-cas-templates.zip

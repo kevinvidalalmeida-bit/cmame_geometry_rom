@@ -616,7 +616,7 @@ def parse_args() -> argparse.Namespace:
         default="numba",
     )
     parser.add_argument("--generator-cores", type=int, default=2)
-    parser.add_argument("--solver-tol", type=float, default=1e-3)
+    parser.add_argument("--solver-tol", type=float, default=1e-4)
     parser.add_argument(
         "--out-root",
         type=Path,
