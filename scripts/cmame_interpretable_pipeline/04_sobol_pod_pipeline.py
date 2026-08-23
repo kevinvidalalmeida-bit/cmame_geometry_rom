@@ -300,6 +300,7 @@ def append_sobol_batch(
     preserve_raw_coordinates: bool = False,
     factorized_ritz: bool = False,
     async_ritz: bool = False,
+    experimental_local_frame_ritz: bool = False,
 ) -> tuple[
     list[dict[str, Any]], dict[str, np.ndarray] | None, np.ndarray | None
 ]:
@@ -344,6 +345,18 @@ def append_sobol_batch(
         if cleanup_snapshot_fields:
             shutil.rmtree(common.snapshot_dir(run_dir, candidate_id), ignore_errors=True)
         records.append(record)
+
+    local_frame_metadata = {
+        "local_frame_backend": "disabled",
+        "local_frame_transform_wall_s": 0.0,
+        "local_frame_chunk_voxels": 0,
+        "local_frame_workspace_peak_bytes": 0,
+    }
+    if bool(experimental_local_frame_ritz):
+        local_frame_metadata = reduced._localize_snapshot_fields_inplace(
+            ordered_fields,
+            affine_stress_batch,
+        )
 
     rank_before = len(basis)
     basis_started = time.perf_counter()
@@ -498,6 +511,19 @@ def append_sobol_batch(
                 "snapshot_step_wall_s": float(record.get("solve_wall_s", 0.0))
                 + non_solve_share,
                 "basis_update_wall_s": basis_wall_s / material_count,
+                "local_frame_transform_wall_s": float(
+                    local_frame_metadata["local_frame_transform_wall_s"]
+                )
+                / material_count,
+                "local_frame_backend": str(
+                    local_frame_metadata["local_frame_backend"]
+                ),
+                "local_frame_chunk_voxels": int(
+                    local_frame_metadata["local_frame_chunk_voxels"]
+                ),
+                "local_frame_workspace_peak_bytes": int(
+                    local_frame_metadata["local_frame_workspace_peak_bytes"]
+                ),
                 "new_directions": added,
                 "basis_rank": cumulative_rank,
                 "operator_assembly_wall_s": assembly_totals["assembly_wall_s"]
@@ -1504,6 +1530,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--experimental-local-frame-ritz",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Rotate each new fiber snapshot once into its local Mandel frame "
+            "before exact factorized Ritz assembly."
+        ),
+    )
+    parser.add_argument(
+        "--experimental-gathered-factor-ritz",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Gather orientation-dependent spectral factors per voxel and use "
+            "large CUDA contractions without changing snapshot coordinates."
+        ),
+    )
+    parser.add_argument(
         "--pod-batch-max-gib",
         type=float,
         default=float(pipeline.get("pod_batch_max_gib", 8.0)),
@@ -1639,6 +1683,28 @@ def main() -> int:
         ):
             raise ValueError(
                 "async_ritz requires factorized_ritz."
+            )
+        if bool(args.experimental_local_frame_ritz) and not bool(
+            args.factorized_ritz
+        ):
+            raise ValueError(
+                "experimental_local_frame_ritz requires factorized_ritz."
+            )
+        if bool(args.experimental_local_frame_ritz) and bool(args.structural_audit):
+            raise ValueError(
+                "structural_audit is not implemented for local-frame snapshots."
+            )
+        if bool(args.experimental_gathered_factor_ritz) and not bool(
+            args.factorized_ritz
+        ):
+            raise ValueError(
+                "experimental_gathered_factor_ritz requires factorized_ritz."
+            )
+        if bool(args.experimental_gathered_factor_ritz) and bool(
+            args.experimental_local_frame_ritz
+        ):
+            raise ValueError(
+                "gathered-factor and local-frame Ritz are separate experiments."
             )
         if int(args.candidate_seed) == int(args.final_validation_seed):
             raise ValueError(
@@ -1853,6 +1919,12 @@ def main() -> int:
                     args.factorized_ritz
                 ),
                 "async_ritz": bool(args.async_ritz),
+                "experimental_local_frame_ritz": bool(
+                    args.experimental_local_frame_ritz
+                ),
+                "experimental_gathered_factor_ritz": bool(
+                    args.experimental_gathered_factor_ritz
+                ),
                 "reference_energy_qr_reference_policy": "candidate_affine_mean",
                 "reference_energy_qr_reference_coefficients": (
                     reference_energy_qr_reference
@@ -1884,12 +1956,20 @@ def main() -> int:
                 "basis_component_layout": "mandel_component_then_voxel",
                 "affine_orientation_kernel": "grouped_blocks_with_voxelwise_fallback",
                 "ritz_contraction_kernel": (
-                    "exact_factorized_gpu_async"
-                    if bool(args.async_ritz)
+                    "experimental_local_frame_factorized_gpu_async"
+                    if bool(args.experimental_local_frame_ritz)
                     else (
-                        "exact_factorized_gpu"
-                        if bool(args.factorized_ritz)
-                        else "exact_phase_supported_component_batched"
+                        "experimental_gathered_factorized_gpu_async"
+                        if bool(args.experimental_gathered_factor_ritz)
+                        else (
+                            "exact_factorized_gpu_async"
+                            if bool(args.async_ritz)
+                            else (
+                                "exact_factorized_gpu"
+                                if bool(args.factorized_ritz)
+                                else "exact_phase_supported_component_batched"
+                            )
+                        )
                     )
                 ),
                 "blas_thread_policy": str(args.blas_threads),
@@ -1918,6 +1998,8 @@ def main() -> int:
         affine = reduced.affine_stress_batch_factory(
             operator_phase,
             operator_ori,
+            local_frame_snapshots=bool(args.experimental_local_frame_ritz),
+            gathered_factor_ritz=bool(args.experimental_gathered_factor_ritz),
         )
         affine_setup_wall_s = float(time.perf_counter() - affine_started)
         reconstruction_check = reduced.affine_constitutive_reconstruction_error(
@@ -1967,6 +2049,7 @@ def main() -> int:
             "solve_wall_s": 0.0,
             "snapshot_step_wall_s": 0.0,
             "basis_update_wall_s": 0.0,
+            "local_frame_transform_wall_s": 0.0,
             "operator_assembly_wall_s": 0.0,
             "affine_stress_wall_s": 0.0,
             "ritz_contraction_wall_s": 0.0,
@@ -2010,6 +2093,9 @@ def main() -> int:
                     args.factorized_ritz
                 ),
                 async_ritz=bool(args.async_ritz),
+                experimental_local_frame_ritz=bool(
+                    args.experimental_local_frame_ritz
+                ),
             )
             snapshot_rows.extend(records)
             for record in records:
@@ -2045,6 +2131,9 @@ def main() -> int:
                         "snapshot_solve_wall_s": cumulative["solve_wall_s"],
                         "snapshot_step_wall_s": cumulative["snapshot_step_wall_s"],
                         "basis_update_wall_s": cumulative["basis_update_wall_s"],
+                        "local_frame_transform_wall_s": cumulative[
+                            "local_frame_transform_wall_s"
+                        ],
                         "operator_assembly_wall_s": cumulative[
                             "operator_assembly_wall_s"
                         ],
@@ -2095,6 +2184,9 @@ def main() -> int:
                     "snapshot_solve_wall_s": cumulative["solve_wall_s"],
                     "snapshot_step_wall_s": cumulative["snapshot_step_wall_s"],
                     "basis_update_wall_s": cumulative["basis_update_wall_s"],
+                    "local_frame_transform_wall_s": cumulative[
+                        "local_frame_transform_wall_s"
+                    ],
                     "operator_assembly_wall_s": cumulative["operator_assembly_wall_s"],
                     "affine_stress_wall_s": cumulative["affine_stress_wall_s"],
                     "ritz_contraction_wall_s": cumulative["ritz_contraction_wall_s"],
@@ -2392,6 +2484,12 @@ def main() -> int:
                     args.factorized_ritz
                 ),
                 "async_ritz": bool(args.async_ritz),
+                "experimental_local_frame_ritz": bool(
+                    args.experimental_local_frame_ritz
+                ),
+                "experimental_gathered_factor_ritz": bool(
+                    args.experimental_gathered_factor_ritz
+                ),
                 "reference_energy_qr_metadata": (
                     reference_energy_qr_metadata
                 ),
@@ -2782,6 +2880,7 @@ def main() -> int:
                 "snapshot_solve_wall_s",
                 "snapshot_step_wall_s",
                 "basis_update_wall_s",
+                "local_frame_transform_wall_s",
                 "operator_assembly_wall_s",
                 "affine_stress_wall_s",
                 "ritz_contraction_wall_s",
@@ -2930,6 +3029,12 @@ def main() -> int:
                 args.factorized_ritz
             ),
             "async_ritz_enabled": bool(args.async_ritz),
+            "experimental_local_frame_ritz_enabled": bool(
+                args.experimental_local_frame_ritz
+            ),
+            "experimental_gathered_factor_ritz_enabled": bool(
+                args.experimental_gathered_factor_ritz
+            ),
             "reference_energy_qr_reference_policy": "candidate_affine_mean",
             "reference_energy_qr_reference_coefficients": (
                 reference_energy_qr_reference

@@ -193,6 +193,33 @@ def _fiber_local_bases_axis0() -> list[np.ndarray]:
     return list(fiber_bases)
 
 
+def _mandel_rotation_matrix(rotation: np.ndarray) -> np.ndarray:
+    """Return the orthogonal Mandel map from local to global components."""
+    R = np.asarray(rotation, dtype=np.float64)
+    if R.shape != (3, 3):
+        raise ValueError("rotation must have shape (3, 3)")
+    pairs = ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1))
+    factors = np.array([1.0, 1.0, 1.0, np.sqrt(2.0), np.sqrt(2.0), np.sqrt(2.0)])
+    transform = np.empty((6, 6), dtype=np.float64)
+    for column, ((i, j), factor) in enumerate(zip(pairs, factors, strict=True)):
+        local = np.zeros((3, 3), dtype=np.float64)
+        local[i, j] = 1.0 / factor
+        local[j, i] = 1.0 / factor
+        global_tensor = R @ local @ R.T
+        transform[:, column] = np.array(
+            [
+                global_tensor[0, 0],
+                global_tensor[1, 1],
+                global_tensor[2, 2],
+                np.sqrt(2.0) * global_tensor[1, 2],
+                np.sqrt(2.0) * global_tensor[0, 2],
+                np.sqrt(2.0) * global_tensor[0, 1],
+            ],
+            dtype=np.float64,
+        )
+    return transform
+
+
 def _isotropic_compliance_bases() -> tuple[np.ndarray, np.ndarray]:
     """Two isotropic compliance bases in Mandel notation."""
     inv_e = np.eye(6, dtype=float)
@@ -328,6 +355,8 @@ def _affine_tensor_batch_factory(
     matrix_bases: tuple[np.ndarray, np.ndarray],
     fiber_local_bases: list[np.ndarray],
     coefficient_names: list[str],
+    local_frame_snapshots: bool = False,
+    gathered_factor_ritz: bool = False,
 ) -> Any:
     """Build a phase/orientation-aware affine fourth-order tensor map."""
     phase_flat = np.asarray(phase).reshape(-1)
@@ -338,19 +367,23 @@ def _affine_tensor_batch_factory(
     fiber_selector = _contiguous_selector(fiber_idx)
     fiber_group_ids = np.empty(0, dtype=np.int32)
     fiber_bases_by_group = np.empty((0, 5, 6, 6), dtype=np.float64)
+    fiber_mandel_rotations = np.empty((0, 6, 6), dtype=np.float64)
     if len(fiber_idx):
         inverse, unique_oris = _group_quantized_orientations(
             ori_flat[fiber_idx], AFFINE_ORIENTATION_QUANTIZATION
         )
         group_bases: list[np.ndarray] = []
+        group_rotations: list[np.ndarray] = []
         for axis in unique_oris:
             rotation = rotation_matrix_from_vector(axis)
+            group_rotations.append(_mandel_rotation_matrix(rotation))
             group_bases.append(np.stack(
                 [rotate_C_mandel(basis, rotation) for basis in fiber_local_bases],
                 axis=0,
             ))
         fiber_group_ids = np.asarray(inverse, dtype=np.int32)
         fiber_bases_by_group = np.stack(group_bases, axis=0)
+        fiber_mandel_rotations = np.stack(group_rotations, axis=0)
 
     q_count = len(coefficient_names)
     nvox = max(1, int(phase_flat.size))
@@ -390,6 +423,16 @@ def _affine_tensor_batch_factory(
                 "coefficient_slices": tuple(),
                 "ranks": tuple(),
             }
+        ),
+    }
+    local_exact_factorizations = {
+        "matrix": exact_factorizations["matrix"],
+        "fiber": (
+            _exact_spectral_factorization(
+                np.asarray(fiber_local_bases, dtype=np.float64)[None, ...]
+            )
+            if len(fiber_idx)
+            else exact_factorizations["fiber"]
         ),
     }
     stiffness_matrix_fast_path = tuple(coefficient_names) == tuple(COEFF_NAMES)
@@ -788,7 +831,12 @@ def _affine_tensor_batch_factory(
     apply.orientation_kernel = "grouped" if fiber_group_runs else "voxelwise"
     apply.coefficient_names = tuple(coefficient_names)
     apply.exact_factorizations = exact_factorizations
+    apply.local_exact_factorizations = local_exact_factorizations
+    apply.local_frame_snapshots = bool(local_frame_snapshots)
+    apply.gathered_factor_ritz = bool(gathered_factor_ritz)
     apply.fiber_group_ids = fiber_group_ids
+    apply.fiber_group_runs = fiber_group_runs
+    apply.fiber_mandel_rotations = fiber_mandel_rotations
     apply.apply_indices = apply_indices
     apply.apply_all = apply_all
     apply.apply_supported_chunk = apply_supported_chunk
@@ -805,6 +853,9 @@ def _affine_tensor_batch_factory(
 def affine_stress_batch_factory(
     phase: np.ndarray,
     ori: np.ndarray,
+    *,
+    local_frame_snapshots: bool = False,
+    gathered_factor_ritz: bool = False,
 ) -> Any:
     """Build the affine stiffness action used by primal Ritz compilation."""
     return _affine_tensor_batch_factory(
@@ -813,7 +864,151 @@ def affine_stress_batch_factory(
         matrix_bases=_isotropic_bases(),
         fiber_local_bases=_fiber_local_bases_axis0(),
         coefficient_names=COEFF_NAMES,
+        local_frame_snapshots=bool(local_frame_snapshots),
+        gathered_factor_ritz=bool(gathered_factor_ritz),
     )
+
+
+_LOCAL_FRAME_KERNEL_CACHE: dict[str, Any] = {}
+
+
+def _local_frame_kernel(dtype: np.dtype) -> Any:
+    """Compile the voxelwise global-to-local Mandel rotation kernel."""
+    import cupy as cp
+
+    key = np.dtype(dtype).name
+    if key not in ("float32", "float64"):
+        raise ValueError("local-frame snapshots require float32 or float64 fields")
+    if key not in _LOCAL_FRAME_KERNEL_CACHE:
+        scalar = "float" if key == "float32" else "double"
+        name = f"mandel_global_to_local_{key}"
+        source = f"""
+        extern "C" __global__
+        void {name}(
+            const {scalar}* values,
+            {scalar}* output,
+            const int* group_ids,
+            const {scalar}* rotations,
+            const int rows,
+            const int voxels)
+        {{
+            const long long index =
+                (long long)blockDim.x * blockIdx.x + threadIdx.x;
+            const long long total = (long long)rows * 6 * voxels;
+            if (index >= total) return;
+            const int voxel = (int)(index % voxels);
+            const int local_component = (int)((index / voxels) % 6);
+            const int row = (int)(index / ((long long)6 * voxels));
+            const int group = group_ids[voxel];
+            {scalar} value = ({scalar})0;
+            #pragma unroll
+            for (int global_component = 0; global_component < 6; ++global_component) {{
+                const {scalar} rotation = rotations[
+                    ((long long)group * 6 + global_component) * 6
+                    + local_component
+                ];
+                value += rotation * values[
+                    ((long long)row * 6 + global_component) * voxels + voxel
+                ];
+            }}
+            output[index] = value;
+        }}
+        """
+        _LOCAL_FRAME_KERNEL_CACHE[key] = cp.RawKernel(source, name)
+    return _LOCAL_FRAME_KERNEL_CACHE[key]
+
+
+def _localize_snapshot_fields_inplace(
+    fields: np.ndarray,
+    affine: Any,
+    *,
+    max_chunk_voxels: int = 1_000_000,
+) -> dict[str, Any]:
+    """Rotate ordered fiber snapshots once into their local Mandel frames."""
+    values = np.asarray(fields)
+    if values.ndim != 3 or values.shape[1] != 6:
+        raise ValueError("snapshot fields must have shape (r, 6, nvox)")
+    if not bool(getattr(affine, "local_frame_snapshots", False)):
+        raise ValueError("affine map is not configured for local-frame snapshots")
+    support_blocks = getattr(affine, "support_blocks", ())
+    fiber_selector = next(
+        (selector for support, _, selector in support_blocks if support == "fiber"),
+        slice(0, 0),
+    )
+    if not isinstance(fiber_selector, slice):
+        raise ValueError("local-frame snapshots require contiguous fiber support")
+    fiber_start = int(fiber_selector.start or 0)
+    fiber_stop = int(fiber_selector.stop or values.shape[2])
+    fiber_count = max(0, fiber_stop - fiber_start)
+    group_ids = np.asarray(getattr(affine, "fiber_group_ids"), dtype=np.int32)
+    rotations = np.asarray(
+        getattr(affine, "fiber_mandel_rotations"), dtype=np.float64
+    )
+    if fiber_count != len(group_ids):
+        raise ValueError("fiber group map does not match ordered snapshot fields")
+    if not fiber_count:
+        return {
+            "local_frame_backend": "none",
+            "local_frame_transform_wall_s": 0.0,
+            "local_frame_chunk_voxels": 0,
+            "local_frame_workspace_peak_bytes": 0,
+        }
+
+    started = time.perf_counter()
+    chunk_voxels = min(int(max_chunk_voxels), fiber_count)
+    workspace_peak_bytes = 0
+    backend = "cpu"
+    try:
+        import cupy as cp
+
+        cp_dtype = cp.float32 if values.dtype == np.float32 else cp.float64
+        free_bytes, _ = cp.cuda.runtime.memGetInfo()
+        bytes_per_voxel = values.shape[0] * 6 * values.dtype.itemsize * 2 + 4
+        gpu_limit = max(4096, int(0.18 * free_bytes) // max(bytes_per_voxel, 1))
+        chunk_voxels = max(4096, min(chunk_voxels, gpu_limit, fiber_count))
+        rotations_gpu = cp.asarray(rotations, dtype=cp_dtype)
+        kernel = _local_frame_kernel(values.dtype)
+        for relative_start in range(0, fiber_count, chunk_voxels):
+            relative_stop = min(relative_start + chunk_voxels, fiber_count)
+            global_start = fiber_start + relative_start
+            global_stop = fiber_start + relative_stop
+            host_chunk = np.ascontiguousarray(values[:, :, global_start:global_stop])
+            input_gpu = cp.asarray(host_chunk, dtype=cp_dtype)
+            output_gpu = cp.empty_like(input_gpu)
+            groups_gpu = cp.asarray(group_ids[relative_start:relative_stop])
+            count = int(relative_stop - relative_start)
+            total = int(values.shape[0] * 6 * count)
+            kernel(
+                ((total + 255) // 256,),
+                (256,),
+                (
+                    input_gpu,
+                    output_gpu,
+                    groups_gpu,
+                    rotations_gpu,
+                    np.int32(values.shape[0]),
+                    np.int32(count),
+                ),
+            )
+            output_gpu.get(out=host_chunk)
+            values[:, :, global_start:global_stop] = host_chunk
+            workspace_peak_bytes = max(
+                workspace_peak_bytes,
+                int(host_chunk.nbytes + input_gpu.nbytes + output_gpu.nbytes + groups_gpu.nbytes),
+            )
+            del host_chunk, input_gpu, output_gpu, groups_gpu
+        cp.cuda.get_current_stream().synchronize()
+        backend = "gpu_raw_kernel"
+    except Exception as exc:
+        raise RuntimeError(
+            "local-frame Ritz snapshot rotation requires CUDA/CuPy"
+        ) from exc
+    return {
+        "local_frame_backend": backend,
+        "local_frame_transform_wall_s": float(time.perf_counter() - started),
+        "local_frame_chunk_voxels": int(chunk_voxels),
+        "local_frame_workspace_peak_bytes": int(workspace_peak_bytes),
+    }
 
 
 def affine_compliance_batch_factory(
@@ -1455,7 +1650,17 @@ def _factorized_chunk_gpu(
     """Return exact affine Ritz contributions using constitutive-rank factors."""
     import cupy as cp
 
-    factorizations = getattr(affine, "exact_factorizations", None)
+    use_local_fiber = bool(
+        support == "fiber" and getattr(affine, "local_frame_snapshots", False)
+    )
+    use_gathered_fiber = bool(
+        support == "fiber" and getattr(affine, "gathered_factor_ritz", False)
+    )
+    factorizations = getattr(
+        affine,
+        "local_exact_factorizations" if use_local_fiber else "exact_factorizations",
+        None,
+    )
     if not isinstance(factorizations, dict) or support not in factorizations:
         raise NotImplementedError("affine map does not expose exact factorizations")
     factorization = factorizations[support]
@@ -1527,37 +1732,118 @@ def _factorized_chunk_gpu(
     sums = cp.zeros(
         (len(coefficient_slices), right.shape[0], 6), dtype=cp.float64
     )
-    for start_value, end_value in zip(starts, ends, strict=True):
-        start = int(start_value)
-        end = int(end_value)
-        group = int(group_ids[start])
-        group_factors = factors[group]
-        right_features[:, :, start:end] = cp.einsum(
+    sum_workspace_peak_bytes = 0
+    if use_local_fiber:
+        right_features[:] = cp.einsum(
             "ak,ran->rkn",
-            group_factors,
-            right[:, :, start:end],
+            factors[0],
+            right,
             optimize=True,
         )
         if left_features is not None and left is not None:
-            left_features[:, :, start:end] = cp.einsum(
+            left_features[:] = cp.einsum(
                 "ak,ran->rkn",
-                group_factors,
-                left[:, :, start:end],
+                factors[0],
+                left,
+                optimize=True,
+            )
+        rotations_cpu = np.asarray(
+            getattr(affine, "fiber_mandel_rotations"), dtype=np.float64
+        )
+        global_factors_cpu = np.einsum(
+            "gab,bk->gak",
+            rotations_cpu,
+            factors_cpu[0],
+            optimize=True,
+        )
+        rotation_cache = factorization.setdefault("_global_factor_gpu_cache", {})
+        if dtype_name not in rotation_cache:
+            compute_dtype = cp.float32 if dtype_name == "float32" else cp.float64
+            rotation_cache[dtype_name] = cp.asarray(
+                global_factors_cpu, dtype=compute_dtype
+            )
+        global_factors = rotation_cache[dtype_name]
+        group_ids_gpu = cp.asarray(group_ids)
+        for local_q, (factor_start, factor_stop) in enumerate(coefficient_slices):
+            voxel_factors = global_factors[
+                group_ids_gpu, :, factor_start:factor_stop
+            ]
+            global_stress = cp.einsum(
+                "nak,k,rkn->ran",
+                voxel_factors,
+                weights[factor_start:factor_stop],
+                right_features[:, factor_start:factor_stop],
+                optimize=True,
+            )
+            sums[local_q] = cp.sum(global_stress, axis=2, dtype=cp.float64)
+            sum_workspace_peak_bytes = max(
+                sum_workspace_peak_bytes,
+                int(voxel_factors.nbytes + global_stress.nbytes + group_ids_gpu.nbytes),
+            )
+            del voxel_factors, global_stress
+    elif use_gathered_fiber:
+        group_ids_gpu = cp.asarray(group_ids)
+        voxel_factors = factors[group_ids_gpu]
+        right_features[:] = cp.einsum(
+            "nak,ran->rkn",
+            voxel_factors,
+            right,
+            optimize=True,
+        )
+        if left_features is not None and left is not None:
+            left_features[:] = cp.einsum(
+                "nak,ran->rkn",
+                voxel_factors,
+                left,
                 optimize=True,
             )
         for local_q, (factor_start, factor_stop) in enumerate(coefficient_slices):
-            feature_sum = cp.sum(
-                right_features[:, factor_start:factor_stop, start:end],
-                axis=2,
-                dtype=cp.float64,
-            )
-            sums[local_q] += cp.einsum(
-                "ak,k,rk->ra",
-                factors64[group, :, factor_start:factor_stop],
-                weights64[factor_start:factor_stop],
-                feature_sum,
+            global_stress = cp.einsum(
+                "nak,k,rkn->ran",
+                voxel_factors[:, :, factor_start:factor_stop],
+                weights[factor_start:factor_stop],
+                right_features[:, factor_start:factor_stop],
                 optimize=True,
             )
+            sums[local_q] = cp.sum(global_stress, axis=2, dtype=cp.float64)
+            sum_workspace_peak_bytes = max(
+                sum_workspace_peak_bytes,
+                int(voxel_factors.nbytes + global_stress.nbytes + group_ids_gpu.nbytes),
+            )
+            del global_stress
+        del voxel_factors, group_ids_gpu
+    else:
+        for start_value, end_value in zip(starts, ends, strict=True):
+            start = int(start_value)
+            end = int(end_value)
+            group = int(group_ids[start])
+            group_factors = factors[group]
+            right_features[:, :, start:end] = cp.einsum(
+                "ak,ran->rkn",
+                group_factors,
+                right[:, :, start:end],
+                optimize=True,
+            )
+            if left_features is not None and left is not None:
+                left_features[:, :, start:end] = cp.einsum(
+                    "ak,ran->rkn",
+                    group_factors,
+                    left[:, :, start:end],
+                    optimize=True,
+                )
+            for local_q, (factor_start, factor_stop) in enumerate(coefficient_slices):
+                feature_sum = cp.sum(
+                    right_features[:, factor_start:factor_stop, start:end],
+                    axis=2,
+                    dtype=cp.float64,
+                )
+                sums[local_q] += cp.einsum(
+                    "ak,k,rk->ra",
+                    factors64[group, :, factor_start:factor_stop],
+                    weights64[factor_start:factor_stop],
+                    feature_sum,
+                    optimize=True,
+                )
 
     diagonal = cp.empty(
         (len(coefficient_slices), right.shape[0], right.shape[0]),
@@ -1587,7 +1873,11 @@ def _factorized_chunk_gpu(
             ).astype(cp.float64)
         del weighted, weighted_flat
 
-    workspace_bytes = int(right_features.nbytes) + weighted_peak_bytes
+    workspace_bytes = (
+        int(right_features.nbytes)
+        + weighted_peak_bytes
+        + sum_workspace_peak_bytes
+    )
     if left_features is not None:
         workspace_bytes += int(left_features.nbytes)
     return cross, diagonal, sums, workspace_bytes
@@ -1862,8 +2152,13 @@ def _factorized_raw_gpu(
         np.asarray(cp.asnumpy(diagonal_accumulator), dtype=np.float64) / float(nvox)
     )
     b_host = np.asarray(cp.asnumpy(b_accumulator), dtype=np.float64) / float(nvox)
+    rank_factorizations = (
+        getattr(affine, "local_exact_factorizations")
+        if bool(getattr(affine, "local_frame_snapshots", False))
+        else getattr(affine, "exact_factorizations")
+    )
     factorization_ranks = {
-        support: list(getattr(affine, "exact_factorizations")[support]["ranks"])
+        support: list(rank_factorizations[support]["ranks"])
         for support in ("matrix", "fiber")
     }
     snapshot_buffer_copies = 2 if bool(async_transfers) else 1
@@ -1888,6 +2183,12 @@ def _factorized_raw_gpu(
         "basis_gpu_uploads": int(basis_gpu_uploads),
         "stress_workspace_peak_bytes": int(workspace_peak_bytes),
         "gpu_resident_reduced_accumulation": True,
+        "local_frame_snapshots": bool(
+            getattr(affine, "local_frame_snapshots", False)
+        ),
+        "gathered_factor_ritz": bool(
+            getattr(affine, "gathered_factor_ritz", False)
+        ),
         "async_pinned_double_buffer": bool(asynchronous_overlap),
         "async_pinned_bytes": int(pinned_bytes),
         "gpu_snapshot_buffer_bytes": gpu_snapshot_buffer_bytes,
