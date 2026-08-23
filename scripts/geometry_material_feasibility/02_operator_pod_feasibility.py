@@ -38,7 +38,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
-from scipy.linalg import solve_triangular
 
 import cmame_campaign_common as common
 import fft_homogenization_solver as sweep
@@ -180,14 +179,13 @@ def build_common_basis(
     basis /= singular_values[:rank, None].astype(np.float32)
     basis_gram = np.asarray(basis @ basis.T, dtype=np.float64) / float(dimension)
     basis_gram = 0.5 * (basis_gram + basis_gram.T)
-    correction = np.linalg.cholesky(basis_gram)
-    basis = solve_triangular(
-        correction.astype(np.float32),
-        basis,
-        lower=True,
-        overwrite_b=True,
-        check_finite=False,
-    )
+    gram_eigenvalues, gram_eigenvectors = np.linalg.eigh(basis_gram)
+    if float(gram_eigenvalues[0]) <= 0.0:
+        raise RuntimeError("The selected common basis is not numerically positive.")
+    whitening = (
+        gram_eigenvectors / np.sqrt(gram_eigenvalues)[None, :]
+    ).T.astype(np.float32)
+    basis = whitening @ basis
     modes_wall_s = float(time.perf_counter() - modes_started)
     orthogonality = np.asarray(basis @ basis.T, dtype=np.float64) / float(dimension)
     orthogonality_error = float(

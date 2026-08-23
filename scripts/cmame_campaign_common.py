@@ -461,6 +461,10 @@ def _cached_record_is_valid(
             atol=1.0e-15,
         ):
             return False
+        if int(record.get("solver_maxiter", -1)) != int(
+            settings.get("solver_maxiter", 1000)
+        ):
+            return False
     return True
 
 
@@ -530,6 +534,7 @@ def solve_material(
             "solver_real_dtype": settings["solver_real_dtype"],
             "solver_rtol": float(settings["solver_rtol"]),
             "solver_atol": float(settings["solver_atol"]),
+            "solver_maxiter": int(settings.get("solver_maxiter", 1000)),
             "cfield_storage": "sym21",
             "cfield_indexed": settings["solver_real_dtype"] == "float32",
             "projection_storage": "direct" if settings["solver_real_dtype"] == "float32" else "full",
@@ -652,6 +657,7 @@ def solve_material(
         "solver_real_dtype": settings["solver_real_dtype"],
         "solver_rtol": float(settings["solver_rtol"]),
         "solver_atol": float(settings["solver_atol"]),
+        "solver_maxiter": int(settings.get("solver_maxiter", 1000)),
         "persistent_gpu_cache": bool(persistent_gpu_cache),
         "warm_start_used": bool(initial_solution_fields is not None),
         "solver_all_converged": all_converged,
@@ -714,6 +720,7 @@ class ContiguousBasis:
         *,
         dtype: str | np.dtype = np.float32,
         projection_row_block_size: int = 6,
+        storage_path: str | Path | None = None,
     ) -> None:
         if int(capacity) < 1:
             raise ValueError("basis capacity must be positive.")
@@ -726,7 +733,21 @@ class ContiguousBasis:
             raise ValueError("projection_row_block_size must be positive.")
         self.projection_row_block_size = int(projection_row_block_size)
         self.last_projection_backend = "not_used"
-        self._values = np.empty((int(capacity), self.dimension), dtype=self.dtype)
+        self.storage_path = (
+            None if storage_path is None else Path(storage_path).expanduser().resolve()
+        )
+        if self.storage_path is None:
+            self._values = np.empty(
+                (int(capacity), self.dimension), dtype=self.dtype
+            )
+        else:
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+            self._values = np.memmap(
+                self.storage_path,
+                mode="w+",
+                dtype=self.dtype,
+                shape=(int(capacity), self.dimension),
+            )
         self.rank = 0
 
     def __len__(self) -> int:
@@ -1058,8 +1079,13 @@ def load_operators(path: Path) -> dict[str, np.ndarray]:
         if "raw_Kq" in payload:
             ops["raw_Kq"] = np.asarray(payload["raw_Kq"], dtype=np.float64)
             ops["raw_Bq"] = np.asarray(payload["raw_Bq"], dtype=np.float64)
-            ops["G"] = np.asarray(payload["G"], dtype=np.float64)
-            ops["invR"] = np.asarray(payload["invR"], dtype=np.float64)
+            if "G" in payload:
+                ops["G"] = np.asarray(payload["G"], dtype=np.float64)
+            if "invR" in payload:
+                ops["invR"] = np.asarray(payload["invR"], dtype=np.float64)
+        for name in ("energy_qr_R", "energy_qr_reference_coefficients"):
+            if name in payload:
+                ops[name] = np.asarray(payload[name], dtype=np.float64)
         return ops
 
 _load_operators = load_operators
@@ -1077,6 +1103,10 @@ def update_reduced_operators(
     gram_rank_reveal: bool = False,
     gram_rank_rtol: float = 1.0e-11,
     contraction_compute_dtype: str | np.dtype = np.float64,
+    gram_compute_dtype: str | np.dtype = np.float64,
+    gram_backend: str = "auto",
+    overlap_cpu_gram_gpu: bool = False,
+    preserve_raw_coordinates: bool = False,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     import rom_reduced_operator as reduced
 
@@ -1090,6 +1120,10 @@ def update_reduced_operators(
             gram_rank_reveal=bool(gram_rank_reveal),
             gram_rank_rtol=float(gram_rank_rtol),
             contraction_compute_dtype=contraction_compute_dtype,
+            gram_compute_dtype=gram_compute_dtype,
+            gram_backend=str(gram_backend),
+            overlap_cpu_gram_gpu=bool(overlap_cpu_gram_gpu),
+            preserve_raw_coordinates=bool(preserve_raw_coordinates),
         )
     else:
         old_basis = basis[: -len(new_fields)]
@@ -1102,14 +1136,19 @@ def update_reduced_operators(
             gram_rank_reveal=bool(gram_rank_reveal),
             gram_rank_rtol=float(gram_rank_rtol),
             contraction_compute_dtype=contraction_compute_dtype,
+            gram_compute_dtype=gram_compute_dtype,
+            gram_backend=str(gram_backend),
+            overlap_cpu_gram_gpu=bool(overlap_cpu_gram_gpu),
+            preserve_raw_coordinates=bool(preserve_raw_coordinates),
         )
         
     ops = {"Kq": Kq, "Bq": Bq, "Dq": Dq}
     if "raw_Kq" in metadata:
         ops["raw_Kq"] = metadata["raw_Kq"]
         ops["raw_Bq"] = metadata["raw_Bq"]
-        ops["G"] = metadata["G"]
         ops["invR"] = metadata["invR"]
+        if "G" in metadata:
+            ops["G"] = metadata["G"]
         
     return ops, metadata
 

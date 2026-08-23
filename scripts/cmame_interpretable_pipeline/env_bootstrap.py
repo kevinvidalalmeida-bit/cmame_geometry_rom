@@ -49,4 +49,17 @@ def ensure_configured_venv(default_config: Path) -> None:
     bin_dir = str(venv_path / "bin")
     current_path = env.get("PATH", "")
     env["PATH"] = bin_dir if not current_path else f"{bin_dir}:{current_path}"
+    python_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    nvidia_root = venv_path / "lib" / python_version / "site-packages" / "nvidia"
+    nvidia_library_dirs = sorted(
+        str(path.resolve())
+        for path in nvidia_root.glob("*/lib")
+        if path.is_dir()
+    )
+    if nvidia_library_dirs:
+        current_library_path = env.get("LD_LIBRARY_PATH", "")
+        entries = [*nvidia_library_dirs]
+        if current_library_path:
+            entries.append(current_library_path)
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(entries)
     os.execve(str(venv_python), [str(venv_python), *sys.argv], env)

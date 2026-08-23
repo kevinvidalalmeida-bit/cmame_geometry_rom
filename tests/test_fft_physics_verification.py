@@ -12,7 +12,14 @@ for path in (ROOT / "FFT", ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from pipeline.fft_solver import _save_solution_fields_if_requested, solve_homogenization
+from pipeline.fft_solver import (
+    TI_stiffness_voigt,
+    _save_solution_fields_if_requested,
+    rotate_C_mandel,
+    rotation_matrix_from_vector,
+    solve_homogenization,
+    voigt_to_mandel,
+)
 
 
 MANDEL_PAIRS = ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1))
@@ -131,6 +138,75 @@ def isotropic_mandel(E: float, nu: float) -> np.ndarray:
     matrix[np.arange(3), np.arange(3)] += 2.0 * mu
     matrix[3:, 3:] = 2.0 * mu * np.eye(3)
     return matrix
+
+
+def test_homogeneous_isotropic_medium_returns_local_stiffness(tmp_path: Path):
+    shape = (6, 6, 6)
+    phase = np.zeros(shape, dtype=np.uint8)
+    ori = np.zeros((*shape, 3), dtype=np.float64)
+    E, nu = 7.25, 0.29
+    ceff = solve_homogenization(
+        {
+            "input_dir": str(tmp_path),
+            "seed": 11,
+            "phase_array": phase,
+            "ori_array": ori,
+            "Em": E,
+            "nu_m": nu,
+            "Ef_L": 31.0,
+            "Ef_T": 8.0,
+            "nu_LT": 0.22,
+            "nu_TT": 0.35,
+            "G_LT": 4.1,
+            "fft_backend": "scipy",
+            "solver_profile": "truth",
+            "solver_maxiter": 200,
+        }
+    )
+    expected = isotropic_mandel(E, nu)
+    relative_error = np.linalg.norm(ceff - expected) / np.linalg.norm(expected)
+    assert relative_error < 1.0e-12
+
+
+def test_homogeneous_rotated_ti_medium_returns_rotated_stiffness(tmp_path: Path):
+    shape = (6, 6, 6)
+    phase = np.ones(shape, dtype=np.uint8)
+    axis = np.array((2.0, -1.0, 3.0), dtype=np.float64)
+    axis /= np.linalg.norm(axis)
+    ori = np.broadcast_to(axis, (*shape, 3)).copy()
+    fiber = {
+        "Ef_L": 48.0,
+        "Ef_T": 13.0,
+        "nu_LT": 0.21,
+        "nu_TT": 0.37,
+        "G_LT": 5.2,
+    }
+    ceff = solve_homogenization(
+        {
+            "input_dir": str(tmp_path),
+            "seed": 12,
+            "phase_array": phase,
+            "ori_array": ori,
+            "Em": 3.0,
+            "nu_m": 0.34,
+            **fiber,
+            "fft_backend": "scipy",
+            "solver_profile": "truth",
+            "solver_maxiter": 200,
+        }
+    )
+    local = voigt_to_mandel(
+        TI_stiffness_voigt(
+            fiber["Ef_L"],
+            fiber["Ef_T"],
+            fiber["nu_LT"],
+            fiber["nu_TT"],
+            fiber["G_LT"],
+        )
+    )
+    expected = rotate_C_mandel(local, rotation_matrix_from_vector(axis))
+    relative_error = np.linalg.norm(ceff - expected) / np.linalg.norm(expected)
+    assert relative_error < 1.0e-12
 
 
 def laminate_normal_x1(C0: np.ndarray, C1: np.ndarray, vf1: float) -> np.ndarray:

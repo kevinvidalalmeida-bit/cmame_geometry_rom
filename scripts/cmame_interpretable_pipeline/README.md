@@ -41,22 +41,22 @@ Default choices:
 - Ten manual interpretable cases: baseline, low/high `Vf`, short/long `AR`, planar xy, aligned x, biased triaxial, dilute-short, dense-long.
 - Geometry resolution: `6` voxels per fiber diameter, giving `60`, `150`, and
   `240` voxels per side for the current cases. Binary voxelization is retained.
-- ROM campaign: a fixed 14-material Sobol set followed by numerical full-rank
-  POD/Ritz compilation. The solve order may change for warm starts, but the
-  selected Sobol set does not.
-- FFT precision: training and final validation use the configured `snapshot`
-  profile (`float32`, `rtol=1e-5`). Snapshot storage remains contiguous
-  `float32`. The fast CUDA compiler uses `float32` products with `float64`
-  reduced accumulation and a fixed Gram rank threshold of `1e-6`; coordinates
-  below that numerical resolution are discarded without regularization. If an
-  SPD check still fails, the same basis is rebuilt once with `float64`
-  contractions. Reduced operators and online solves remain `float64`.
-- The default fixed mode solves no preliminary monitor or calibration FOMs.
-  Reduced operators are compiled once after the 14 training materials.
-- Optional adaptive mode is enabled explicitly with `--adaptive`. It solves an
-  independent pool of `5` monitor materials once before training and reuses
-  their truth solutions at each stopping check. `--monitor-count` can override
-  that default without changing the final held-out validation set.
+- ROM campaign: adaptive Sobol-prefix training starts from two materials and
+  stops at the first maximum monitor error below `1e-4`. Five independent
+  monitor materials are solved once and never enter the snapshot matrix.
+- FFT precision: training, monitoring, and FOM timing use `float32` with
+  `rtol=1e-5`; held-out references use `float64` with `rtol=1e-6` only to
+  measure error. Snapshots and affine voxel actions use `float32`, Gram
+  products use CPU `float64`, and reduced transformations and online dense
+  solves use `float64`. No structural audit is part of the nominal campaign.
+- Gram orthonormalization uses a symmetric eigendecomposition and retains the
+  complete snapshot span. The `1e-15` machine-zero guard removed no direction
+  in the reported campaign. A failed reduced solve is reported without
+  probing, regularization, or rebuilding the frozen ROM.
+- The ROM archive and SHA-256 hash are written before the held-out design is
+  created. Twenty common validation materials are selected deterministically
+  by affine-coefficient maximin traversal of an independent 4096-point Sobol
+  pool with seed `20260901`.
 
 For example, this activates those five preliminary monitor solves:
 
@@ -64,43 +64,105 @@ For example, this activates those five preliminary monitor solves:
 python scripts/cmame_interpretable_pipeline/04_sobol_pod_pipeline.py \
   --geometry-id 9 --adaptive
 ```
-- Final validation: after freezing the ROM, solve a new independent set of
-  `5` FFT materials exactly once with `truth_profile=snapshot`. These final
-  points never control training. The output reports
-  the count and percentage with relative Frobenius error at or below `1e-4`.
+- Final validation: after freezing the ROM, solve the 20-point maximin design
+  once with the `reference` profile. These final points never control
+  training. The output reports
+  the count and percentage with relative Frobenius error at or below `1e-4`
+  and `1e-3`.
   Since `100 * 1e-4 = 0.01`, that threshold means `0.01%` relative tensor-norm
   error on each observed geometry-material pair; it is not a global-domain
   guarantee or a componentwise error bound.
-- Monotonicity: in exact arithmetic, retaining the previous Ritz basis and
-  only appending new directions makes the tensor error nonincreasing. Mixed
-  precision and finite solver tolerances can introduce small numerical
-  perturbations. The ten completed curves contained no observed increases.
-- Training limit: fixed mode uses `14` materials. Adaptive mode defaults to
-  `adaptive_training_limit=0`, meaning it continues until all five monitor
+- Monotonicity: the complete snapshot spans are nested as response blocks are
+  appended. In exact arithmetic this gives monotone Loewner convergence of
+  the Ritz--Schur operators and nonincreasing monitor errors. The first
+  crossing remains a finite-monitor heuristic rather than a domain-wide
+  guarantee.
+- Training limit: adaptive mode defaults to `adaptive_training_limit=0`,
+  meaning it continues until all five monitor
   cases meet the tolerance or the memory-safe candidate limit is reached. An
   explicit `--training-limit` overrides that behavior. Reaching such a limit
   freezes and validates the best available ROM with a warning; it is not a
   fatal pipeline error.
-- Online timing: evaluate the final ROM at `10000` independent material points.
+- Online timing: use one NumPy/OpenBLAS thread for 1,000 hot isolated queries
+  and CuPy/CUDA with resident operators for ten synchronized repetitions of
+  one 10,000-query batch. Both paths include affine-coefficient evaluation and
+  result return. Ten fresh-process CUDA cold starts are recorded separately;
+  speed-up and break-even use the lower isolated-query CPU latency.
 - Memory controls: POD and affine-stress workspaces are capped at `8 GiB`, ROM
-  batches at `1 GiB`, and exact full-rank runs must fit within 80% of available
-  host memory. The default raw-Ritz path reveals numerical rank through the
+  batches at `4 GiB`, and full-rank runs must fit within 80% of available host
+  memory. The raw-Ritz path orthonormalizes the complete span through the
   small snapshot Gram matrix and avoids a second snapshot-sized array.
-- Online backend: persistent `float64` CUDA operators and batched solves by
-  default. Use `--rom-backend auto` only when a CPU fallback is desired.
+- Online backend: one-thread CPU for isolated latency and persistent `float64`
+  CUDA operators for batched throughput.
 
-Scaling with `D = 6*Nvox` and reduced rank `r`:
+Scaling with `D = 6*Nvox`, raw snapshot count `p`, and reduced rank `r`:
 
-- Stored basis: `O(D*r)` memory. It is never written to the final run directory.
-- Exact incremental POD and K/B/D compilation: `O(D*r^2)` total work.
+- Stored raw snapshots: `O(D*p)` memory. They are discarded after compilation.
+- Incremental Gram and K/B/D compilation: `O(D*p^2)` total work.
 - Reduced operators: `O(r^2)` memory.
 - Dense online solve: `O(r^3)` work per material and `O(chunk*r^2)` workspace.
 
-The fixed pipeline consumes the prescribed Sobol training set, compiles at the
-final rank, bounds affine-coefficient and online-query workspaces, and retains
-only the final reduced operators. Intermediate voxel solutions and the POD
-basis are not written to disk. Lower asymptotic growth requires truncated POD;
-it is not enabled implicitly because it changes the model space.
+The adaptive pipeline consumes a fixed Sobol prefix, compiles the complete
+snapshot span, bounds affine-coefficient and online-query workspaces, and
+retains only the final reduced operators. Intermediate voxel solutions and
+the POD basis are not written to disk. Lower asymptotic growth would require
+truncated POD; that defines a different model and is not enabled.
+
+Additional reproducible checks are available as:
+
+```bash
+python scripts/cmame_interpretable_pipeline/07_fft_adaptation_verification.py --require-gpu
+python scripts/cmame_interpretable_pipeline/08_voxel_resolution_convergence.py
+```
+
+The second command revoxelizes the unchanged continuous masters for G08, G00,
+and G09 at 3, 4, 5, and 6 voxels per micrometre using the declared Carbon Fiber
+(290 GPa)/Resin Epoxy material and the nominal `snapshot32` profile.
+
+Rebenchmark the frozen ROMs without repeating any FFT solve:
+
+```bash
+python scripts/cmame_interpretable_pipeline/09_rom_backend_benchmark.py \
+  --summary-dir results/cmame_method/interpretable_vf05_25_ar5_20/runs/full_rank_f32f64_20260821_summary
+```
+
+This writes CPU isolated-query and CuPy/CUDA batch measurements to
+`rom_backend_benchmark.csv` and records the full protocol in the companion
+JSON file.
+
+## Data-only surrogate baselines
+
+After the ten ROMs and validation references have been frozen, compare the
+same Sobol prefixes against RBF and Kriging without running any additional FFT
+solve:
+
+```bash
+python scripts/cmame_interpretable_pipeline/06_surrogate_baselines.py \
+  --runs-root results/cmame_method/interpretable_vf05_25_ar5_20/runs \
+  --base-run-name full_rank_f32f64_20260821 \
+  --output-dir results/cmame_method/interpretable_vf05_25_ar5_20/runs/full_rank_f32f64_20260821_summary \
+  --tau-G 1e-15 \
+  --paper-figure-dir paper/figures \
+  --jobs 4
+```
+
+The benchmark uses the seven affine coefficients as inputs and the 21
+independent Mandel stiffness entries as outputs. Input ranges come only from
+the declared candidate pool. At every geometry and prefix, the RBF kernel,
+shape parameter, smoothing, and admissible polynomial degree are selected by
+minimum leave-one-out relative tensor error on that training prefix. The
+search includes linear, thin-plate, cubic, quintic, multiquadric,
+inverse-multiquadric, inverse-quadratic, and Gaussian kernels. Kriging compares
+isotropic and ARD Matern, squared-exponential, rational-quadratic, and mixed
+linear covariance families by optimized training log marginal likelihood;
+the selected family is then refitted with ten deterministic optimizer
+restarts. Neither method is selected or tuned with the 20 held-out responses.
+The detailed, learning-curve, per-geometry, global, and complete
+hyperparameter-selection records are written to the aggregated campaign
+directory. The flattened selections are available in
+`surrogate_baseline_prefix_hyperparameters.csv` and
+`surrogate_baseline_final_hyperparameters.csv`; the JSON protocol also keeps
+the scores of every Kriging covariance candidate.
 
 Smoke test:
 

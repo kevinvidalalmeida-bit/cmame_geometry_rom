@@ -28,14 +28,15 @@ RUN_DEFAULT = (
 )
 ROM_DEFAULT = RUN_DEFAULT / "rom_tangential_r36_center_m1_m2_m3_m5_m7"
 SOLVER_PROFILES = {
-    "truth": {"solver_real_dtype": "float64", "solver_rtol": 1.0e-10, "solver_atol": 0.0},
-    "snapshot": {"solver_real_dtype": "float32", "solver_rtol": 1.0e-5, "solver_atol": 0.0},
-    "reference": {"solver_real_dtype": "float64", "solver_rtol": 1.0e-6, "solver_atol": 0.0},
-    "reference32": {"solver_real_dtype": "float32", "solver_rtol": 1.0e-6, "solver_atol": 0.0},
-    "timing": {"solver_real_dtype": "float32", "solver_rtol": 1.0e-5, "solver_atol": 0.0},
+    "truth": {"solver_real_dtype": "float64", "solver_rtol": 1.0e-10, "solver_atol": 0.0, "solver_maxiter": 5000},
+    "snapshot": {"solver_real_dtype": "float64", "solver_rtol": 1.0e-5, "solver_atol": 0.0, "solver_maxiter": 5000},
+    "snapshot32": {"solver_real_dtype": "float32", "solver_rtol": 1.0e-5, "solver_atol": 0.0, "solver_maxiter": 1000},
+    "reference": {"solver_real_dtype": "float64", "solver_rtol": 1.0e-6, "solver_atol": 0.0, "solver_maxiter": 5000},
+    "reference32": {"solver_real_dtype": "float32", "solver_rtol": 1.0e-6, "solver_atol": 0.0, "solver_maxiter": 5000},
+    "timing": {"solver_real_dtype": "float64", "solver_rtol": 1.0e-5, "solver_atol": 0.0, "solver_maxiter": 5000},
     # Economical pilot mode for the declared 1e-4 ROM floor.  It is useful
     # for feasibility and timing checks; truth validation remains float64.
-    "rom_floor": {"solver_real_dtype": "float32", "solver_rtol": 1.0e-4, "solver_atol": 0.0},
+    "rom_floor": {"solver_real_dtype": "float32", "solver_rtol": 1.0e-4, "solver_atol": 0.0, "solver_maxiter": 1000},
 }
 DEFAULT_VENV_PATH = (
     Path.home() / "Documentos/ANDRES/COMPUTATIONAL_WORKSPACEV4/.venv"

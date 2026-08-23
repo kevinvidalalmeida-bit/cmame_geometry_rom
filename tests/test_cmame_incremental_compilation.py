@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pandas as pd
 import pytest
 
 
@@ -118,6 +119,23 @@ def test_contiguous_float32_basis_preserves_full_rank_subspace():
     np.testing.assert_allclose(singular_values, 1.0, rtol=3.0e-6, atol=3.0e-6)
     gram = contiguous.active_flat @ contiguous.active_flat.T / np.float32(np.prod(shape))
     np.testing.assert_allclose(gram, np.eye(12), rtol=3.0e-6, atol=3.0e-6)
+
+
+def test_contiguous_basis_supports_temporary_memmap_storage(tmp_path):
+    shape = (6, 2, 2, 2)
+    values = np.arange(3 * np.prod(shape), dtype=np.float64).reshape((3,) + shape)
+    path = tmp_path / "basis.dat"
+    basis = common.ContiguousBasis(
+        3,
+        shape,
+        dtype=np.float64,
+        storage_path=path,
+    )
+    basis.append_raw_preordered(np.ascontiguousarray(values))
+
+    assert path.is_file()
+    assert isinstance(basis._values, np.memmap)
+    np.testing.assert_array_equal(basis.active_fields, values)
 
 
 def test_contiguous_basis_accepts_preordered_blocks():
@@ -242,6 +260,7 @@ def test_float32_ritz_rank_reveal_drops_unresolved_coordinates_and_keeps_spd():
         gram_rank_reveal=True,
         gram_rank_rtol=1.0e-6,
         contraction_compute_dtype="float32",
+        gram_compute_dtype="float32",
     )
     stiffness = np.einsum("q,qij->ij", coefficients, Kq, optimize=True)
     stiffness = 0.5 * (stiffness + stiffness.T)
@@ -250,6 +269,32 @@ def test_float32_ritz_rank_reveal_drops_unresolved_coordinates_and_keeps_spd():
     assert metadata["discarded_rank"] == rank - metadata["effective_rank"]
     assert metadata["gram_transform_mode"] == "eigh_rank_reveal"
     assert metadata["contraction_compute_dtype"] == "float32"
+    assert metadata["gram_product_dtype"] == "float32"
+    assert np.linalg.eigvalsh(stiffness)[0] > 0.0
+
+
+def test_hybrid_full_rank_ritz_uses_float64_gram_and_float32_affine_products():
+    raw, phase, ori, coefficients = _ill_conditioned_raw_ritz_case(20260916)
+    rank = len(raw)
+
+    Kq, _, _, metadata = reduced._assemble_reduced_operators(
+        phase=phase,
+        ori=ori,
+        basis=raw,
+        gram_rank_reveal=True,
+        gram_rank_rtol=1.0e-15,
+        contraction_compute_dtype="float32",
+        gram_compute_dtype="float64",
+        gram_backend="cpu",
+    )
+    stiffness = np.einsum("q,qij->ij", coefficients, Kq, optimize=True)
+    stiffness = 0.5 * (stiffness + stiffness.T)
+
+    assert metadata["effective_rank"] == rank
+    assert metadata["discarded_rank"] == 0
+    assert metadata["contraction_compute_dtype"] == "float32"
+    assert metadata["gram_product_dtype"] == "float64"
+    assert metadata["gram_product_backend"] == "cpu"
     assert np.linalg.eigvalsh(stiffness)[0] > 0.0
 
 
@@ -304,6 +349,350 @@ def test_raw_ritz_incremental_extension_matches_full_assembly():
     np.testing.assert_allclose(Ki, Kf, rtol=3.0e-12, atol=3.0e-12)
     np.testing.assert_allclose(Bi, Bf, rtol=3.0e-12, atol=3.0e-12)
     np.testing.assert_allclose(Di, Df, rtol=3.0e-13, atol=3.0e-13)
+
+
+def test_incremental_raw_coordinates_skip_gram_and_energy_qr_matches_nominal():
+    rng = np.random.default_rng(20260922)
+    shape = (5, 4, 3)
+    phase = np.zeros(shape, dtype=np.uint8)
+    phase.reshape(-1)[::3] = 1
+    ori = np.zeros(shape + (3,), dtype=np.float64)
+    ori[..., 0] = 1.0
+    orthonormal = np.stack(_orthonormal_fields(rng, 10, (6,) + shape))
+    mixing = np.eye(10) + 0.03 * rng.standard_normal((10, 10))
+    raw = (mixing @ orthonormal.reshape(10, -1)).reshape(
+        orthonormal.shape
+    ).astype(np.float32)
+    order = reduced.phase_orientation_voxel_order(phase, ori)
+    ordered_phase = phase.reshape(-1)[order]
+    ordered_ori = ori.reshape(-1, 3)[order]
+    raw = np.take(raw.reshape(10, 6, -1), order, axis=2)
+    affine = reduced.affine_stress_batch_factory(ordered_phase, ordered_ori)
+    split = 6
+
+    first_Kq, first_Bq, first_Dq, first = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=raw[:split],
+        affine_stress_batch=affine,
+        contraction_compute_dtype="float32",
+        gram_compute_dtype="float64",
+        gram_backend="cpu",
+        overlap_cpu_gram_gpu=True,
+        preserve_raw_coordinates=True,
+    )
+    assert "G" not in first
+    assert first["gram_product_backend"] == "none"
+    assert first["gram_transform_mode"] == "raw_coordinates_no_gram"
+    assert first["gram_product_wall_s"] == 0.0
+    np.testing.assert_array_equal(first_Kq, first["raw_Kq"])
+    np.testing.assert_array_equal(first_Bq, first["raw_Bq"])
+
+    existing = {
+        "Kq": first_Kq,
+        "Bq": first_Bq,
+        "Dq": first_Dq,
+        "raw_Kq": first["raw_Kq"],
+        "raw_Bq": first["raw_Bq"],
+        "invR": first["invR"],
+    }
+    raw_Kq, raw_Bq, raw_Dq, raw_meta = reduced._extend_reduced_operators(
+        existing=existing,
+        old_basis=raw[:split],
+        new_basis=raw[split:],
+        affine_stress_batch=affine,
+        contraction_compute_dtype="float32",
+        gram_compute_dtype="float64",
+        gram_backend="cpu",
+        overlap_cpu_gram_gpu=True,
+        preserve_raw_coordinates=True,
+    )
+    nominal_Kq, nominal_Bq, nominal_Dq, nominal = (
+        reduced._assemble_reduced_operators(
+            phase=ordered_phase,
+            ori=ordered_ori,
+            basis=raw,
+            affine_stress_batch=affine,
+            gram_rank_reveal=True,
+            gram_rank_rtol=1.0e-15,
+            contraction_compute_dtype="float32",
+            gram_compute_dtype="float64",
+            gram_backend="cpu",
+        )
+    )
+
+    assert "G" not in raw_meta
+    assert raw_meta["gram_overlap_enabled"] is False
+    np.testing.assert_allclose(
+        raw_Kq, nominal["raw_Kq"], rtol=2.0e-6, atol=2.0e-6
+    )
+    np.testing.assert_allclose(
+        raw_Bq, nominal["raw_Bq"], rtol=2.0e-6, atol=2.0e-6
+    )
+    np.testing.assert_allclose(raw_Dq, nominal_Dq, rtol=2.0e-14, atol=2.0e-14)
+
+    reference_coefficients = reduced._material_coefficients(
+        {
+            "Em": 2.8,
+            "nu_m": 0.38,
+            "Ef_L": 220.0,
+            "Ef_T": 16.0,
+            "G_LT": 14.0,
+            "nu_LT": 0.23,
+            "nu_TT": 0.37,
+        }
+    )
+    energy, energy_meta = reduced._experimental_energy_qr_recompile(
+        raw_Kq=raw_Kq,
+        raw_Bq=raw_Bq,
+        Dq=raw_Dq,
+        reference_coefficients=reference_coefficients,
+    )
+    query_coefficients = reduced._material_coefficients(
+        {
+            "Em": 4.0,
+            "nu_m": 0.36,
+            "Ef_L": 310.0,
+            "Ef_T": 20.0,
+            "G_LT": 22.0,
+            "nu_LT": 0.21,
+            "nu_TT": 0.39,
+        }
+    )
+    nominal_effective, _, _ = reduced._rom_ceff(
+        query_coefficients, nominal_Kq, nominal_Bq, nominal_Dq
+    )
+    energy_effective, _, _ = reduced._rom_ceff(
+        query_coefficients, energy["Kq"], energy["Bq"], energy["Dq"]
+    )
+    np.testing.assert_allclose(
+        energy_effective, nominal_effective, rtol=3.0e-6, atol=3.0e-6
+    )
+    assert energy_meta["energy_qr_additional_voxel_passes"] == 0
+    assert energy_meta["energy_qr_discarded_rank"] == 0
+
+
+def test_energy_qr_archive_loads_without_snapshot_gram(tmp_path):
+    path = tmp_path / "energy_qr.npz"
+    np.savez(
+        path,
+        Kq=np.ones((2, 3, 3)),
+        Bq=np.ones((2, 3, 6)),
+        Dq=np.ones((2, 6, 6)),
+        raw_Kq=np.ones((2, 3, 3)),
+        raw_Bq=np.ones((2, 3, 6)),
+        invR=np.eye(3),
+        energy_qr_R=np.eye(3),
+        energy_qr_reference_coefficients=np.ones(2),
+    )
+
+    operators = common.load_operators(path)
+
+    assert "G" not in operators
+    np.testing.assert_array_equal(operators["energy_qr_R"], np.eye(3))
+    np.testing.assert_array_equal(
+        operators["energy_qr_reference_coefficients"], np.ones(2)
+    )
+
+
+def test_cpu_gram_gpu_overlap_matches_serial_raw_ritz_assembly():
+    rng = np.random.default_rng(20260918)
+    shape = (7, 6, 5)
+    phase = np.zeros(shape, dtype=np.uint8)
+    phase.reshape(-1)[::4] = 1
+    ori = np.zeros(shape + (3,), dtype=np.float64)
+    ori[..., 0] = 1.0
+    raw = np.stack(_orthonormal_fields(rng, 10, (6,) + shape)).astype(np.float32)
+    order = reduced.phase_orientation_voxel_order(phase, ori)
+    ordered_phase = phase.reshape(-1)[order]
+    ordered_ori = ori.reshape(-1, 3)[order]
+    raw = np.take(raw.reshape(10, 6, -1), order, axis=2)
+    affine = reduced.affine_stress_batch_factory(ordered_phase, ordered_ori)
+
+    serial_Kq, serial_Bq, serial_Dq, serial = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=raw,
+        affine_stress_batch=affine,
+        gram_rank_reveal=True,
+        gram_rank_rtol=1.0e-15,
+        contraction_compute_dtype="float32",
+        gram_compute_dtype="float64",
+        gram_backend="cpu",
+        overlap_cpu_gram_gpu=False,
+    )
+    overlap_Kq, overlap_Bq, overlap_Dq, overlap = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=raw,
+        affine_stress_batch=affine,
+        gram_rank_reveal=True,
+        gram_rank_rtol=1.0e-15,
+        contraction_compute_dtype="float32",
+        gram_compute_dtype="float64",
+        gram_backend="cpu",
+        overlap_cpu_gram_gpu=True,
+    )
+
+    np.testing.assert_allclose(overlap["G"], serial["G"], rtol=2.0e-14, atol=2.0e-14)
+    np.testing.assert_allclose(overlap["raw_Kq"], serial["raw_Kq"], rtol=1.0e-6, atol=1.0e-7)
+    np.testing.assert_allclose(overlap["raw_Bq"], serial["raw_Bq"], rtol=1.0e-6, atol=1.0e-7)
+    np.testing.assert_allclose(overlap_Kq, serial_Kq, rtol=2.0e-6, atol=2.0e-6)
+    np.testing.assert_allclose(overlap_Bq, serial_Bq, rtol=2.0e-6, atol=2.0e-6)
+    np.testing.assert_allclose(overlap_Dq, serial_Dq, rtol=2.0e-14, atol=2.0e-14)
+    assert overlap["gram_overlap_requested"] is True
+    assert serial["gram_overlap_requested"] is False
+    if overlap["gpu_affine_chunks"]:
+        assert overlap["gram_overlap_enabled"] is True
+        assert overlap["gram_overlap_used_chunks"] > 0
+        assert overlap["gram_product_wall_s"] >= overlap["gram_overlap_wait_wall_s"]
+
+    split = 6
+    first_Kq, first_Bq, first_Dq, first = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=raw[:split],
+        affine_stress_batch=affine,
+        gram_rank_reveal=True,
+        gram_rank_rtol=1.0e-15,
+        contraction_compute_dtype="float32",
+        gram_compute_dtype="float64",
+        gram_backend="cpu",
+    )
+    existing = {
+        "Kq": first_Kq,
+        "Bq": first_Bq,
+        "Dq": first_Dq,
+        "raw_Kq": first["raw_Kq"],
+        "raw_Bq": first["raw_Bq"],
+        "G": first["G"],
+        "invR": first["invR"],
+    }
+    serial_extension = reduced._extend_reduced_operators(
+        existing=existing,
+        old_basis=raw[:split],
+        new_basis=raw[split:],
+        affine_stress_batch=affine,
+        gram_rank_reveal=True,
+        gram_rank_rtol=1.0e-15,
+        contraction_compute_dtype="float32",
+        gram_compute_dtype="float64",
+        gram_backend="cpu",
+        overlap_cpu_gram_gpu=False,
+    )
+    overlap_extension = reduced._extend_reduced_operators(
+        existing=existing,
+        old_basis=raw[:split],
+        new_basis=raw[split:],
+        affine_stress_batch=affine,
+        gram_rank_reveal=True,
+        gram_rank_rtol=1.0e-15,
+        contraction_compute_dtype="float32",
+        gram_compute_dtype="float64",
+        gram_backend="cpu",
+        overlap_cpu_gram_gpu=True,
+    )
+    for serial_value, overlap_value in zip(
+        serial_extension[:3], overlap_extension[:3], strict=True
+    ):
+        np.testing.assert_allclose(overlap_value, serial_value, rtol=2.0e-6, atol=2.0e-6)
+    serial_meta = serial_extension[3]
+    overlap_meta = overlap_extension[3]
+    np.testing.assert_allclose(overlap_meta["G"], serial_meta["G"], rtol=2.0e-14, atol=2.0e-14)
+    if overlap_meta["gpu_affine_chunks"]:
+        assert overlap_meta["gram_overlap_enabled"] is True
+
+
+def test_experimental_blocked_tsqr_matches_direct_householder_qr():
+    rng = np.random.default_rng(20260920)
+    rank, nvox, q_count = 9, 41, 3
+    basis = rng.standard_normal((rank, 6, nvox))
+    flat = basis.reshape(rank, -1)
+    gram = flat @ flat.T / float(nvox)
+    raw_Kq = np.empty((q_count, rank, rank), dtype=np.float64)
+    raw_Bq = rng.standard_normal((q_count, rank, 6))
+    Dq = np.empty((q_count, 6, 6), dtype=np.float64)
+    for q in range(q_count):
+        factor = rng.standard_normal((rank, rank))
+        raw_Kq[q] = factor.T @ factor + np.eye(rank)
+        macro = rng.standard_normal((6, 6))
+        Dq[q] = macro.T @ macro + np.eye(6)
+
+    qr_operators, metadata = reduced._experimental_tsqr_recompile(
+        basis=basis,
+        raw_Kq=raw_Kq,
+        raw_Bq=raw_Bq,
+        Dq=Dq,
+        G=gram,
+        nvox=nvox,
+        block_max_gib=1.0e-5,
+    )
+
+    tall = flat.T / np.sqrt(float(nvox))
+    _, direct_R = np.linalg.qr(tall, mode="reduced")
+    signs = np.where(np.diag(direct_R) < 0.0, -1.0, 1.0)
+    direct_R *= signs[:, None]
+    direct_T = np.linalg.solve(direct_R.T, np.eye(rank))
+    direct_Kq = np.empty_like(raw_Kq)
+    direct_Bq = np.empty_like(raw_Bq)
+    for q in range(q_count):
+        direct_Kq[q] = direct_T @ raw_Kq[q] @ direct_T.T
+        direct_Kq[q] = 0.5 * (direct_Kq[q] + direct_Kq[q].T)
+        direct_Bq[q] = direct_T @ raw_Bq[q]
+
+    np.testing.assert_allclose(qr_operators["R"], direct_R, rtol=2.0e-13, atol=2.0e-13)
+    np.testing.assert_allclose(qr_operators["Kq"], direct_Kq, rtol=3.0e-13, atol=3.0e-13)
+    np.testing.assert_allclose(qr_operators["Bq"], direct_Bq, rtol=3.0e-13, atol=3.0e-13)
+    np.testing.assert_allclose(qr_operators["Dq"], Dq, rtol=0.0, atol=0.0)
+    assert metadata["qr_block_count"] > 1
+    assert metadata["qr_forms_explicit_q"] is False
+    assert metadata["qr_discarded_rank"] == 0
+    assert metadata["qr_orthogonality_frobenius_error"] < 1.0e-12
+    assert metadata["qr_gram_reconstruction_relative_error"] < 1.0e-13
+    assert metadata["qr_estimated_peak_temporary_bytes"] <= int(1.0e-5 * 1024**3)
+
+
+def test_experimental_energy_qr_preserves_full_ritz_operator():
+    rng = np.random.default_rng(20260921)
+    q_count, rank = 4, 11
+    raw_Kq = np.empty((q_count, rank, rank), dtype=np.float64)
+    raw_Bq = rng.standard_normal((q_count, rank, 6))
+    Dq = np.empty((q_count, 6, 6), dtype=np.float64)
+    for q in range(q_count):
+        factor = rng.standard_normal((rank, rank))
+        raw_Kq[q] = factor.T @ factor + (q + 1.0) * np.eye(rank)
+        macro = rng.standard_normal((6, 6))
+        Dq[q] = macro.T @ macro + np.eye(6)
+    reference_coefficients = 0.5 + rng.random(q_count)
+
+    operators, metadata = reduced._experimental_energy_qr_recompile(
+        raw_Kq=raw_Kq,
+        raw_Bq=raw_Bq,
+        Dq=Dq,
+        reference_coefficients=reference_coefficients,
+    )
+
+    normalized_reference = np.einsum(
+        "q,qij->ij", reference_coefficients, operators["Kq"], optimize=True
+    )
+    np.testing.assert_allclose(
+        normalized_reference, np.eye(rank), rtol=2.0e-13, atol=2.0e-13
+    )
+    query_coefficients = 0.5 + rng.random(q_count)
+    raw_effective, _, _ = reduced._rom_ceff(
+        query_coefficients, raw_Kq, raw_Bq, Dq
+    )
+    energy_effective, _, _ = reduced._rom_ceff(
+        query_coefficients, operators["Kq"], operators["Bq"], operators["Dq"]
+    )
+    np.testing.assert_allclose(
+        energy_effective, raw_effective, rtol=5.0e-13, atol=5.0e-13
+    )
+    assert metadata["energy_qr_forms_explicit_q"] is False
+    assert metadata["energy_qr_uses_snapshot_gram"] is False
+    assert metadata["energy_qr_additional_voxel_passes"] == 0
+    assert metadata["energy_qr_discarded_rank"] == 0
+    assert metadata["energy_qr_reference_identity_spectral_error"] < 1.0e-12
 
 
 def test_contiguous_basis_blocked_projection_preserves_subspace():
@@ -552,8 +941,20 @@ def test_float32_incremental_ritz_matches_float64_assembly():
         basis=basis64,
     )
 
-    np.testing.assert_allclose(Ki, Kf, rtol=2.0e-5, atol=2.0e-6)
-    np.testing.assert_allclose(Bi, Bf, rtol=2.0e-5, atol=2.0e-6)
+    coefficients = reduced._material_coefficients(
+        {
+            "Em": 3.5,
+            "nu_m": 0.35,
+            "Ef_L": 120.0,
+            "Ef_T": 14.0,
+            "G_LT": 5.5,
+            "nu_LT": 0.22,
+            "nu_TT": 0.32,
+        }
+    )
+    Ci, _, _ = reduced._rom_ceff(coefficients, Ki, Bi, Di)
+    Cf, _, _ = reduced._rom_ceff(coefficients, Kf, Bf, Df)
+    np.testing.assert_allclose(Ci, Cf, rtol=2.0e-5, atol=2.0e-6)
     np.testing.assert_allclose(Di, Df, rtol=3.0e-13, atol=3.0e-13)
     assert metadata["contraction_dtype"] == "float32"
     assert metadata["contraction_compute_dtype"] == "float64"
@@ -597,8 +998,20 @@ def test_phase_orientation_permutation_preserves_ritz_operators():
         basis=ordered_basis,
     )
 
-    np.testing.assert_allclose(K1, K0, rtol=2.0e-6, atol=2.0e-6)
-    np.testing.assert_allclose(B1, B0, rtol=2.0e-6, atol=2.0e-6)
+    coefficients = reduced._material_coefficients(
+        {
+            "Em": 3.5,
+            "nu_m": 0.35,
+            "Ef_L": 120.0,
+            "Ef_T": 14.0,
+            "G_LT": 5.5,
+            "nu_LT": 0.22,
+            "nu_TT": 0.32,
+        }
+    )
+    C0, _, _ = reduced._rom_ceff(coefficients, K0, B0, D0)
+    C1, _, _ = reduced._rom_ceff(coefficients, K1, B1, D1)
+    np.testing.assert_allclose(C1, C0, rtol=2.0e-6, atol=2.0e-6)
     np.testing.assert_allclose(D1, D0, rtol=3.0e-13, atol=3.0e-13)
 
 
@@ -696,7 +1109,7 @@ def test_vectorized_material_and_engineering_maps_match_scalar_references():
     )
 
 
-def test_incremental_batch_cholesky_matches_dense_batched_solves():
+def test_incremental_batch_evaluator_matches_dense_batched_solves():
     rng = np.random.default_rng(20260819)
     candidates, coefficients, final_rank = 19, 4, 18
     coefficient_values = 0.1 + rng.random((candidates, coefficients))
@@ -721,4 +1134,64 @@ def test_incremental_batch_cholesky_matches_dense_batched_solves():
         np.testing.assert_allclose(
             cached_amplitudes, dense_amplitudes, rtol=2.0e-12, atol=2.0e-12
         )
-        assert metadata["update_mode"] == "block_cholesky"
+        assert metadata["update_mode"] == "dense_resolve"
+
+
+def test_rom_evaluation_records_singular_reduced_system_without_regularization():
+    row = {
+        "material_id": 7,
+        "material_label": "singular",
+        "Em": 3.5,
+        "nu_m": 0.35,
+        "Ef_L": 120.0,
+        "Ef_T": 14.0,
+        "G_LT": 5.5,
+        "nu_LT": 0.22,
+        "nu_TT": 0.32,
+    }
+    for ii in range(6):
+        for jj in range(6):
+            row[f"Ceff_{ii + 1}{jj + 1}"] = float(ii == jj)
+
+    result = reduced._evaluate_rom(
+        results_df=pd.DataFrame([row]),
+        Kq=np.zeros((7, 1, 1), dtype=np.float64),
+        Bq=np.zeros((7, 1, 6), dtype=np.float64),
+        Dq=np.zeros((7, 6, 6), dtype=np.float64),
+    )
+
+    assert bool(result.loc[0, "rom_numerical_failure"])
+    assert "refusing silent regularization" in result.loc[0, "rom_failure_message"]
+    assert np.isnan(result.loc[0, "relative_frobenius_error"])
+
+
+def test_nested_full_snapshot_spans_give_monotone_schur_operators():
+    rng = np.random.default_rng(20260916)
+    n, m = 18, 4
+    factor = rng.standard_normal((n, n))
+    K = factor.T @ factor + 2.0 * np.eye(n)
+    B = rng.standard_normal((n, m))
+    D = B.T @ np.linalg.solve(K, B) + 3.0 * np.eye(m)
+
+    snapshots_1 = rng.standard_normal((n, 5))
+    snapshots_2 = np.column_stack(
+        (snapshots_1, rng.standard_normal((n, 4)))
+    )
+
+    def schur(snapshot_matrix):
+        basis, _ = np.linalg.qr(snapshot_matrix, mode="reduced")
+        K_r = basis.T @ K @ basis
+        B_r = basis.T @ B
+        return D - B_r.T @ np.linalg.solve(K_r, B_r)
+
+    H_fom = D - B.T @ np.linalg.solve(K, B)
+    H_1 = schur(snapshots_1)
+    H_2 = schur(snapshots_2)
+    H_1_minus_H_2 = 0.5 * ((H_1 - H_2) + (H_1 - H_2).T)
+    H_2_minus_H_fom = 0.5 * ((H_2 - H_fom) + (H_2 - H_fom).T)
+
+    assert np.linalg.eigvalsh(H_1_minus_H_2)[0] > -1.0e-12
+    assert np.linalg.eigvalsh(H_2_minus_H_fom)[0] > -1.0e-12
+    assert np.linalg.norm(H_2 - H_fom, ord="fro") <= np.linalg.norm(
+        H_1 - H_fom, ord="fro"
+    ) + 1.0e-12

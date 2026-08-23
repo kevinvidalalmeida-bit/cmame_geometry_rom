@@ -195,7 +195,7 @@ def write_design_outputs(config: dict[str, Any], destination: Path) -> None:
         [
             {"step": 1, "script": "01_design_cases.py", "does": "write CSV/XLSX design table"},
             {"step": 2, "script": "02_generate_geometries.py", "does": "generate phase.npy and ori.npy"},
-            {"step": 3, "script": "03_run_pipeline.py", "does": "run Sobol+POD full-rank ROM validation"},
+            {"step": 3, "script": "03_run_pipeline.py", "does": "run numerical-rank Sobol+POD ROM validation"},
         ]
     )
     with pd.ExcelWriter(design_xlsx, engine="openpyxl") as writer:

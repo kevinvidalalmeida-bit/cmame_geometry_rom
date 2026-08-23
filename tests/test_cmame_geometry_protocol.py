@@ -72,6 +72,47 @@ def test_rasterization_uses_every_master_fiber(tmp_path: Path):
     assert (tmp_path / "raster_manifest.json").is_file()
 
 
+def test_same_master_revoxelization_changes_only_grid_resolution(tmp_path: Path):
+    fibers = pd.DataFrame(
+        {
+            "cx_um": [1.0, 3.0],
+            "cy_um": [2.0, 2.5],
+            "cz_um": [2.0, 3.0],
+            "ux": [1.0, 0.0],
+            "uy": [0.0, 1.0],
+            "uz": [0.0, 0.0],
+            "L_um": [2.0, 2.0],
+            "d_um": [0.5, 0.5],
+        }
+    )
+    coarse = rasterize_continuous_fibers(
+        fibers,
+        caja_um=4.0,
+        resolution=3.0,
+        output_dir=tmp_path / "r3",
+    )
+    fine = rasterize_continuous_fibers(
+        fibers,
+        caja_um=4.0,
+        resolution=6.0,
+        output_dir=tmp_path / "r6",
+    )
+    assert coarse["phase"].shape == (12, 12, 12)
+    assert fine["phase"].shape == (24, 24, 24)
+    assert coarse["metadata"]["fiber_count"] == len(fibers)
+    assert fine["metadata"]["fiber_count"] == len(fibers)
+    np.testing.assert_allclose(
+        coarse["metadata"]["A2_voxel"],
+        np.asarray(coarse["metadata"]["A2_voxel"]).T,
+        atol=1.0e-15,
+    )
+    np.testing.assert_allclose(
+        fine["metadata"]["A2_voxel"],
+        np.asarray(fine["metadata"]["A2_voxel"]).T,
+        atol=1.0e-15,
+    )
+
+
 def test_overlap_tolerance_scales_with_voxelized_diameter():
     parameters = {"sam_overlap_tolerance_relative": 1.0 / 120.0}
     tolerance_6, relative_6 = resolve_overlap_tolerance(parameters, 6.0)
