@@ -43,14 +43,17 @@ MAXITER = 2000
 
 SOLVER_PROFILES: Dict[str, Dict[str, Any]] = {
     "truth": {"solver_real_dtype": "float64", "solver_rtol": 1.0e-10, "solver_atol": 0.0},
-    "snapshot": {"solver_real_dtype": "float64", "solver_rtol": 1.0e-8, "solver_atol": 0.0},
+    "snapshot": {"solver_real_dtype": "float64", "solver_rtol": 1.0e-5, "solver_atol": 0.0},
+    "snapshot32": {"solver_real_dtype": "float32", "solver_rtol": 1.0e-5, "solver_atol": 0.0},
     "reference": {"solver_real_dtype": "float64", "solver_rtol": 1.0e-6, "solver_atol": 0.0},
     "reference32": {"solver_real_dtype": "float32", "solver_rtol": 1.0e-6, "solver_atol": 0.0},
-    "timing": {"solver_real_dtype": "float32", "solver_rtol": 1.0e-5, "solver_atol": 0.0},
+    "timing": {"solver_real_dtype": "float64", "solver_rtol": 1.0e-5, "solver_atol": 0.0},
     # Fast feasibility mode aligned with the declared 1e-4 ROM floor.
     # It is not used for high-precision truth validation.
     "rom_floor": {"solver_real_dtype": "float32", "solver_rtol": 1.0e-4, "solver_atol": 0.0},
 }
+
+AFFINE_ORIENTATION_QUANTIZATION = 1.0e4
 
 base_dir = get_base_dir()
 
@@ -674,7 +677,7 @@ def _build_affine_sensitivity_cfields_cpu(
     ori: np.ndarray,
     dtype: np.dtype,
     *,
-    quantization: float = 1.0e4,
+    quantization: float = AFFINE_ORIENTATION_QUANTIZATION,
     assign_chunk_voxels: int = _CFIELD_ASSIGN_CHUNK_VOXELS,
 ) -> np.ndarray:
     """Build full sym21 fields for dA/dgamma_q on CPU."""
@@ -729,7 +732,7 @@ def _build_affine_sensitivity_cfields_gpu(
     ori: np.ndarray,
     dtype: np.dtype,
     *,
-    quantization: float = 1.0e4,
+    quantization: float = AFFINE_ORIENTATION_QUANTIZATION,
     assign_chunk_voxels: int = _CFIELD_ASSIGN_CHUNK_VOXELS,
 ) -> Any:
     """Build full sym21 fields for dA/dgamma_q on GPU."""
@@ -794,7 +797,7 @@ def _build_affine_sensitivity_operator_specs_gpu(
     ori: np.ndarray,
     dtype: np.dtype,
     *,
-    quantization: float = 1.0e4,
+    quantization: float = AFFINE_ORIENTATION_QUANTIZATION,
     assign_chunk_voxels: int = _CFIELD_ASSIGN_CHUNK_VOXELS,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """Build indexed sym21 operators for dA/dgamma_q on GPU.
@@ -933,7 +936,7 @@ def _build_cfield_gpu(
     ori: np.ndarray,
     Cm: np.ndarray,
     Cf_local: np.ndarray,
-    QUANT: float = 1e4,
+    QUANT: float = AFFINE_ORIENTATION_QUANTIZATION,
     storage: str = "full",
     rotation_batch_size: int = 0,
     assign_chunk_voxels: int = _CFIELD_ASSIGN_CHUNK_VOXELS,
@@ -1062,7 +1065,7 @@ def _build_cfield_cpu(
     Cm: np.ndarray,
     Cf_local: np.ndarray,
     DTYPE: type,
-    QUANT: float = 1e4,
+    QUANT: float = AFFINE_ORIENTATION_QUANTIZATION,
     storage: str = "full",
 ) -> Tuple[np.ndarray, int, float]:
     t0 = time.perf_counter()

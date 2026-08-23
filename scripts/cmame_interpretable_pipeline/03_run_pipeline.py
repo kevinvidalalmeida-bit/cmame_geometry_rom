@@ -146,9 +146,15 @@ def command_for_geometry(
             int(pipe.get("final_validation_count", 16)), 2
         )
         pipe["rom_timing_count"] = min(int(pipe.get("rom_timing_count", 10000)), 100)
+        pipe["rom_timing_repetitions"] = 1
         pipe["target_error"] = 1.0
-        pipe["basis_profile"] = "rom_floor"
-        pipe["truth_profile"] = "rom_floor"
+        pipe["training_profile"] = "rom_floor"
+        pipe["monitor_profile"] = "rom_floor"
+        pipe["validation_profile"] = "rom_floor"
+        pipe["timing_profile"] = "rom_floor"
+        pipe["audit_profile"] = "rom_floor"
+        pipe["structural_audit_geometry_ids"] = []
+        pipe["tau_sensitivity_geometry_ids"] = []
 
     if not adaptive:
         fixed_limit = int(pipe.get("training_limit", 0) or 0)
@@ -179,21 +185,37 @@ def command_for_geometry(
         "--monitor-seed",
         str(int(pipe.get("monitor_seed", 20260822))),
         "--final-validation-count",
-        str(int(pipe.get("final_validation_count", 16))),
+        str(int(pipe.get("final_validation_count", 20))),
+        "--final-validation-pool-count",
+        str(int(pipe.get("final_validation_pool_count", 4096))),
         "--final-validation-seed",
-        str(int(pipe.get("final_validation_seed", 20260824))),
-        "--basis-profile",
-        str(pipe.get("basis_profile", "snapshot")),
-        "--truth-profile",
-        str(pipe.get("truth_profile", "snapshot")),
+        str(int(pipe.get("final_validation_seed", 20260901))),
+        "--training-profile",
+        str(pipe.get("training_profile", "snapshot")),
+        "--monitor-profile",
+        str(pipe.get("monitor_profile", "snapshot")),
+        "--validation-profile",
+        str(pipe.get("validation_profile", "reference")),
+        "--timing-profile",
+        str(pipe.get("timing_profile", "timing")),
+        "--audit-profile",
+        str(pipe.get("audit_profile", "truth")),
+        "--structural-audit-count",
+        str(int(pipe.get("structural_audit_count", 3))),
         "--target-error",
         str(float(pipe.get("target_error", 1.0e-4))),
         "--basis-tolerance",
         str(float(pipe.get("basis_tolerance", 1.0e-12))),
         "--basis-dtype",
-        str(pipe.get("basis_dtype", "float32")),
+        str(pipe.get("basis_dtype", "float64")),
+        "--full-rank-basis-mode",
+        str(pipe.get("full_rank_basis_mode", "raw-ritz")),
         "--ritz-contraction-dtype",
         str(pipe.get("ritz_contraction_dtype", "float32")),
+        "--ritz-gram-compute-dtype",
+        str(pipe.get("ritz_gram_compute_dtype", "float64")),
+        "--ritz-gram-backend",
+        str(pipe.get("ritz_gram_backend", "auto")),
         "--ritz-gram-rank-rtol",
         str(float(pipe.get("ritz_gram_rank_rtol", 1.0e-6))),
         "--pod-batch-max-gib",
@@ -201,7 +223,7 @@ def command_for_geometry(
         "--affine-stress-max-gib",
         str(float(pipe.get("affine_stress_max_gib", 8.0))),
         "--rom-batch-max-gib",
-        str(float(pipe.get("rom_batch_max_gib", 1.0))),
+        str(float(pipe.get("rom_batch_max_gib", 4.0))),
         "--rom-backend",
         str(pipe.get("rom_backend", "gpu")),
         "--fft-backend",
@@ -226,14 +248,59 @@ def command_for_geometry(
         str(int(pipe.get("rom_timing_count", 10000))),
         "--rom-timing-seed",
         str(int(pipe.get("rom_timing_seed", 20260823))),
+        "--rom-timing-repetitions",
+        str(int(pipe.get("rom_timing_repetitions", 10))),
         "--rom-chunk-size",
-        str(int(pipe.get("rom_chunk_size", 2048))),
+        str(int(pipe.get("rom_chunk_size", 10000))),
     ]
     append_bool(
         command,
         adaptive,
         "--adaptive",
         "--no-adaptive",
+    )
+    append_bool(
+        command,
+        int(geometry_id)
+        in {int(value) for value in pipe.get("structural_audit_geometry_ids", [])},
+        "--structural-audit",
+        "--no-structural-audit",
+    )
+    append_bool(
+        command,
+        int(geometry_id)
+        in {int(value) for value in pipe.get("tau_sensitivity_geometry_ids", [])},
+        "--tau-sensitivity",
+        "--no-tau-sensitivity",
+    )
+    append_bool(
+        command,
+        bool(pipe.get("energy_pod_baseline", True)),
+        "--energy-pod-baseline",
+        "--no-energy-pod-baseline",
+    )
+    command.extend(
+        [
+            "--tau-sensitivity-values",
+            *[
+                str(float(value))
+                for value in pipe.get(
+                    "tau_sensitivity_values", [1.0e-4, 1.0e-5, 1.0e-6, 1.0e-7]
+                )
+            ],
+        ]
+    )
+    command.extend(
+        [
+            "--energy-pod-retentions",
+            *[
+                str(float(value))
+                for value in pipe.get(
+                    "energy_pod_retentions",
+                    [0.99, 0.999, 0.9999, 0.99999, 0.999999],
+                )
+            ],
+        ]
     )
     append_bool(command, bool(pipe.get("save_operators", True)), "--save-operators", "--no-save-operators")
     append_bool(
@@ -276,6 +343,7 @@ def collect_run_summary(
         curve.insert(2, "run_dir", str(run_dir))
     summary_path = run_dir / "sobol_pod_summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.is_file() else {}
+    summary.pop("automatic_precision_rebuild", None)
     summary.update(
         {
             "geometry_id": int(geometry_id),
@@ -522,26 +590,126 @@ def validation_coverage_tables(
             frame["relative_frobenius_error"] <= float(target_error)
         )
         frames.append(frame)
-        coverage_rows.append(
-            {
-                "scope": f"geometry_{geometry_id:02d}",
-                **empirical_coverage(
-                    frame["relative_frobenius_error"], target_error
-                ),
-            }
-        )
+        for threshold in sorted({float(target_error), 1.0e-3}):
+            coverage_rows.append(
+                {
+                    "scope": f"geometry_{geometry_id:02d}",
+                    "criterion": f"error_le_{threshold:.0e}",
+                    **empirical_coverage(
+                        frame["relative_frobenius_error"], threshold
+                    ),
+                }
+            )
 
     details = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not details.empty:
-        coverage_rows.append(
-            {
-                "scope": "all_geometry_material_pairs",
-                **empirical_coverage(
-                    details["relative_frobenius_error"], target_error
-                ),
-            }
-        )
+        for threshold in sorted({float(target_error), 1.0e-3}):
+            coverage_rows.append(
+                {
+                    "scope": "all_geometry_material_pairs",
+                    "criterion": f"error_le_{threshold:.0e}",
+                    **empirical_coverage(
+                        details["relative_frobenius_error"], threshold
+                    ),
+                }
+            )
     return details, pd.DataFrame(coverage_rows)
+
+
+def performance_table(summary: pd.DataFrame) -> pd.DataFrame:
+    if not summary.empty:
+        summary = summary.copy()
+        summary["cuda_cold_start_median_s"] = summary["rom_timing"].map(
+            lambda value: value.get("cold_start_median_s")
+            if isinstance(value, dict)
+            else None
+        )
+        summary["rom_hot_single_median_s"] = summary["rom_timing"].map(
+            lambda value: value.get("warm_single_query_median_s")
+            if isinstance(value, dict)
+            else None
+        )
+        summary["rom_hot_single_p95_s"] = summary["rom_timing"].map(
+            lambda value: value.get("warm_single_query_p95_s")
+            if isinstance(value, dict)
+            else None
+        )
+        summary["rom_batch_10000_median_s"] = summary["rom_timing"].map(
+            lambda value: value.get("rom_online_total_s")
+            if isinstance(value, dict)
+            else None
+        )
+    columns = [
+        "geometry_id",
+        "geometry_label",
+        "nvox",
+        "stop_materials",
+        "basis_rank",
+        "fom_material_median_s",
+        "compilation_wall_s",
+        "cuda_cold_start_median_s",
+        "rom_hot_single_median_s",
+        "rom_hot_single_p95_s",
+        "rom_batch_10000_median_s",
+        "hot_single_speedup",
+        "break_even_queries",
+    ]
+    if summary.empty:
+        return pd.DataFrame(columns=columns)
+    missing = sorted(set(columns).difference(summary.columns))
+    if missing:
+        raise KeyError(f"Campaign summaries are missing performance fields: {missing}")
+    return summary[columns].sort_values("geometry_id").reset_index(drop=True)
+
+
+def collect_optional_diagnostics(
+    summaries: list[dict[str, Any]], key: str
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for summary in summaries:
+        path_value = summary.get(key)
+        if not path_value:
+            continue
+        frame = read_csv_if_exists(Path(str(path_value)))
+        if frame.empty:
+            continue
+        frame.insert(0, "geometry_id", int(summary["geometry_id"]))
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def write_performance_plot(performance: pd.DataFrame, path: Path) -> None:
+    if performance.empty:
+        return
+    try:
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(1, 2, figsize=(9.2, 3.8))
+        left, right = axes
+        left.scatter(
+            performance["nvox"], performance["fom_material_median_s"], s=42
+        )
+        right.scatter(
+            performance["basis_rank"],
+            1.0e6 * performance["rom_hot_single_median_s"],
+            s=42,
+        )
+        for row in performance.itertuples(index=False):
+            label = f"G{int(row.geometry_id):02d}"
+            left.annotate(label, (row.nvox, row.fom_material_median_s), xytext=(4, 3), textcoords="offset points", fontsize=7)
+            right.annotate(label, (row.basis_rank, 1.0e6 * row.rom_hot_single_median_s), xytext=(4, 3), textcoords="offset points", fontsize=7)
+        left.set_xlabel(r"FFT voxel count $N_{\mathrm{vox}}$")
+        left.set_ylabel(r"Median FOM time $t_{\mathrm{FOM}}$ [s]")
+        right.set_xlabel(r"Reduced rank $r$")
+        right.set_ylabel(r"Median ROM time $t_{\mathrm{ROM}}$ [$\mu$s]")
+        for axis in axes:
+            axis.grid(True, alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(path, dpi=240)
+        fig.savefig(path.with_suffix(".pdf"))
+        plt.close(fig)
+    except Exception as exc:  # pragma: no cover - paper artifact only
+        print(f"[STEP3] performance plot skipped: {exc}", flush=True)
 
 
 def write_campaign_summary(
@@ -563,6 +731,19 @@ def write_campaign_summary(
     )
     validation, validation_coverage = validation_coverage_tables(
         summaries, target_error
+    )
+    performance = performance_table(summary)
+    tau_sensitivity = collect_optional_diagnostics(
+        summaries, "tau_sensitivity_summary_csv"
+    )
+    structural_audit = collect_optional_diagnostics(
+        summaries, "structural_audit_csv"
+    )
+    energy_pod_selection = collect_optional_diagnostics(
+        summaries, "energy_pod_monitor_selection_csv"
+    )
+    energy_pod_validation = collect_optional_diagnostics(
+        summaries, "energy_pod_final_validation_csv"
     )
     first_crossing_curve = first_threshold_crossing_curve(curve, target_error)
     timing = one_pass_timing_table(
@@ -586,11 +767,29 @@ def write_campaign_summary(
     validation_coverage.to_csv(
         summary_dir / "sobol_pod_validation_coverage.csv", index=False
     )
+    performance.to_csv(
+        summary_dir / "sobol_pod_multigeometry_performance.csv", index=False
+    )
+    tau_sensitivity.to_csv(
+        summary_dir / "sobol_pod_tau_G_sensitivity.csv", index=False
+    )
+    structural_audit.to_csv(
+        summary_dir / "sobol_pod_structural_audit.csv", index=False
+    )
+    energy_pod_selection.to_csv(
+        summary_dir / "energy_pod_monitor_selection.csv", index=False
+    )
+    energy_pod_validation.to_csv(
+        summary_dir / "energy_pod_validation.csv", index=False
+    )
     if bool(config.get("sobol_pod_pipeline", {}).get("write_summary_plot", True)):
         write_campaign_plot(
             first_crossing_curve,
             summary_dir / "sobol_pod_multigeometry_error_curves.png",
             target_error,
+        )
+        write_performance_plot(
+            performance, summary_dir / "sobol_pod_performance_scaling.png"
         )
     with pd.ExcelWriter(summary_dir / "sobol_pod_multigeometry_tables.xlsx") as writer:
         summary.to_excel(writer, sheet_name="summary", index=False)
@@ -601,6 +800,11 @@ def write_campaign_summary(
         timing.to_excel(writer, sheet_name="one_pass_timing", index=False)
         validation.to_excel(writer, sheet_name="final_validation", index=False)
         validation_coverage.to_excel(writer, sheet_name="validation_coverage", index=False)
+        performance.to_excel(writer, sheet_name="performance", index=False)
+        tau_sensitivity.to_excel(writer, sheet_name="tau_G_sensitivity", index=False)
+        structural_audit.to_excel(writer, sheet_name="structural_audit", index=False)
+        energy_pod_selection.to_excel(writer, sheet_name="energy_POD_selection", index=False)
+        energy_pod_validation.to_excel(writer, sheet_name="energy_POD_validation", index=False)
         commands.to_excel(writer, sheet_name="commands", index=False)
     (summary_dir / "campaign_config_snapshot.json").write_text(
         json.dumps(config, indent=2, sort_keys=True),
@@ -618,6 +822,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--geometry-ids", type=int, nargs="*", default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--reuse-existing",
+        action="store_true",
+        help="Reuse completed geometry runs when assembling a campaign summary.",
+    )
     return parser.parse_args()
 
 
@@ -637,6 +846,11 @@ def main() -> int:
     command_rows: list[dict[str, Any]] = []
 
     for geometry_id in geometry_ids:
+        actual_run_name = (
+            base_run_name
+            if single
+            else f"{base_run_name}_geometry_{geometry_id:02d}"
+        )
         command = command_for_geometry(
             args=args,
             config=config,
@@ -645,8 +859,20 @@ def main() -> int:
             geometry_id=int(geometry_id),
             single_geometry=single,
         )
-        wall_s = run(command)
-        actual_run_name = base_run_name if single else f"{base_run_name}_geometry_{geometry_id:02d}"
+        existing_summary = (
+            destination / "runs" / actual_run_name / "sobol_pod_summary.json"
+        )
+        reused_existing = bool(args.reuse_existing and existing_summary.exists())
+        if reused_existing:
+            existing_payload = json.loads(existing_summary.read_text(encoding="utf-8"))
+            if str(existing_payload.get("status", "")) != "complete":
+                raise RuntimeError(
+                    f"Cannot reuse incomplete run: {existing_summary.parent}"
+                )
+            wall_s = float(existing_payload.get("pipeline_wall_s_before_final_write", 0.0))
+            print(f"[STEP3] reuse={existing_summary.parent}", flush=True)
+        else:
+            wall_s = run(command)
         curve, summary = collect_run_summary(
             destination=destination,
             run_name=actual_run_name,
@@ -660,7 +886,11 @@ def main() -> int:
             {
                 "geometry_id": int(geometry_id),
                 "run_name": actual_run_name,
-                "command": " ".join(command),
+                "command": (
+                    f"REUSED {existing_summary.parent}"
+                    if reused_existing
+                    else " ".join(command)
+                ),
                 "wrapper_wall_s": float(wall_s),
             }
         )

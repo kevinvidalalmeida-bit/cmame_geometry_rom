@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import math
 from pathlib import Path
@@ -136,7 +137,10 @@ _add_fft_paths()
 
 from ffthompy_core.ffthompy.RESU import engineering_constants_from_Cmandel
 from pipeline.fft_solver import (
+    AFFINE_ORIENTATION_QUANTIZATION,
     TI_stiffness_voigt,
+    _affine_stiffness_bases,
+    _group_quantized_orientations,
     rotate_C_mandel,
     rotation_matrix_from_vector,
     voigt_to_mandel,
@@ -179,37 +183,14 @@ def _relative_frobenius(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _isotropic_bases() -> tuple[np.ndarray, np.ndarray]:
-    lam = np.zeros((6, 6), dtype=float)
-    mu = np.zeros((6, 6), dtype=float)
-    lam[:3, :3] = 1.0
-    mu[0, 0] = mu[1, 1] = mu[2, 2] = 2.0
-    mu[3, 3] = mu[4, 4] = mu[5, 5] = 2.0
-    return lam, mu
+    matrix_bases, _ = _affine_stiffness_bases()
+    return matrix_bases
 
 
 def _fiber_local_bases_axis0() -> list[np.ndarray]:
     """Five TI Mandel bases with local axis 0 as the fiber direction."""
-    c_tt = np.zeros((6, 6), dtype=float)
-    c_tt_cross = np.zeros((6, 6), dtype=float)
-    c_lt = np.zeros((6, 6), dtype=float)
-    c_ll = np.zeros((6, 6), dtype=float)
-    g_lt = np.zeros((6, 6), dtype=float)
-
-    c_tt[1, 1] = c_tt[2, 2] = 1.0
-    c_tt[3, 3] = 1.0
-
-    c_tt_cross[1, 2] = c_tt_cross[2, 1] = 1.0
-    c_tt_cross[3, 3] = -1.0
-
-    c_lt[0, 1] = c_lt[1, 0] = 1.0
-    c_lt[0, 2] = c_lt[2, 0] = 1.0
-
-    c_ll[0, 0] = 1.0
-
-    g_lt[4, 4] = 2.0
-    g_lt[5, 5] = 2.0
-
-    return [c_tt, c_tt_cross, c_lt, c_ll, g_lt]
+    _, fiber_bases = _affine_stiffness_bases()
+    return list(fiber_bases)
 
 
 def _isotropic_compliance_bases() -> tuple[np.ndarray, np.ndarray]:
@@ -258,8 +239,9 @@ def phase_orientation_voxel_order(phase: np.ndarray, ori: np.ndarray) -> np.ndar
     fiber_idx = np.flatnonzero(phase_flat != 0)
     if not len(fiber_idx):
         return matrix_idx.astype(np.int64, copy=False)
-    rounded = np.round(ori_flat[fiber_idx], decimals=12)
-    _, group_ids = np.unique(rounded, axis=0, return_inverse=True)
+    group_ids, _ = _group_quantized_orientations(
+        ori_flat[fiber_idx], AFFINE_ORIENTATION_QUANTIZATION
+    )
     fiber_order = np.argsort(group_ids, kind="stable")
     return np.concatenate((matrix_idx, fiber_idx[fiber_order])).astype(np.int64, copy=False)
 
@@ -291,8 +273,9 @@ def _affine_tensor_batch_factory(
     fiber_group_ids = np.empty(0, dtype=np.int32)
     fiber_bases_by_group = np.empty((0, 5, 6, 6), dtype=np.float64)
     if len(fiber_idx):
-        rounded = np.round(ori_flat[fiber_idx], decimals=12)
-        unique_oris, inverse = np.unique(rounded, axis=0, return_inverse=True)
+        inverse, unique_oris = _group_quantized_orientations(
+            ori_flat[fiber_idx], AFFINE_ORIENTATION_QUANTIZATION
+        )
         group_bases: list[np.ndarray] = []
         for axis in unique_oris:
             rotation = rotation_matrix_from_vector(axis)
@@ -920,6 +903,83 @@ def _check_local_basis(row: dict[str, Any]) -> float:
     return _relative_frobenius(recon, cf_local)
 
 
+def affine_constitutive_reconstruction_error(
+    phase: np.ndarray,
+    ori: np.ndarray,
+    row: dict[str, Any],
+) -> dict[str, float | int]:
+    """Verify the shared affine stiffness representation over all voxel groups."""
+    phase_flat = np.asarray(phase).reshape(-1)
+    ori_flat = np.asarray(ori, dtype=np.float64).reshape(-1, 3)
+    coefficients = _material_coefficients(row)
+    matrix_bases, fiber_bases = _affine_stiffness_bases()
+
+    em = float(row["Em"])
+    nu_m = float(row["nu_m"])
+    matrix_reference = voigt_to_mandel(
+        TI_stiffness_voigt(
+            em,
+            em,
+            nu_m,
+            nu_m,
+            em / (2.0 * (1.0 + nu_m)),
+        )
+    )
+    matrix_affine = sum(coefficients[q] * matrix_bases[q] for q in range(2))
+    matrix_error = _relative_frobenius(matrix_affine, matrix_reference)
+
+    fiber_reference_local = voigt_to_mandel(
+        TI_stiffness_voigt(
+            float(row["Ef_L"]),
+            float(row["Ef_T"]),
+            float(row["nu_LT"]),
+            float(row["nu_TT"]),
+            float(row["G_LT"]),
+        )
+    )
+    fiber_affine_local = sum(
+        coefficients[q + 2] * fiber_bases[q] for q in range(len(fiber_bases))
+    )
+
+    matrix_count = float(np.count_nonzero(phase_flat == 0))
+    squared_difference = matrix_count * float(
+        np.linalg.norm(matrix_affine - matrix_reference, ord="fro") ** 2
+    )
+    squared_reference = matrix_count * float(
+        np.linalg.norm(matrix_reference, ord="fro") ** 2
+    )
+    maximum_local_error = matrix_error
+    group_count = 0
+    fiber_mask = phase_flat != 0
+    if np.any(fiber_mask):
+        inverse, means = _group_quantized_orientations(
+            ori_flat[fiber_mask], AFFINE_ORIENTATION_QUANTIZATION
+        )
+        counts = np.bincount(inverse, minlength=len(means))
+        group_count = int(len(means))
+        for group_id, axis in enumerate(means):
+            rotation = rotation_matrix_from_vector(axis)
+            direct = rotate_C_mandel(fiber_reference_local, rotation)
+            reconstructed = rotate_C_mandel(fiber_affine_local, rotation)
+            local_error = _relative_frobenius(reconstructed, direct)
+            maximum_local_error = max(maximum_local_error, local_error)
+            weight = float(counts[group_id])
+            squared_difference += weight * float(
+                np.linalg.norm(reconstructed - direct, ord="fro") ** 2
+            )
+            squared_reference += weight * float(np.linalg.norm(direct, ord="fro") ** 2)
+
+    global_error = math.sqrt(
+        squared_difference / max(squared_reference, np.finfo(float).tiny)
+    )
+    return {
+        "relative_frobenius_error": float(global_error),
+        "maximum_voxel_group_relative_error": float(maximum_local_error),
+        "orientation_group_count": group_count,
+        "voxel_count": int(phase_flat.size),
+    }
+
+
 def _discover_snapshot_ids(run_dir: Path, results_df: pd.DataFrame) -> list[int]:
     ids: list[int] = []
     if "solution_fields_path" in results_df.columns:
@@ -1267,26 +1327,108 @@ def _contract_gpu_batch(left_gpu: Any, right_gpu: Any) -> np.ndarray:
 
 def _contract_component_major(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     """Return A B^T over component+voxel coordinates, accumulated in float64."""
+    return _contract_component_major_compute(A, B, compute_dtype=np.float64)
+
+
+def _contract_component_major_compute(
+    A: np.ndarray,
+    B: np.ndarray,
+    *,
+    compute_dtype: str | np.dtype,
+) -> np.ndarray:
+    """Return A B^T using the requested product precision.
+
+    The small contracted block is always returned in float64 so spatial
+    chunks can be accumulated accurately even when the products use float32.
+    """
     if A.ndim != 3 or B.ndim != 3 or A.shape[1] != 6 or B.shape[1] != 6:
         raise ValueError("contraction expects component-major (r, 6, n) arrays")
     if A.shape[2] != B.shape[2]:
         raise ValueError("contraction arrays must share the spatial chunk")
+    requested_dtype = _ritz_compute_dtype(compute_dtype)
     a2 = np.ascontiguousarray(A).reshape(A.shape[0], -1)
     b2 = np.ascontiguousarray(B).reshape(B.shape[0], -1)
     try:
         import cupy as cp
-        a_gpu = cp.asarray(a2, dtype=cp.float64)
+        cp_dtype = cp.float32 if requested_dtype == np.dtype(np.float32) else cp.float64
+        a_gpu = cp.asarray(a2, dtype=cp_dtype)
         if A is B:
             b_gpu = a_gpu
         else:
-            b_gpu = cp.asarray(b2, dtype=cp.float64)
+            b_gpu = cp.asarray(b2, dtype=cp_dtype)
         result = cp.asnumpy(a_gpu @ b_gpu.T)
         del a_gpu
         if A is not B:
             del b_gpu
         return np.asarray(result, dtype=np.float64)
     except Exception:
-        return np.asarray(a2, dtype=np.float64) @ np.asarray(b2, dtype=np.float64).T
+        return np.asarray(
+            np.asarray(a2, dtype=requested_dtype)
+            @ np.asarray(b2, dtype=requested_dtype).T,
+            dtype=np.float64,
+        )
+
+
+def _contract_component_major_cpu(
+    A: np.ndarray,
+    B: np.ndarray,
+    *,
+    compute_dtype: str | np.dtype,
+) -> np.ndarray:
+    """Return A B^T on the CPU using the requested product precision."""
+    if A.ndim != 3 or B.ndim != 3 or A.shape[1] != 6 or B.shape[1] != 6:
+        raise ValueError("contraction expects component-major (r, 6, n) arrays")
+    if A.shape[2] != B.shape[2]:
+        raise ValueError("contraction arrays must share the spatial chunk")
+    requested_dtype = _ritz_compute_dtype(compute_dtype)
+    a2 = np.asarray(
+        np.ascontiguousarray(A).reshape(A.shape[0], -1), dtype=requested_dtype
+    )
+    b2 = a2 if A is B else np.asarray(
+        np.ascontiguousarray(B).reshape(B.shape[0], -1), dtype=requested_dtype
+    )
+    return np.asarray(a2 @ b2.T, dtype=np.float64)
+
+
+def _timed_cpu_gram(
+    values: np.ndarray,
+    *,
+    compute_dtype: str | np.dtype,
+) -> tuple[np.ndarray, float]:
+    started = time.perf_counter()
+    product = _contract_component_major_cpu(
+        values,
+        values,
+        compute_dtype=compute_dtype,
+    )
+    return product, float(time.perf_counter() - started)
+
+
+def _timed_cpu_gram_extension(
+    old_values: np.ndarray,
+    new_values: np.ndarray,
+    *,
+    compute_dtype: str | np.dtype,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    started = time.perf_counter()
+    cross = _contract_component_major_cpu(
+        old_values,
+        new_values,
+        compute_dtype=compute_dtype,
+    )
+    diagonal = _contract_component_major_cpu(
+        new_values,
+        new_values,
+        compute_dtype=compute_dtype,
+    )
+    return cross, diagonal, float(time.perf_counter() - started)
+
+
+def _ritz_gram_backend(value: str) -> str:
+    backend = str(value).strip().lower()
+    if backend not in {"auto", "cpu", "gpu"}:
+        raise ValueError("Gram backend must be auto, cpu, or gpu.")
+    return backend
 
 
 def _gpu_contract_dense(
@@ -1349,24 +1491,19 @@ def _orthonormal_transform_from_gram(
             f"lambda_min/lambda_max={relative_min:.3e}. "
             "Rank-reveal the incoming block before assembly."
         )
-    if dependent:
-        eigenvalues, eigenvectors = scipy_linalg.eigh(gram, check_finite=False)
-        keep = eigenvalues > largest * float(rank_rtol)
-        if not np.any(keep):
-            raise np.linalg.LinAlgError("reduced Gram matrix has zero numerical rank")
-        T = (
-            eigenvectors[:, keep] / np.sqrt(eigenvalues[keep])
-        ).T
-        transform_mode = "eigh_rank_reveal"
-    else:
-        L = scipy_linalg.cholesky(gram, lower=True, check_finite=False)
-        T = scipy_linalg.solve_triangular(
-            L,
-            np.eye(L.shape[0], dtype=np.float64),
-            lower=True,
-            check_finite=False,
-        )
-        transform_mode = "cholesky_full_rank"
+    eigenvalues, eigenvectors = scipy_linalg.eigh(gram, check_finite=False)
+    keep = eigenvalues > largest * float(rank_rtol) if dependent else np.ones_like(
+        eigenvalues, dtype=bool
+    )
+    if not np.any(keep):
+        raise np.linalg.LinAlgError("reduced Gram matrix has zero numerical rank")
+    kept_vectors = np.array(eigenvectors[:, keep], dtype=np.float64, copy=True)
+    pivot_rows = np.argmax(np.abs(kept_vectors), axis=0)
+    pivot_signs = np.sign(kept_vectors[pivot_rows, np.arange(kept_vectors.shape[1])])
+    pivot_signs[pivot_signs == 0.0] = 1.0
+    kept_vectors *= pivot_signs
+    T = (kept_vectors / np.sqrt(eigenvalues[keep])).T
+    transform_mode = "eigh_rank_reveal" if dependent else "eigh_full_rank"
     meta = {
         "gram_lambda_min": smallest,
         "gram_lambda_max": largest,
@@ -1413,6 +1550,377 @@ def _transform_raw_operators_with_rank_policy(
     return Kq, Bq, T.T, gram_meta
 
 
+def _householder_r(matrix: np.ndarray) -> np.ndarray:
+    """Return the thin Householder-QR R factor without materializing Q."""
+    values = np.asarray(matrix, dtype=np.float64, order="F")
+    if values.ndim != 2 or values.shape[0] < values.shape[1]:
+        raise ValueError("Householder QR requires a tall matrix")
+    factored = scipy_linalg.qr(
+        values,
+        mode="r",
+        overwrite_a=True,
+        check_finite=False,
+    )[0]
+    rank = int(values.shape[1])
+    return np.array(np.triu(factored[:rank]), dtype=np.float64, copy=True)
+
+
+def _experimental_tsqr_factor(
+    basis: np.ndarray | list[np.ndarray],
+    *,
+    nvox: int,
+    block_max_gib: float = 2.0,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Factor the normalized tall snapshot matrix by blocked Householder TSQR."""
+    started = time.perf_counter()
+    rank = _basis_rank_nvox(basis, int(nvox))
+    if rank < 1:
+        raise ValueError("TSQR requires at least one snapshot")
+    if not np.isfinite(float(block_max_gib)) or float(block_max_gib) <= 0.0:
+        raise ValueError("TSQR block_max_gib must be finite and positive")
+
+    first = _field_component_voxel_view(
+        basis[0] if isinstance(basis, list) else basis[0], int(nvox)
+    )
+    storage_itemsize = int(first.dtype.itemsize)
+    block_budget_bytes = int(float(block_max_gib) * (1024**3))
+    bytes_per_voxel = rank * 6 * (storage_itemsize + np.dtype(np.float64).itemsize)
+    minimum_voxels = max(1, math.ceil(rank / 6))
+    block_voxels = max(
+        minimum_voxels,
+        min(int(nvox), block_budget_bytes // max(bytes_per_voxel, 1)),
+    )
+    if block_voxels * bytes_per_voxel > block_budget_bytes:
+        raise MemoryError(
+            "TSQR workspace cap cannot hold one full-rank Householder block"
+        )
+
+    scale = 1.0 / math.sqrt(float(nvox))
+    accumulated_r: np.ndarray | None = None
+    local_factor_wall_s = 0.0
+    merge_factor_wall_s = 0.0
+    block_count = 0
+    peak_snapshot_chunk_bytes = 0
+    peak_qr_matrix_bytes = 0
+    for start in range(0, int(nvox), int(block_voxels)):
+        end = min(start + int(block_voxels), int(nvox))
+        values = _basis_chunk(basis, nvox=int(nvox), start=start, end=end)
+        peak_snapshot_chunk_bytes = max(
+            peak_snapshot_chunk_bytes, int(values.nbytes)
+        )
+        tall = np.array(
+            values.reshape(rank, -1).T,
+            dtype=np.float64,
+            order="F",
+            copy=True,
+        )
+        tall *= scale
+        peak_qr_matrix_bytes = max(peak_qr_matrix_bytes, int(tall.nbytes))
+        local_started = time.perf_counter()
+        local_r = _householder_r(tall)
+        local_factor_wall_s += float(time.perf_counter() - local_started)
+        del tall, values
+
+        if accumulated_r is None:
+            accumulated_r = local_r
+        else:
+            merge_started = time.perf_counter()
+            accumulated_r = _householder_r(
+                np.asfortranarray(np.vstack((accumulated_r, local_r)))
+            )
+            merge_factor_wall_s += float(time.perf_counter() - merge_started)
+        block_count += 1
+
+    if accumulated_r is None:
+        raise RuntimeError("TSQR produced no local factors")
+    diagonal = np.diag(accumulated_r).copy()
+    signs = np.where(diagonal < 0.0, -1.0, 1.0)
+    accumulated_r *= signs[:, None]
+    diagonal = np.diag(accumulated_r)
+    if not np.all(np.isfinite(accumulated_r)) or np.any(diagonal == 0.0):
+        raise np.linalg.LinAlgError(
+            "TSQR encountered an arithmetic-zero snapshot direction"
+        )
+
+    metadata = {
+        "qr_method": "blocked_householder_tsqr",
+        "qr_compute_dtype": "float64",
+        "qr_forms_explicit_q": False,
+        "qr_rank": int(rank),
+        "qr_block_count": int(block_count),
+        "qr_block_voxels": int(block_voxels),
+        "qr_block_max_gib": float(block_max_gib),
+        "qr_peak_snapshot_chunk_bytes": int(peak_snapshot_chunk_bytes),
+        "qr_peak_factor_matrix_bytes": int(peak_qr_matrix_bytes),
+        "qr_estimated_peak_temporary_bytes": int(
+            peak_snapshot_chunk_bytes + peak_qr_matrix_bytes
+        ),
+        "qr_local_factor_wall_s": float(local_factor_wall_s),
+        "qr_merge_factor_wall_s": float(merge_factor_wall_s),
+        "qr_factor_wall_s": float(time.perf_counter() - started),
+        "qr_r_condition": float(np.linalg.cond(accumulated_r)),
+        "qr_r_diagonal_min_abs": float(np.min(np.abs(diagonal))),
+        "qr_r_diagonal_max_abs": float(np.max(np.abs(diagonal))),
+        "qr_r_diagonal_relative_min": float(
+            np.min(np.abs(diagonal))
+            / max(np.max(np.abs(diagonal)), np.finfo(np.float64).tiny)
+        ),
+    }
+    return accumulated_r, metadata
+
+
+def _experimental_tsqr_recompile(
+    *,
+    basis: np.ndarray | list[np.ndarray],
+    raw_Kq: np.ndarray,
+    raw_Bq: np.ndarray,
+    Dq: np.ndarray,
+    G: np.ndarray,
+    nvox: int,
+    block_max_gib: float = 2.0,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Recompile raw affine blocks in full-span TSQR coordinates."""
+    total_started = time.perf_counter()
+    R, metadata = _experimental_tsqr_factor(
+        basis,
+        nvox=int(nvox),
+        block_max_gib=float(block_max_gib),
+    )
+    rank = int(R.shape[0])
+    raw_K = np.asarray(raw_Kq, dtype=np.float64)
+    raw_B = np.asarray(raw_Bq, dtype=np.float64)
+    if raw_K.shape[1:] != (rank, rank) or raw_B.shape[1] != rank:
+        raise ValueError("raw affine blocks do not match the TSQR snapshot rank")
+
+    transform_started = time.perf_counter()
+    Kq = np.empty_like(raw_K)
+    Bq = np.empty_like(raw_B)
+    for q in range(raw_K.shape[0]):
+        left = scipy_linalg.solve_triangular(
+            R.T,
+            raw_K[q],
+            lower=True,
+            check_finite=False,
+        )
+        Kq[q] = scipy_linalg.solve_triangular(
+            R.T,
+            left.T,
+            lower=True,
+            check_finite=False,
+        ).T
+        Kq[q] = 0.5 * (Kq[q] + Kq[q].T)
+        Bq[q] = scipy_linalg.solve_triangular(
+            R.T,
+            raw_B[q],
+            lower=True,
+            check_finite=False,
+        )
+    transform_wall_s = float(time.perf_counter() - transform_started)
+
+    identity = np.eye(rank, dtype=np.float64)
+    T = scipy_linalg.solve_triangular(
+        R.T,
+        identity,
+        lower=True,
+        check_finite=False,
+    )
+    gram = 0.5 * (np.asarray(G, dtype=np.float64) + np.asarray(G, dtype=np.float64).T)
+    qr_gram = R.T @ R
+    orthogonality = T @ gram @ T.T
+    metadata.update(
+        {
+            "qr_transform_wall_s": transform_wall_s,
+            "qr_total_wall_s": float(time.perf_counter() - total_started),
+            "qr_gram_reconstruction_relative_error": float(
+                np.linalg.norm(qr_gram - gram, ord="fro")
+                / max(np.linalg.norm(gram, ord="fro"), np.finfo(float).tiny)
+            ),
+            "qr_orthogonality_frobenius_error": float(
+                np.linalg.norm(orthogonality - identity, ord="fro")
+            ),
+            "qr_orthogonality_spectral_error": float(
+                np.linalg.norm(orthogonality - identity, ord=2)
+            ),
+            "qr_discarded_rank": 0,
+        }
+    )
+    operators = {
+        "Kq": Kq,
+        "Bq": Bq,
+        "Dq": np.asarray(Dq, dtype=np.float64).copy(),
+        "R": R,
+    }
+    return operators, metadata
+
+
+def _experimental_energy_qr_recompile(
+    *,
+    raw_Kq: np.ndarray,
+    raw_Bq: np.ndarray,
+    Dq: np.ndarray,
+    reference_coefficients: np.ndarray,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Whiten the full snapshot span in a reference-energy inner product.
+
+    The raw affine contractions already contain ``S.T @ K_q @ S``.  Their
+    coercive reference combination therefore supplies a weighted QR factor
+    without another voxel-scale pass or an explicit Q basis.
+    """
+    total_started = time.perf_counter()
+    raw_K = np.asarray(raw_Kq, dtype=np.float64)
+    raw_B = np.asarray(raw_Bq, dtype=np.float64)
+    coefficients = np.asarray(reference_coefficients, dtype=np.float64)
+    if raw_K.ndim != 3 or raw_K.shape[1] != raw_K.shape[2]:
+        raise ValueError("raw_Kq must contain square affine blocks")
+    if raw_B.shape[:2] != raw_K.shape[:2]:
+        raise ValueError("raw_Bq does not match raw_Kq")
+    if coefficients.shape != (raw_K.shape[0],):
+        raise ValueError("reference coefficients do not match affine blocks")
+    if not np.all(np.isfinite(coefficients)):
+        raise ValueError("reference coefficients must be finite")
+
+    reference = np.einsum("q,qij->ij", coefficients, raw_K, optimize=True)
+    reference = 0.5 * (reference + reference.T)
+    factor_started = time.perf_counter()
+    try:
+        R = scipy_linalg.cholesky(
+            reference,
+            lower=False,
+            overwrite_a=False,
+            check_finite=False,
+        )
+    except np.linalg.LinAlgError as exc:
+        eigenvalues = scipy_linalg.eigvalsh(reference, check_finite=False)
+        raise np.linalg.LinAlgError(
+            "reference-energy QR requires a positive-definite raw Ritz block; "
+            f"lambda_min={float(eigenvalues[0]):.3e}"
+        ) from exc
+    factor_wall_s = float(time.perf_counter() - factor_started)
+
+    transform_started = time.perf_counter()
+    Kq = np.empty_like(raw_K)
+    Bq = np.empty_like(raw_B)
+    for q in range(raw_K.shape[0]):
+        left = scipy_linalg.solve_triangular(
+            R.T,
+            raw_K[q],
+            lower=True,
+            check_finite=False,
+        )
+        Kq[q] = scipy_linalg.solve_triangular(
+            R.T,
+            left.T,
+            lower=True,
+            check_finite=False,
+        ).T
+        Kq[q] = 0.5 * (Kq[q] + Kq[q].T)
+        Bq[q] = scipy_linalg.solve_triangular(
+            R.T,
+            raw_B[q],
+            lower=True,
+            check_finite=False,
+        )
+    transform_wall_s = float(time.perf_counter() - transform_started)
+
+    rank = int(R.shape[0])
+    identity = np.eye(rank, dtype=np.float64)
+    normalized_reference = np.einsum(
+        "q,qij->ij", coefficients, Kq, optimize=True
+    )
+    normalized_reference = 0.5 * (
+        normalized_reference + normalized_reference.T
+    )
+    identity_error = normalized_reference - identity
+    diagonal = np.diag(R)
+    metadata = {
+        "energy_qr_experimental": True,
+        "energy_qr_method": "reference_energy_cholesky_qr",
+        "energy_qr_compute_dtype": "float64",
+        "energy_qr_forms_explicit_q": False,
+        "energy_qr_uses_snapshot_gram": False,
+        "energy_qr_additional_voxel_passes": 0,
+        "energy_qr_rank": rank,
+        "energy_qr_discarded_rank": 0,
+        "energy_qr_reference_coefficients": coefficients.copy(),
+        "energy_qr_reference_condition": float(np.linalg.cond(reference)),
+        "energy_qr_r_condition": float(np.linalg.cond(R)),
+        "energy_qr_r_diagonal_min_abs": float(np.min(np.abs(diagonal))),
+        "energy_qr_r_diagonal_max_abs": float(np.max(np.abs(diagonal))),
+        "energy_qr_factor_wall_s": factor_wall_s,
+        "energy_qr_transform_wall_s": transform_wall_s,
+        "energy_qr_total_wall_s": float(time.perf_counter() - total_started),
+        "energy_qr_reference_identity_frobenius_error": float(
+            np.linalg.norm(identity_error, ord="fro")
+        ),
+        "energy_qr_reference_identity_spectral_error": float(
+            np.linalg.norm(identity_error, ord=2)
+        ),
+    }
+    operators = {
+        "Kq": Kq,
+        "Bq": Bq,
+        "Dq": np.asarray(Dq, dtype=np.float64).copy(),
+        "R": R,
+        "invR": scipy_linalg.solve_triangular(
+            R,
+            identity,
+            lower=False,
+            check_finite=False,
+        ),
+        "reference_coefficients": coefficients.copy(),
+    }
+    return operators, metadata
+
+
+def _transform_raw_operators_with_energy_retention(
+    raw_Kq: np.ndarray,
+    raw_Bq: np.ndarray,
+    G: np.ndarray,
+    *,
+    retention: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float | int | str]]:
+    """Construct a conventional POD space using cumulative snapshot energy."""
+    requested = float(retention)
+    if not 0.0 < requested <= 1.0:
+        raise ValueError("POD energy retention must lie in (0, 1].")
+    gram = 0.5 * (
+        np.asarray(G, dtype=np.float64) + np.asarray(G, dtype=np.float64).T
+    )
+    eigenvalues, eigenvectors = scipy_linalg.eigh(gram, check_finite=False)
+    eigenvalues = np.maximum(eigenvalues, 0.0)
+    total = float(np.sum(eigenvalues))
+    if not np.isfinite(total) or total <= 0.0:
+        raise np.linalg.LinAlgError("snapshot Gram matrix has no positive POD energy")
+    descending = eigenvalues[::-1]
+    rank = int(np.searchsorted(np.cumsum(descending) / total, requested) + 1)
+    rank = min(rank, len(eigenvalues))
+    selected_values = eigenvalues[-rank:]
+    positive = selected_values > np.finfo(np.float64).eps * eigenvalues[-1]
+    if not np.any(positive):
+        raise np.linalg.LinAlgError("selected POD energy space has zero numerical rank")
+    selected_vectors = eigenvectors[:, -rank:][:, positive]
+    selected_values = selected_values[positive]
+    T = (selected_vectors / np.sqrt(selected_values)).T
+    effective_rank = int(T.shape[0])
+    Kq = np.empty((raw_Kq.shape[0], effective_rank, effective_rank), dtype=np.float64)
+    Bq = np.empty((raw_Bq.shape[0], effective_rank, raw_Bq.shape[2]), dtype=np.float64)
+    for q in range(raw_Kq.shape[0]):
+        Kq[q] = T @ np.asarray(raw_Kq[q], dtype=np.float64) @ T.T
+        Kq[q] = 0.5 * (Kq[q] + Kq[q].T)
+        Bq[q] = T @ np.asarray(raw_Bq[q], dtype=np.float64)
+    retained_fraction = float(np.sum(selected_values) / total)
+    metadata = {
+        "pod_energy_retention_requested": requested,
+        "pod_energy_retention_realized": retained_fraction,
+        "effective_rank": effective_rank,
+        "discarded_rank": int(len(eigenvalues) - effective_rank),
+        "gram_lambda_min": float(eigenvalues[0]),
+        "gram_lambda_max": float(eigenvalues[-1]),
+        "gram_transform_mode": "conventional_pod_energy",
+    }
+    return Kq, Bq, T.T, metadata
+
+
 def _assemble_dense_operators(
     *,
     phase: np.ndarray,
@@ -1423,6 +1931,9 @@ def _assemble_dense_operators(
     gram_rank_reveal: bool = False,
     gram_rank_rtol: float = 1.0e-11,
     contraction_compute_dtype: str | np.dtype = np.float64,
+    gram_compute_dtype: str | np.dtype = np.float64,
+    gram_backend: str = "auto",
+    overlap_cpu_gram_gpu: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Compatibility assembly for non phase-contiguous layouts."""
     t0 = time.perf_counter()
@@ -1435,9 +1946,18 @@ def _assemble_dense_operators(
     q_count = len(coefficient_names)
     values = _basis_chunk(basis, nvox=nvox, start=0, end=nvox)
     compute_dtype = _ritz_compute_dtype(contraction_compute_dtype)
+    gram_dtype = _ritz_compute_dtype(gram_compute_dtype)
+    selected_gram_backend = _ritz_gram_backend(gram_backend)
     raw_Kq = np.zeros((q_count, r, r), dtype=np.float64)
     raw_Bq = np.zeros((q_count, r, 6), dtype=np.float64)
-    G = _contract_component_major(values, values) / float(nvox)
+    G = None
+    if not bool(preserve_raw_coordinates):
+        gram_contract = (
+            _contract_component_major_cpu
+            if selected_gram_backend == "cpu"
+            else _contract_component_major_compute
+        )
+        G = gram_contract(values, values, compute_dtype=gram_dtype) / float(nvox)
     stress_started = time.perf_counter()
     stresses = np.asarray(affine.apply_all(np.asarray(values, dtype=compute_dtype)))
     affine_stress_wall_s = float(time.perf_counter() - stress_started)
@@ -1458,7 +1978,8 @@ def _assemble_dense_operators(
         del stresses_gpu
     contraction_wall_s = float(time.perf_counter() - contraction_started)
     Dq = np.asarray(affine.averaged_stiffness, dtype=np.float64).copy()
-    G = 0.5 * (G + G.T)
+    if G is not None:
+        G = 0.5 * (G + G.T)
     for q in range(q_count):
         raw_Kq[q] = 0.5 * (raw_Kq[q] + raw_Kq[q].T)
         Dq[q] = 0.5 * (Dq[q] + Dq[q].T)
@@ -1467,15 +1988,16 @@ def _assemble_dense_operators(
         Bq = raw_Bq.copy()
         invR = np.eye(r, dtype=np.float64)
         gram_meta = {
-            "gram_lambda_min": float(np.linalg.eigvalsh(G)[0]),
-            "gram_lambda_max": float(np.linalg.eigvalsh(G)[-1]),
-            "gram_condition": float(np.linalg.cond(G)),
-            "gram_relative_min": float(
-                np.linalg.eigvalsh(G)[0] / max(np.linalg.eigvalsh(G)[-1], np.finfo(float).eps)
-            ),
+            "gram_lambda_min": 0.0,
+            "gram_lambda_max": 0.0,
+            "gram_condition": 1.0,
+            "gram_relative_min": 1.0,
             "effective_rank": int(r),
+            "discarded_rank": 0,
+            "gram_transform_mode": "raw_coordinates_no_gram",
         }
     else:
+        assert G is not None
         Kq, Bq, invR, gram_meta = _transform_raw_operators_with_rank_policy(
             raw_Kq,
             raw_Bq,
@@ -1489,17 +2011,28 @@ def _assemble_dense_operators(
         "contraction_mode": "dense_full_support",
         "contraction_dtype": str(values.dtype),
         "contraction_compute_dtype": str(compute_dtype),
-        "gram_product_dtype": "float64",
+        "gram_product_dtype": (
+            "not_computed" if bool(preserve_raw_coordinates) else str(gram_dtype)
+        ),
+        "gram_product_backend": (
+            "none" if bool(preserve_raw_coordinates) else selected_gram_backend
+        ),
+        "gram_product_wall_s": 0.0,
+        "gram_overlap_wait_wall_s": 0.0,
+        "gram_overlap_hidden_wall_s": 0.0,
+        "gram_overlap_requested": False,
+        "gram_overlap_enabled": False,
         "affine_stress_wall_s": affine_stress_wall_s,
         "contraction_wall_s": contraction_wall_s,
         "stress_workspace_peak_bytes": int(stresses.nbytes),
         "full_volume_equivalent_passes": float(q_count),
         "raw_Kq": raw_Kq,
         "raw_Bq": raw_Bq,
-        "G": G,
         "invR": invR,
         **gram_meta,
     }
+    if G is not None:
+        metadata["G"] = G
     return Kq, Bq, Dq, metadata
 
 
@@ -1513,6 +2046,10 @@ def _assemble_reduced_operators(
     gram_rank_reveal: bool = False,
     gram_rank_rtol: float = 1.0e-11,
     contraction_compute_dtype: str | np.dtype = np.float64,
+    gram_compute_dtype: str | np.dtype = np.float64,
+    gram_backend: str = "auto",
+    overlap_cpu_gram_gpu: bool = False,
+    preserve_raw_coordinates: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Stream an exact reduced Ritz assembly without stacking the global basis.
 
@@ -1526,6 +2063,8 @@ def _assemble_reduced_operators(
     if r < 1:
         raise ValueError("basis must contain at least one field")
     compute_dtype = _ritz_compute_dtype(contraction_compute_dtype)
+    gram_dtype = _ritz_compute_dtype(gram_compute_dtype)
+    selected_gram_backend = _ritz_gram_backend(gram_backend)
     external_affine = affine_stress_batch is not None
     affine = affine_stress_batch or affine_stress_batch_factory(phase, ori)
     apply_chunk = getattr(affine, "apply_supported_chunk", None)
@@ -1537,10 +2076,16 @@ def _assemble_reduced_operators(
             ori=ori,
             basis=basis,
             affine_stress_batch=affine,
-            preserve_raw_coordinates=external_affine and isinstance(basis, list),
+            preserve_raw_coordinates=(
+                bool(preserve_raw_coordinates)
+                or (external_affine and isinstance(basis, list))
+            ),
             gram_rank_reveal=bool(gram_rank_reveal),
             gram_rank_rtol=float(gram_rank_rtol),
             contraction_compute_dtype=compute_dtype,
+            gram_compute_dtype=gram_dtype,
+            gram_backend=selected_gram_backend,
+            overlap_cpu_gram_gpu=bool(overlap_cpu_gram_gpu),
         )
 
     coefficient_names = tuple(getattr(affine, "coefficient_names", COEFF_NAMES))
@@ -1555,13 +2100,21 @@ def _assemble_reduced_operators(
     ).dtype
     chunk_voxels = _stream_chunk_voxels(
         ranks=(r,), q_block_size=q_block_size, nvox=nvox,
-        storage_itemsize=max(int(first_dtype.itemsize), int(compute_dtype.itemsize)),
+        storage_itemsize=max(
+            int(first_dtype.itemsize),
+            int(compute_dtype.itemsize),
+            int(gram_dtype.itemsize),
+        ),
         max_chunk_voxels=1_000_000,
     )
 
     raw_Kq = np.zeros((q_count, r, r), dtype=np.float64)
     raw_Bq = np.zeros((q_count, r, 6), dtype=np.float64)
-    G = np.zeros((r, r), dtype=np.float64)
+    G = (
+        None
+        if bool(preserve_raw_coordinates)
+        else np.zeros((r, r), dtype=np.float64)
+    )
     affine_stress_wall_s = 0.0
     contraction_wall_s = 0.0
     stress_workspace_peak_bytes = 0
@@ -1570,6 +2123,18 @@ def _assemble_reduced_operators(
     gpu_affine_chunks = 0
     cpu_affine_chunks = 0
     gpu_affine_fallback = ""
+    gram_product_wall_s = 0.0
+    gram_overlap_wait_wall_s = 0.0
+    gram_overlap_used_chunks = 0
+    gram_executor = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="ritz-gram")
+        if (
+            not bool(preserve_raw_coordinates)
+            and bool(overlap_cpu_gram_gpu)
+            and selected_gram_backend == "cpu"
+        )
+        else None
+    )
 
     for support, support_indices, selector in support_blocks:
         support_start = int(selector.start or 0)
@@ -1583,12 +2148,43 @@ def _assemble_reduced_operators(
             values = _basis_chunk(basis, nvox=nvox, start=global_start, end=global_end)
             contraction_started = time.perf_counter()
             values_gpu = _gpu_flat_compute(values, compute_dtype=compute_dtype)
-            if values_gpu is not None:
+            gram_future: Future[tuple[np.ndarray, float]] | None = None
+            gram_gpu = None
+            if not bool(preserve_raw_coordinates):
+                gram_gpu = (
+                    values_gpu
+                    if selected_gram_backend != "cpu" and gram_dtype == compute_dtype
+                    else (
+                        _gpu_flat_compute(values, compute_dtype=gram_dtype)
+                        if selected_gram_backend != "cpu"
+                        else None
+                    )
+                )
+            separate_gram_gpu = gram_gpu is not None and gram_gpu is not values_gpu
+            if gram_gpu is not None:
                 import cupy as cp
-                basis_gpu_uploads += 1
-                G += cp.asnumpy(values_gpu @ values_gpu.T) / float(nvox)
-            else:
-                G += _contract_component_major(values, values) / float(nvox)
+                gram_started = time.perf_counter()
+                basis_gpu_uploads += 1 + int(separate_gram_gpu)
+                assert G is not None
+                G += cp.asnumpy(gram_gpu @ gram_gpu.T) / float(nvox)
+                gram_product_wall_s += float(time.perf_counter() - gram_started)
+            elif gram_executor is not None and values_gpu is not None and apply_chunk_gpu is not None:
+                gram_future = gram_executor.submit(
+                    _timed_cpu_gram,
+                    values,
+                    compute_dtype=gram_dtype,
+                )
+                gram_overlap_used_chunks += 1
+            elif not bool(preserve_raw_coordinates):
+                gram_contract = (
+                    _contract_component_major_cpu
+                    if selected_gram_backend == "cpu"
+                    else _contract_component_major_compute
+                )
+                gram_started = time.perf_counter()
+                assert G is not None
+                G += gram_contract(values, values, compute_dtype=gram_dtype) / float(nvox)
+                gram_product_wall_s += float(time.perf_counter() - gram_started)
             contraction_wall_s += float(time.perf_counter() - contraction_started)
             support_offset = global_start - support_start
 
@@ -1654,30 +2250,76 @@ def _assemble_reduced_operators(
                     del stresses_gpu
                 else:
                     del stresses
+            if gram_future is not None:
+                wait_started = time.perf_counter()
+                gram_block, gram_elapsed = gram_future.result()
+                wait_elapsed = float(time.perf_counter() - wait_started)
+                assert G is not None
+                G += gram_block / float(nvox)
+                gram_product_wall_s += float(gram_elapsed)
+                gram_overlap_wait_wall_s += wait_elapsed
+                contraction_wall_s += wait_elapsed
+            if separate_gram_gpu:
+                del gram_gpu
             if values_gpu is not None:
                 del values_gpu
             del values
 
+    if gram_executor is not None:
+        gram_executor.shutdown(wait=True)
+
     averaged = getattr(affine, "averaged_stiffness", None)
     Dq = np.asarray(averaged, dtype=np.float64).copy()
-    G = 0.5 * (G + G.T)
+    if G is not None:
+        G = 0.5 * (G + G.T)
     for q in range(q_count):
         raw_Kq[q] = 0.5 * (raw_Kq[q] + raw_Kq[q].T)
         Dq[q] = 0.5 * (Dq[q] + Dq[q].T)
 
-    Kq, Bq, invR, gram_meta = _transform_raw_operators_with_rank_policy(
-        raw_Kq,
-        raw_Bq,
-        G,
-        allow_rank_reveal=bool(gram_rank_reveal),
-        rank_rtol=float(gram_rank_rtol),
-    )
+    if bool(preserve_raw_coordinates):
+        Kq = raw_Kq.copy()
+        Bq = raw_Bq.copy()
+        invR = np.eye(r, dtype=np.float64)
+        gram_meta = {
+            "gram_lambda_min": 0.0,
+            "gram_lambda_max": 0.0,
+            "gram_condition": 1.0,
+            "gram_relative_min": 1.0,
+            "effective_rank": int(r),
+            "discarded_rank": 0,
+            "gram_transform_mode": "raw_coordinates_no_gram",
+        }
+    else:
+        assert G is not None
+        Kq, Bq, invR, gram_meta = _transform_raw_operators_with_rank_policy(
+            raw_Kq,
+            raw_Bq,
+            G,
+            allow_rank_reveal=bool(gram_rank_reveal),
+            rank_rtol=float(gram_rank_rtol),
+        )
     metadata = {
         "assembly_wall_s": float(time.perf_counter() - t0),
         "assembly_mode": "phase_supported_blocks",
         "contraction_mode": "phase_supported_blocks",
         "contraction_dtype": str(first_dtype),
-        "gram_product_dtype": str(compute_dtype),
+        "gram_product_dtype": (
+            "not_computed" if bool(preserve_raw_coordinates) else str(gram_dtype)
+        ),
+        "gram_product_backend": (
+            "none" if bool(preserve_raw_coordinates) else selected_gram_backend
+        ),
+        "gram_overlap_requested": bool(overlap_cpu_gram_gpu)
+        and not bool(preserve_raw_coordinates),
+        "gram_overlap_enabled": bool(gram_overlap_used_chunks),
+        "gram_overlap_used_chunks": int(gram_overlap_used_chunks),
+        "gram_product_wall_s": float(gram_product_wall_s),
+        "gram_overlap_wait_wall_s": float(gram_overlap_wait_wall_s),
+        "gram_overlap_hidden_wall_s": float(
+            max(0.0, gram_product_wall_s - gram_overlap_wait_wall_s)
+            if gram_overlap_used_chunks
+            else 0.0
+        ),
         "contraction_compute_dtype": str(compute_dtype),
         "reduced_accumulation_dtype": "float64",
         "affine_stress_wall_s": affine_stress_wall_s,
@@ -1697,10 +2339,11 @@ def _assemble_reduced_operators(
         "gpu_affine_fallback": gpu_affine_fallback,
         "raw_Kq": raw_Kq,
         "raw_Bq": raw_Bq,
-        "G": G,
         "invR": invR,
         **gram_meta,
     }
+    if G is not None:
+        metadata["G"] = G
     return Kq, Bq, Dq, metadata
 
 
@@ -1714,11 +2357,22 @@ def _extend_reduced_operators(
     gram_rank_reveal: bool = False,
     gram_rank_rtol: float = 1.0e-11,
     contraction_compute_dtype: str | np.dtype = np.float64,
+    gram_compute_dtype: str | np.dtype = np.float64,
+    gram_backend: str = "auto",
+    overlap_cpu_gram_gpu: bool = False,
+    preserve_raw_coordinates: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Exact streaming extension of raw Ritz blocks, followed by re-whitening."""
     t0 = time.perf_counter()
     compute_dtype = _ritz_compute_dtype(contraction_compute_dtype)
-    if "raw_Kq" not in existing or "raw_Bq" not in existing or "G" not in existing:
+    gram_dtype = _ritz_compute_dtype(gram_compute_dtype)
+    selected_gram_backend = _ritz_gram_backend(gram_backend)
+    raw_cache_available = (
+        "raw_Kq" in existing
+        and "raw_Bq" in existing
+        and (bool(preserve_raw_coordinates) or "G" in existing)
+    )
+    if not raw_cache_available:
         if isinstance(old_basis, np.ndarray) or isinstance(new_basis, np.ndarray):
             old_array = np.asarray(old_basis)
             new_array = np.asarray(new_basis)
@@ -1745,6 +2399,10 @@ def _extend_reduced_operators(
             gram_rank_reveal=bool(gram_rank_reveal),
             gram_rank_rtol=float(gram_rank_rtol),
             contraction_compute_dtype=compute_dtype,
+            gram_compute_dtype=gram_dtype,
+            gram_backend=selected_gram_backend,
+            overlap_cpu_gram_gpu=bool(overlap_cpu_gram_gpu),
+            preserve_raw_coordinates=bool(preserve_raw_coordinates),
         )
         metadata.update({
             "assembly_mode": "incremental",
@@ -1755,7 +2413,11 @@ def _extend_reduced_operators(
 
     raw_K_old = np.asarray(existing["raw_Kq"], dtype=np.float64)
     raw_B_old = np.asarray(existing["raw_Bq"], dtype=np.float64)
-    G_old = np.asarray(existing["G"], dtype=np.float64)
+    G_old = (
+        None
+        if bool(preserve_raw_coordinates)
+        else np.asarray(existing["G"], dtype=np.float64)
+    )
     Dq = np.asarray(existing["Dq"], dtype=np.float64).copy()
     old_rank = int(raw_K_old.shape[1])
     count = int(len(new_basis) if isinstance(new_basis, list) else new_basis.shape[0])
@@ -1789,16 +2451,25 @@ def _extend_reduced_operators(
     ).dtype
     chunk_voxels = _stream_chunk_voxels(
         ranks=(old_rank, count), q_block_size=q_block_size, nvox=nvox,
-        storage_itemsize=max(int(first_dtype.itemsize), int(compute_dtype.itemsize)),
+        storage_itemsize=max(
+            int(first_dtype.itemsize),
+            int(compute_dtype.itemsize),
+            int(gram_dtype.itemsize),
+        ),
         max_chunk_voxels=1_000_000,
     )
 
     raw_Kq = np.zeros((q_count, new_rank, new_rank), dtype=np.float64)
     raw_Bq = np.zeros((q_count, new_rank, 6), dtype=np.float64)
-    G = np.zeros((new_rank, new_rank), dtype=np.float64)
+    G = (
+        None
+        if bool(preserve_raw_coordinates)
+        else np.zeros((new_rank, new_rank), dtype=np.float64)
+    )
     raw_Kq[:, :old_rank, :old_rank] = raw_K_old
     raw_Bq[:, :old_rank] = raw_B_old
-    G[:old_rank, :old_rank] = G_old
+    if G is not None and G_old is not None:
+        G[:old_rank, :old_rank] = G_old
     affine_stress_wall_s = 0.0
     contraction_wall_s = 0.0
     stress_workspace_peak_bytes = 0
@@ -1807,6 +2478,18 @@ def _extend_reduced_operators(
     gpu_affine_chunks = 0
     cpu_affine_chunks = 0
     gpu_affine_fallback = ""
+    gram_product_wall_s = 0.0
+    gram_overlap_wait_wall_s = 0.0
+    gram_overlap_used_chunks = 0
+    gram_executor = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="ritz-gram")
+        if (
+            not bool(preserve_raw_coordinates)
+            and bool(overlap_cpu_gram_gpu)
+            and selected_gram_backend == "cpu"
+        )
+        else None
+    )
 
     for support, support_indices, selector in support_blocks:
         support_start = int(selector.start or 0)
@@ -1822,22 +2505,80 @@ def _extend_reduced_operators(
             contraction_started = time.perf_counter()
             old_gpu = _gpu_flat_compute(old_values, compute_dtype=compute_dtype)
             new_gpu = _gpu_flat_compute(new_values, compute_dtype=compute_dtype)
-            if old_gpu is not None and new_gpu is not None:
+            gram_future: Future[tuple[np.ndarray, np.ndarray, float]] | None = None
+            old_gram_gpu = None
+            new_gram_gpu = None
+            if not bool(preserve_raw_coordinates):
+                old_gram_gpu = (
+                    old_gpu
+                    if selected_gram_backend != "cpu" and gram_dtype == compute_dtype
+                    else (
+                        _gpu_flat_compute(old_values, compute_dtype=gram_dtype)
+                        if selected_gram_backend != "cpu"
+                        else None
+                    )
+                )
+                new_gram_gpu = (
+                    new_gpu
+                    if selected_gram_backend != "cpu" and gram_dtype == compute_dtype
+                    else (
+                        _gpu_flat_compute(new_values, compute_dtype=gram_dtype)
+                        if selected_gram_backend != "cpu"
+                        else None
+                    )
+                )
+            separate_old_gram_gpu = (
+                old_gram_gpu is not None and old_gram_gpu is not old_gpu
+            )
+            separate_new_gram_gpu = (
+                new_gram_gpu is not None and new_gram_gpu is not new_gpu
+            )
+            if old_gram_gpu is not None and new_gram_gpu is not None:
                 import cupy as cp
+                gram_started = time.perf_counter()
                 basis_gpu_uploads += 2
+                basis_gpu_uploads += int(separate_old_gram_gpu)
+                basis_gpu_uploads += int(separate_new_gram_gpu)
+                assert G is not None
                 G[:old_rank, old_rank:] += cp.asnumpy(
-                    old_gpu @ new_gpu.T
+                    old_gram_gpu @ new_gram_gpu.T
                 ) / float(nvox)
                 G[old_rank:, old_rank:] += cp.asnumpy(
-                    new_gpu @ new_gpu.T
+                    new_gram_gpu @ new_gram_gpu.T
                 ) / float(nvox)
-            else:
+                gram_product_wall_s += float(time.perf_counter() - gram_started)
+            elif (
+                gram_executor is not None
+                and old_gpu is not None
+                and new_gpu is not None
+                and apply_chunk_gpu is not None
+            ):
+                gram_future = gram_executor.submit(
+                    _timed_cpu_gram_extension,
+                    old_values,
+                    new_values,
+                    compute_dtype=gram_dtype,
+                )
+                gram_overlap_used_chunks += 1
+            elif not bool(preserve_raw_coordinates):
+                gram_contract = (
+                    _contract_component_major_cpu
+                    if selected_gram_backend == "cpu"
+                    else _contract_component_major_compute
+                )
+                gram_started = time.perf_counter()
+                assert G is not None
                 G[:old_rank, old_rank:] += (
-                    _contract_component_major(old_values, new_values) / float(nvox)
+                    gram_contract(
+                        old_values, new_values, compute_dtype=gram_dtype
+                    ) / float(nvox)
                 )
                 G[old_rank:, old_rank:] += (
-                    _contract_component_major(new_values, new_values) / float(nvox)
+                    gram_contract(
+                        new_values, new_values, compute_dtype=gram_dtype
+                    ) / float(nvox)
                 )
+                gram_product_wall_s += float(time.perf_counter() - gram_started)
             contraction_wall_s += float(time.perf_counter() - contraction_started)
             support_offset = global_start - support_start
 
@@ -1920,31 +2661,80 @@ def _extend_reduced_operators(
                     del stresses_gpu
                 else:
                     del stresses
+            if gram_future is not None:
+                wait_started = time.perf_counter()
+                gram_cross, gram_diagonal, gram_elapsed = gram_future.result()
+                wait_elapsed = float(time.perf_counter() - wait_started)
+                assert G is not None
+                G[:old_rank, old_rank:] += gram_cross / float(nvox)
+                G[old_rank:, old_rank:] += gram_diagonal / float(nvox)
+                gram_product_wall_s += float(gram_elapsed)
+                gram_overlap_wait_wall_s += wait_elapsed
+                contraction_wall_s += wait_elapsed
+            if separate_old_gram_gpu:
+                del old_gram_gpu
+            if separate_new_gram_gpu:
+                del new_gram_gpu
             if old_gpu is not None:
                 del old_gpu
             if new_gpu is not None:
                 del new_gpu
             del old_values, new_values
 
-    G[old_rank:, :old_rank] = G[:old_rank, old_rank:].T
-    G = 0.5 * (G + G.T)
+    if gram_executor is not None:
+        gram_executor.shutdown(wait=True)
+
+    if G is not None:
+        G[old_rank:, :old_rank] = G[:old_rank, old_rank:].T
+        G = 0.5 * (G + G.T)
     for q in range(q_count):
         raw_Kq[q, old_rank:, :old_rank] = raw_Kq[q, :old_rank, old_rank:].T
         raw_Kq[q] = 0.5 * (raw_Kq[q] + raw_Kq[q].T)
 
-    Kq, Bq, invR, gram_meta = _transform_raw_operators_with_rank_policy(
-        raw_Kq,
-        raw_Bq,
-        G,
-        allow_rank_reveal=bool(gram_rank_reveal),
-        rank_rtol=float(gram_rank_rtol),
-    )
+    if bool(preserve_raw_coordinates):
+        Kq = raw_Kq.copy()
+        Bq = raw_Bq.copy()
+        invR = np.eye(new_rank, dtype=np.float64)
+        gram_meta = {
+            "gram_lambda_min": 0.0,
+            "gram_lambda_max": 0.0,
+            "gram_condition": 1.0,
+            "gram_relative_min": 1.0,
+            "effective_rank": int(new_rank),
+            "discarded_rank": 0,
+            "gram_transform_mode": "raw_coordinates_no_gram",
+        }
+    else:
+        assert G is not None
+        Kq, Bq, invR, gram_meta = _transform_raw_operators_with_rank_policy(
+            raw_Kq,
+            raw_Bq,
+            G,
+            allow_rank_reveal=bool(gram_rank_reveal),
+            rank_rtol=float(gram_rank_rtol),
+        )
     metadata = {
         "assembly_wall_s": float(time.perf_counter() - t0),
         "assembly_mode": "incremental",
         "contraction_mode": "phase_supported_blocks",
         "contraction_dtype": str(first_dtype),
-        "gram_product_dtype": str(compute_dtype),
+        "gram_product_dtype": (
+            "not_computed" if bool(preserve_raw_coordinates) else str(gram_dtype)
+        ),
+        "gram_product_backend": (
+            "none" if bool(preserve_raw_coordinates) else selected_gram_backend
+        ),
+        "gram_overlap_requested": bool(overlap_cpu_gram_gpu)
+        and not bool(preserve_raw_coordinates),
+        "gram_overlap_enabled": bool(gram_overlap_used_chunks),
+        "gram_overlap_used_chunks": int(gram_overlap_used_chunks),
+        "gram_product_wall_s": float(gram_product_wall_s),
+        "gram_overlap_wait_wall_s": float(gram_overlap_wait_wall_s),
+        "gram_overlap_hidden_wall_s": float(
+            max(0.0, gram_product_wall_s - gram_overlap_wait_wall_s)
+            if gram_overlap_used_chunks
+            else 0.0
+        ),
         "contraction_compute_dtype": str(compute_dtype),
         "reduced_accumulation_dtype": "float64",
         "affine_stress_wall_s": affine_stress_wall_s,
@@ -1964,10 +2754,11 @@ def _extend_reduced_operators(
         "gpu_affine_fallback": gpu_affine_fallback,
         "raw_Kq": raw_Kq,
         "raw_Bq": raw_Bq,
-        "G": G,
         "invR": invR,
         **gram_meta,
     }
+    if G is not None:
+        metadata["G"] = G
     return Kq, Bq, Dq, metadata
 
 
@@ -1976,14 +2767,11 @@ def _solve_spd_reduced(K: np.ndarray, B: np.ndarray) -> np.ndarray:
     stiffness = 0.5 * (np.asarray(K, dtype=np.float64) + np.asarray(K, dtype=np.float64).T)
     rhs = -np.asarray(B, dtype=np.float64)
     try:
-        factor = scipy_linalg.cho_factor(
-            stiffness, lower=True, overwrite_a=False, check_finite=False
-        )
-        return scipy_linalg.cho_solve(factor, rhs, check_finite=False)
-    except scipy_linalg.LinAlgError as exc:
+        return np.linalg.solve(stiffness, rhs)
+    except np.linalg.LinAlgError as exc:
         eigvals = scipy_linalg.eigvalsh(stiffness, check_finite=False)
         raise np.linalg.LinAlgError(
-            "Reduced Ritz stiffness lost SPD; refusing silent regularization. "
+            "Reduced Ritz solve failed; refusing silent regularization. "
             f"lambda_min={float(eigvals[0]):.3e}, lambda_max={float(eigvals[-1]):.3e}."
         ) from exc
 
@@ -2071,14 +2859,7 @@ class GpuAffineBatchEvaluator:
         return result, wall
 
 class IncrementalAffineBatchEvaluator:
-    """Maintain exact batched Ritz solves as the basis grows by small blocks.
-
-    For a fixed candidate pool, extending a reduced basis from ``r`` to
-    ``r + b`` only appends a block to every SPD system.  The block Cholesky
-    identity updates each candidate in ``O(r**2 b)`` instead of solving every
-    dense system again in ``O(r**3)``.  It is deliberately an algebraic cache:
-    all returned amplitudes are those of the full current Ritz system.
-    """
+    """Maintain exact batched Ritz solves as the basis grows by small blocks."""
 
     def __init__(
         self,
@@ -2094,65 +2875,30 @@ class IncrementalAffineBatchEvaluator:
         self.rank = int(Kq.shape[1])
         if self.rank < 1 or Kq.shape[2] != self.rank or Bq.shape[1] != self.rank:
             raise ValueError("Kq and Bq must define a non-empty square reduced system.")
-        self.B = np.einsum("nq,qij->nij", self.coefficients, Bq, optimize=True)
-        self.D = np.einsum("nq,qij->nij", self.coefficients, Dq, optimize=True)
-        stiffness = np.einsum("nq,qij->nij", self.coefficients, Kq, optimize=True)
-        stiffness = 0.5 * (stiffness + np.swapaxes(stiffness, -1, -2))
-        try:
-            self.cholesky = np.linalg.cholesky(stiffness)
-        except np.linalg.LinAlgError as error:
-            raise np.linalg.LinAlgError(
-                "The reduced systems must be SPD for incremental Cholesky updates."
-            ) from error
-        self.amplitudes = self._solve_from_cholesky(self.cholesky, -self.B)
+        self._assemble_and_solve(Kq, Bq, Dq)
         self.initialization_wall_s = float(time.perf_counter() - started)
         self.last_update_wall_s = self.initialization_wall_s
 
-    @staticmethod
-    def _forward_lower(lower: np.ndarray, right: np.ndarray) -> np.ndarray:
-        """Batched forward substitution for lower triangular matrices."""
-        L = np.asarray(lower, dtype=np.float64)
-        rhs = np.asarray(right, dtype=np.float64)
-        if L.ndim != 3 or rhs.ndim != 3 or L.shape[0] != rhs.shape[0] or L.shape[1] != rhs.shape[1]:
-            raise ValueError("Incompatible batched triangular solve shapes.")
-        if _NUMBA_TRIANGULAR_AVAILABLE:
-            return _forward_lower_numba(
-                np.ascontiguousarray(L), np.ascontiguousarray(rhs)
-            )
-        result = np.empty_like(rhs)
-        for row in range(L.shape[1]):
-            value = rhs[:, row]
-            if row:
-                value = value - np.einsum(
-                    "ni,nij->nj", L[:, row, :row], result[:, :row], optimize=True
-                )
-            result[:, row] = value / L[:, row, row, None]
-        return result
-
-    @staticmethod
-    def _backward_lower_transpose(lower: np.ndarray, right: np.ndarray) -> np.ndarray:
-        """Batched backward substitution for ``L.T x = right``."""
-        L = np.asarray(lower, dtype=np.float64)
-        rhs = np.asarray(right, dtype=np.float64)
-        if L.ndim != 3 or rhs.ndim != 3 or L.shape[0] != rhs.shape[0] or L.shape[1] != rhs.shape[1]:
-            raise ValueError("Incompatible batched triangular solve shapes.")
-        if _NUMBA_TRIANGULAR_AVAILABLE:
-            return _backward_lower_transpose_numba(
-                np.ascontiguousarray(L), np.ascontiguousarray(rhs)
-            )
-        result = np.empty_like(rhs)
-        for row in range(L.shape[1] - 1, -1, -1):
-            value = rhs[:, row]
-            if row + 1 < L.shape[1]:
-                value = value - np.einsum(
-                    "ni,nij->nj", L[:, row + 1 :, row], result[:, row + 1 :], optimize=True
-                )
-            result[:, row] = value / L[:, row, row, None]
-        return result
-
-    @classmethod
-    def _solve_from_cholesky(cls, lower: np.ndarray, right: np.ndarray) -> np.ndarray:
-        return cls._backward_lower_transpose(lower, cls._forward_lower(lower, right))
+    def _assemble_and_solve(
+        self,
+        Kq: np.ndarray,
+        Bq: np.ndarray,
+        Dq: np.ndarray,
+    ) -> None:
+        self.B = np.einsum("nq,qij->nij", self.coefficients, Bq, optimize=True)
+        self.D = np.einsum("nq,qij->nij", self.coefficients, Dq, optimize=True)
+        self.stiffness = np.einsum(
+            "nq,qij->nij", self.coefficients, Kq, optimize=True
+        )
+        self.stiffness = 0.5 * (
+            self.stiffness + np.swapaxes(self.stiffness, -1, -2)
+        )
+        try:
+            self.amplitudes = np.linalg.solve(self.stiffness, -self.B)
+        except np.linalg.LinAlgError as error:
+            raise np.linalg.LinAlgError(
+                "A reduced Ritz solve failed; no regularization is applied."
+            ) from error
 
     def extend(
         self,
@@ -2160,7 +2906,7 @@ class IncrementalAffineBatchEvaluator:
         Bq: np.ndarray,
         Dq: np.ndarray,
     ) -> dict[str, float | int | str]:
-        """Append new Ritz coordinates using an exact block Cholesky update."""
+        """Replace the affine blocks and solve the enlarged dense systems."""
         started = time.perf_counter()
         new_rank = int(Kq.shape[1])
         if Kq.shape[2] != new_rank or Bq.shape[1] != new_rank:
@@ -2168,9 +2914,9 @@ class IncrementalAffineBatchEvaluator:
         if new_rank < self.rank:
             raise ValueError("Incremental evaluator cannot shrink the reduced basis.")
         if new_rank == self.rank:
-            self.D = np.einsum("nq,qij->nij", self.coefficients, Dq, optimize=True)
+            self._assemble_and_solve(Kq, Bq, Dq)
             return {
-                "update_mode": "unchanged",
+                "update_mode": "dense_resolve",
                 "old_rank": self.rank,
                 "new_rank": new_rank,
                 "update_wall_s": float(time.perf_counter() - started),
@@ -2178,48 +2924,11 @@ class IncrementalAffineBatchEvaluator:
 
         old_rank = self.rank
         block_rank = new_rank - old_rank
-        cross = np.einsum(
-            "nq,qij->nij", self.coefficients, Kq[:, :old_rank, old_rank:new_rank], optimize=True
-        )
-        diagonal = np.einsum(
-            "nq,qij->nij", self.coefficients, Kq[:, old_rank:new_rank, old_rank:new_rank], optimize=True
-        )
-        new_B = np.einsum(
-            "nq,qij->nij", self.coefficients, Bq[:, old_rank:new_rank], optimize=True)
-        W = self._forward_lower(self.cholesky, cross)
-        schur = diagonal - np.einsum("nri,nrj->nij", W, W, optimize=True)
-        schur = 0.5 * (schur + np.swapaxes(schur, -1, -2))
-        try:
-            new_lower = np.linalg.cholesky(schur)
-        except np.linalg.LinAlgError as error:
-            raise np.linalg.LinAlgError(
-                "A Schur block lost positive definiteness during the Ritz update."
-            ) from error
-        right = -(new_B + np.einsum("nri,nrj->nij", cross, self.amplitudes, optimize=True))
-        new_amplitudes = self._solve_from_cholesky(new_lower, right)
-        correction = self._backward_lower_transpose(
-            self.cholesky,
-            np.einsum("nrb,nbj->nrj", W, new_amplitudes, optimize=True),
-        )
-        all_amplitudes = np.empty(
-            (len(self.coefficients), new_rank, 6), dtype=np.float64
-        )
-        all_amplitudes[:, :old_rank] = self.amplitudes - correction
-        all_amplitudes[:, old_rank:] = new_amplitudes
-        all_lower = np.zeros(
-            (len(self.coefficients), new_rank, new_rank), dtype=np.float64
-        )
-        all_lower[:, :old_rank, :old_rank] = self.cholesky
-        all_lower[:, old_rank:, :old_rank] = np.swapaxes(W, -1, -2)
-        all_lower[:, old_rank:, old_rank:] = new_lower
         self.rank = new_rank
-        self.B = np.concatenate((self.B, new_B), axis=1)
-        self.D = np.einsum("nq,qij->nij", self.coefficients, Dq, optimize=True)
-        self.cholesky = all_lower
-        self.amplitudes = all_amplitudes
+        self._assemble_and_solve(Kq, Bq, Dq)
         self.last_update_wall_s = float(time.perf_counter() - started)
         return {
-            "update_mode": "block_cholesky",
+            "update_mode": "dense_resolve",
             "old_rank": old_rank,
             "appended_rank": block_rank,
             "new_rank": new_rank,
@@ -2273,36 +2982,82 @@ def _evaluate_rom(
         material_ids[idx] = int(row["material_id"])
         material_labels.append(str(row.get("material_label", "")))
 
-    # Build all affine systems once and use the batched SPD solver.
-    C_rom_all, amplitudes_all, batch_online_s = _rom_ceff_batch(
-        coeffs_all, Kq, Bq, Dq
-    )
+    # Use the batched path normally, then isolate failures per material if needed.
+    numerical_failures = np.zeros(n, dtype=bool)
+    failure_messages = [""] * n
+    try:
+        C_rom_all, amplitudes_all, batch_online_s = _rom_ceff_batch(
+            coeffs_all, Kq, Bq, Dq
+        )
+    except np.linalg.LinAlgError:
+        C_rom_all = np.full((n, 6, 6), np.nan, dtype=np.float64)
+        amplitudes_all = np.full((n, Kq.shape[1], 6), np.nan, dtype=np.float64)
+        batch_online_s = 0.0
+        for idx in range(n):
+            try:
+                C_rom_all[idx], amplitudes_all[idx], wall_s = _rom_ceff(
+                    coeffs_all[idx], Kq, Bq, Dq
+                )
+                batch_online_s += float(wall_s)
+            except np.linalg.LinAlgError as exc:
+                numerical_failures[idx] = True
+                failure_messages[idx] = str(exc)
     per_material_s = float(batch_online_s) / max(n, 1)
 
-    # Vectorized error and eigenvalue computation
+    # Vectorized diagnostics for successful materials; failed rows remain NaN.
+    valid = ~numerical_failures
     diff_all = C_rom_all - C_fom_all
     fom_norms = np.linalg.norm(C_fom_all.reshape(n, -1), axis=1)
     fom_norms = np.maximum(fom_norms, np.finfo(float).eps)
-    diff_norms = np.linalg.norm(diff_all.reshape(n, -1), axis=1)
-    rel_errors = diff_norms / fom_norms
-    eig_rom_all = np.linalg.eigvalsh(C_rom_all)
+    diff_norms = np.full(n, np.nan, dtype=np.float64)
+    rel_errors = np.full(n, np.nan, dtype=np.float64)
+    eig_rom_all = np.full((n, 6), np.nan, dtype=np.float64)
+    eig_diff_all = np.full((n, 6), np.nan, dtype=np.float64)
+    schur_eta = np.full(n, np.nan, dtype=np.float64)
+    if np.any(valid):
+        diff_norms[valid] = np.linalg.norm(diff_all[valid].reshape(valid.sum(), -1), axis=1)
+        rel_errors[valid] = diff_norms[valid] / fom_norms[valid]
+        eig_rom_all[valid] = np.linalg.eigvalsh(C_rom_all[valid])
     diff_sym = 0.5 * (diff_all + np.swapaxes(diff_all, -1, -2))
-    eig_diff_all = np.linalg.eigvalsh(diff_sym)
+    if np.any(valid):
+        eig_diff_all[valid] = np.linalg.eigvalsh(diff_sym[valid])
+    eig_fom_all = np.linalg.eigvalsh(C_fom_all)
+    fom_spectral_norms = np.max(np.abs(eig_fom_all), axis=1)
+    fom_spectral_norms = np.maximum(fom_spectral_norms, np.finfo(float).eps)
+    schur_eta[valid] = eig_diff_all[valid, 0] / fom_spectral_norms[valid]
+    K_all = np.einsum(
+        "nq,qij->nij", coeffs_all, np.asarray(Kq, dtype=np.float64), optimize=True
+    )
+    K_all = 0.5 * (K_all + np.swapaxes(K_all, -1, -2))
+    eig_K_all = np.linalg.eigvalsh(K_all)
+    spectral_spd_margin = eig_K_all[:, 0] / np.maximum(
+        eig_K_all[:, -1], np.finfo(float).tiny
+    )
 
     rows: list[dict[str, Any]] = []
     for idx in range(n):
         C_rom = C_rom_all[idx]
-        props = engineering_constants_from_Cmandel(C_rom)
+        props = (
+            engineering_constants_from_Cmandel(C_rom)
+            if valid[idx]
+            else {key: np.nan for key in ENGINEERING_COLUMNS}
+        )
         out = {
             "material_id": int(material_ids[idx]),
             "material_label": material_labels[idx],
+            "rom_numerical_failure": bool(numerical_failures[idx]),
+            "rom_failure_message": failure_messages[idx],
             "relative_frobenius_error": float(rel_errors[idx]),
             "absolute_frobenius_error": float(diff_norms[idx]),
             "rom_online_s": per_material_s,
             "rom_min_eig": float(eig_rom_all[idx, 0]),
             "rom_max_eig": float(eig_rom_all[idx, -1]),
+            "reduced_K_min_eig": float(eig_K_all[idx, 0]),
+            "reduced_K_max_eig": float(eig_K_all[idx, -1]),
+            "reduced_K_spectral_spd_margin": float(spectral_spd_margin[idx]),
             "min_eig_Crom_minus_Cfom": float(eig_diff_all[idx, 0]),
             "max_eig_Crom_minus_Cfom": float(eig_diff_all[idx, -1]),
+            "schur_eta": float(schur_eta[idx]),
             "amplitude_frobenius_norm": float(np.linalg.norm(amplitudes_all[idx])),
         }
         for q, name in enumerate(COEFF_NAMES):

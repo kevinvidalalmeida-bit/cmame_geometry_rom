@@ -25,27 +25,27 @@ Run the existing geometries with:
 python scripts/cmame_interpretable_pipeline/main.py --stage pipeline
 ```
 
-The optimized offline backend stores the voxel basis contiguously in `float32`,
-reveals the numerically resolved rank through the small snapshot Gram matrix,
-orders voxels for orientation-grouped affine kernels, and accumulates reduced
-blocks in `float64`. Ill-conditioned FP32 Ritz coordinates are discarded with
-a fixed tolerance; an SPD failure triggers one unregularized FP64 rebuild.
-Online material batches use vectorized maps and CUDA when available. In the default
-fixed mode no preliminary FFT monitor pool is solved. After the 14 training
-materials are frozen, a new independent five-material FFT set validates the
-ROM and never controls its construction. An explicit `--adaptive` run instead
-solves five preliminary monitor materials by default and reuses them only for
-stopping. Validation reports the observed count and percentage below
-`1e-4`, equivalent to `0.01%` relative Frobenius error. This percentage is
-empirical and is not presented as coverage of the entire continuous material
-domain.
+The optimized offline backend stores the complete raw snapshot span
+contiguously in `float32`, evaluates the snapshot Gram products on the CPU in
+`float64`, applies the orientation-grouped affine voxel kernels on the GPU in
+`float32`, and performs the small transformations in `float64`. A
+`1e-15` machine-zero guard removed no direction in the reported campaign; no
+regularization or automatic rebuild is used. Online material batches use
+vectorized CUDA algebra. The adaptive run solves five monitor materials once
+and uses them only for stopping. After the ROM is frozen, an independent
+20-material maximin design selected from a 4096-point Sobol pool validates the
+ROM and never controls its construction. Validation reports the observed
+counts below `1e-4` and `1e-3`, equivalent to `0.01%` and `0.1%` relative
+Frobenius error. These percentages are empirical and are not presented as
+coverage of the entire continuous material domain.
 
 The active configuration points to the completed `60`, `150`, and `240` voxel
 geometries. The final validation set provides finite empirical error evidence;
 the workflow makes no global certification claim over the continuous material
 domain.
 
-For exact full-rank operation, basis memory grows as `O(Nvox*r)`, offline POD
-and K/B/D work as `O(Nvox*r^2)`, and dense online solves as `O(r^3)`. The active
-pipeline shrinks POD, K/B/D, and ROM batches as rank grows. It fails before
-creating output only when the exact basis plus minimum workspaces cannot fit.
+For full-rank operation, raw-snapshot memory grows as `O(Nvox*p)`,
+offline POD and K/B/D contractions as `O(Nvox*p^2)`, and dense online solves
+as `O(r^3)`, with `r=p` in the reported campaign. The active pipeline shrinks
+POD, K/B/D, and ROM batches as rank grows. It fails before creating output
+only when the snapshots plus minimum workspaces cannot fit.
