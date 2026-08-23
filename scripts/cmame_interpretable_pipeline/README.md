@@ -46,13 +46,17 @@ Default choices:
   monitor materials are solved once and never enter the snapshot matrix.
 - FFT precision: training, monitoring, and FOM timing use `float32` with
   `rtol=1e-5`; held-out references use `float64` with `rtol=1e-6` only to
-  measure error. Snapshots and affine voxel actions use `float32`, Gram
-  products use CPU `float64`, and reduced transformations and online dense
+  measure error. Snapshots and exact constitutive-rank contractions use
+  `float32`; reduced accumulation, reference-energy QR, and online dense
   solves use `float64`. No structural audit is part of the nominal campaign.
-- Gram orthonormalization uses a symmetric eigendecomposition and retains the
-  complete snapshot span. The `1e-15` machine-zero guard removed no direction
-  in the reported campaign. A failed reduced solve is reported without
-  probing, regularization, or rebuilding the frozen ROM.
+- Full-span coordinates: enrichment retains raw snapshots and assembles exact
+  affine Ritz blocks without a Euclidean snapshot Gram. At freeze, the mean
+  candidate coefficient vector defines a coercive reference operator whose
+  Cholesky factor supplies the QR coordinates. This introduces no truncation
+  and requires no additional voxel-scale pass.
+- Ritz streaming: two CUDA streams and two pinned voxel-chunk buffers overlap
+  host-to-device transfer with factorized contractions. The total pinned cap
+  is `1 GiB`; snapshot generation and loading remain one material at a time.
 - The ROM archive and SHA-256 hash are written before the held-out design is
   created. Twenty common validation materials are selected deterministically
   by affine-coefficient maximin traversal of an independent 4096-point Sobol
@@ -89,16 +93,16 @@ python scripts/cmame_interpretable_pipeline/04_sobol_pod_pipeline.py \
   result return. Ten fresh-process CUDA cold starts are recorded separately;
   speed-up and break-even use the lower isolated-query CPU latency.
 - Memory controls: POD and affine-stress workspaces are capped at `8 GiB`, ROM
-  batches at `4 GiB`, and full-rank runs must fit within 80% of available host
-  memory. The raw-Ritz path orthonormalizes the complete span through the
-  small snapshot Gram matrix and avoids a second snapshot-sized array.
+  batches at `4 GiB`, pinned Ritz buffers at `1 GiB`, and full-rank runs must
+  fit within 80% of available host memory. The raw-Ritz path avoids a second
+  snapshot-sized array.
 - Online backend: one-thread CPU for isolated latency and persistent `float64`
   CUDA operators for batched throughput.
 
 Scaling with `D = 6*Nvox`, raw snapshot count `p`, and reduced rank `r`:
 
 - Stored raw snapshots: `O(D*p)` memory. They are discarded after compilation.
-- Incremental Gram and K/B/D compilation: `O(D*p^2)` total work.
+- Incremental K/B/D compilation: `O(D*p^2)` total work.
 - Reduced operators: `O(r^2)` memory.
 - Dense online solve: `O(r^3)` work per material and `O(chunk*r^2)` workspace.
 
@@ -107,6 +111,16 @@ snapshot span, bounds affine-coefficient and online-query workspaces, and
 retains only the final reduced operators. Intermediate voxel solutions and
 the POD basis are not written to disk. Lower asymptotic growth would require
 truncated POD; that defines a different model and is not enabled.
+
+The principal route is enabled by `reference_energy_qr`, `factorized_ritz`,
+and `async_ritz` in `campaign_config.json`. To audit the historical
+CPU-Gram/component-action compiler, disable the three dependent switches:
+
+```bash
+python scripts/cmame_interpretable_pipeline/04_sobol_pod_pipeline.py \
+  --geometry-id 9 --adaptive \
+  --no-async-ritz --no-factorized-ritz --no-reference-energy-qr
+```
 
 Additional reproducible checks are available as:
 

@@ -298,6 +298,8 @@ def append_sobol_batch(
     ritz_gram_rank_rtol: float = 1.0e-6,
     overlap_cpu_gram_gpu: bool = False,
     preserve_raw_coordinates: bool = False,
+    factorized_ritz: bool = False,
+    async_ritz: bool = False,
 ) -> tuple[
     list[dict[str, Any]], dict[str, np.ndarray] | None, np.ndarray | None
 ]:
@@ -392,6 +394,11 @@ def append_sobol_batch(
     gpu_affine_chunks = 0
     cpu_affine_chunks = 0
     gpu_affine_fallback = ""
+    factorized_upload_wall_s = 0.0
+    factorized_host_prepare_wall_s = 0.0
+    factorized_kernel_enqueue_wall_s = 0.0
+    async_pinned_double_buffer = False
+    async_pinned_bytes = 0
     contraction_modes: set[str] = set()
     if compile_operators and len(new_fields):
         operators, assembly = common._update_reduced_operators(
@@ -409,6 +416,8 @@ def append_sobol_batch(
             gram_backend=str(ritz_gram_backend),
             overlap_cpu_gram_gpu=bool(overlap_cpu_gram_gpu),
             preserve_raw_coordinates=bool(preserve_raw_coordinates),
+            factorized_ritz=bool(factorized_ritz),
+            async_ritz=bool(async_ritz),
         )
         for name in assembly_totals:
             source_name = (
@@ -443,6 +452,19 @@ def append_sobol_batch(
         gpu_affine_chunks = int(assembly.get("gpu_affine_chunks", 0))
         cpu_affine_chunks = int(assembly.get("cpu_affine_chunks", 0))
         gpu_affine_fallback = str(assembly.get("gpu_affine_fallback", ""))
+        factorized_upload_wall_s = float(
+            assembly.get("factorized_upload_wall_s", 0.0)
+        )
+        factorized_host_prepare_wall_s = float(
+            assembly.get("factorized_host_prepare_wall_s", 0.0)
+        )
+        factorized_kernel_enqueue_wall_s = float(
+            assembly.get("factorized_kernel_enqueue_wall_s", 0.0)
+        )
+        async_pinned_double_buffer = bool(
+            assembly.get("async_pinned_double_buffer", False)
+        )
+        async_pinned_bytes = int(assembly.get("async_pinned_bytes", 0))
         contraction_modes.add(str(assembly.get("contraction_mode", "unknown")))
         gram_product_wall_s = float(assembly.get("gram_product_wall_s", 0.0))
         gram_overlap_wait_wall_s = float(
@@ -528,6 +550,14 @@ def append_sobol_batch(
                 "gpu_affine_chunks": gpu_affine_chunks,
                 "cpu_affine_chunks": cpu_affine_chunks,
                 "gpu_affine_fallback": gpu_affine_fallback,
+                "factorized_upload_wall_s": factorized_upload_wall_s
+                / material_count,
+                "factorized_host_prepare_wall_s": factorized_host_prepare_wall_s
+                / material_count,
+                "factorized_kernel_enqueue_wall_s": factorized_kernel_enqueue_wall_s
+                / material_count,
+                "async_pinned_double_buffer": async_pinned_double_buffer,
+                "async_pinned_bytes": async_pinned_bytes,
                 "affine_q_block_size": int(affine_q_block_size),
                 "pod_batch_materials": material_count,
             }
@@ -1447,12 +1477,30 @@ def parse_args() -> argparse.Namespace:
         help="Host temporary-memory cap for each experimental TSQR block.",
     )
     parser.add_argument(
-        "--experimental-energy-qr",
+        "--reference-energy-qr",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=bool(pipeline.get("reference_energy_qr", True)),
         help=(
-            "Skip the snapshot Gram during enrichment, monitor in raw snapshot "
-            "coordinates, and freeze once in reference-energy QR coordinates."
+            "Monitor in raw snapshot coordinates and freeze the complete span "
+            "once in reference-energy QR coordinates without a snapshot Gram."
+        ),
+    )
+    parser.add_argument(
+        "--factorized-ritz",
+        action=argparse.BooleanOptionalAction,
+        default=bool(pipeline.get("factorized_ritz", True)),
+        help=(
+            "Use exact constitutive-rank Ritz contractions with GPU-resident "
+            "reduced accumulation. Requires --reference-energy-qr."
+        ),
+    )
+    parser.add_argument(
+        "--async-ritz",
+        action=argparse.BooleanOptionalAction,
+        default=bool(pipeline.get("async_ritz", True)),
+        help=(
+            "Overlap pinned host-to-device snapshot transfers with exact "
+            "factorized GPU contractions using two CUDA buffers."
         ),
     )
     parser.add_argument(
@@ -1566,10 +1614,10 @@ def main() -> int:
             raise ValueError(
                 "experimental_qr_block_max_gib must be finite and positive."
             )
-        if bool(args.experimental_energy_qr):
+        if bool(args.reference_energy_qr):
             if str(args.full_rank_basis_mode) != "raw-ritz":
                 raise ValueError(
-                    "experimental_energy_qr requires full_rank_basis_mode=raw-ritz."
+                    "reference_energy_qr requires full_rank_basis_mode=raw-ritz."
                 )
             if bool(args.experimental_qr_audit):
                 raise ValueError(
@@ -1578,8 +1626,20 @@ def main() -> int:
             if bool(args.energy_pod_baseline) or bool(args.tau_sensitivity):
                 raise ValueError(
                     "Energy-POD and tau sensitivity require the snapshot Gram; "
-                    "disable them for experimental_energy_qr."
+                    "disable them for reference_energy_qr."
                 )
+        if bool(args.factorized_ritz) and not bool(
+            args.reference_energy_qr
+        ):
+            raise ValueError(
+                "factorized_ritz requires reference_energy_qr."
+            )
+        if bool(args.async_ritz) and not bool(
+            args.factorized_ritz
+        ):
+            raise ValueError(
+                "async_ritz requires factorized_ritz."
+            )
         if int(args.candidate_seed) == int(args.final_validation_seed):
             raise ValueError(
                 "candidate_seed and final_validation_seed must be distinct."
@@ -1643,7 +1703,7 @@ def main() -> int:
         candidate_parameters = candidates[
             list(reduced.MATERIAL_PARAMETER_COLUMNS)
         ].to_numpy(dtype=np.float64)
-        experimental_energy_qr_reference = np.mean(
+        reference_energy_qr_reference = np.mean(
             reduced._material_coefficients_batch(candidate_parameters), axis=0
         )
 
@@ -1788,11 +1848,15 @@ def main() -> int:
                 "experimental_qr_block_max_gib": float(
                     args.experimental_qr_block_max_gib
                 ),
-                "experimental_energy_qr": bool(args.experimental_energy_qr),
-                "experimental_energy_qr_reference_policy": "candidate_affine_mean",
-                "experimental_energy_qr_reference_coefficients": (
-                    experimental_energy_qr_reference
-                    if bool(args.experimental_energy_qr)
+                "reference_energy_qr": bool(args.reference_energy_qr),
+                "factorized_ritz": bool(
+                    args.factorized_ritz
+                ),
+                "async_ritz": bool(args.async_ritz),
+                "reference_energy_qr_reference_policy": "candidate_affine_mean",
+                "reference_energy_qr_reference_coefficients": (
+                    reference_energy_qr_reference
+                    if bool(args.reference_energy_qr)
                     else None
                 ),
                 "basis_storage": "preallocated_contiguous",
@@ -1819,7 +1883,15 @@ def main() -> int:
                 "basis_voxel_order": "matrix_then_fiber_by_orientation",
                 "basis_component_layout": "mandel_component_then_voxel",
                 "affine_orientation_kernel": "grouped_blocks_with_voxelwise_fallback",
-                "ritz_contraction_kernel": "exact_phase_supported_component_batched",
+                "ritz_contraction_kernel": (
+                    "exact_factorized_gpu_async"
+                    if bool(args.async_ritz)
+                    else (
+                        "exact_factorized_gpu"
+                        if bool(args.factorized_ritz)
+                        else "exact_phase_supported_component_batched"
+                    )
+                ),
                 "blas_thread_policy": str(args.blas_threads),
                 "blas_threads": blas_threads,
                 "generator_core_policy": str(args.generator_cores),
@@ -1933,7 +2005,11 @@ def main() -> int:
                 ritz_gram_backend=str(args.ritz_gram_backend),
                 ritz_gram_rank_rtol=float(args.ritz_gram_rank_rtol),
                 overlap_cpu_gram_gpu=bool(args.overlap_cpu_gram_gpu),
-                preserve_raw_coordinates=bool(args.experimental_energy_qr),
+                preserve_raw_coordinates=bool(args.reference_energy_qr),
+                factorized_ritz=bool(
+                    args.factorized_ritz
+                ),
+                async_ritz=bool(args.async_ritz),
             )
             snapshot_rows.extend(records)
             for record in records:
@@ -2081,15 +2157,15 @@ def main() -> int:
         if operators is None:
             raise RuntimeError("Cannot freeze an empty reduced model.")
 
-        experimental_energy_qr_metadata: dict[str, Any] = {}
-        experimental_energy_qr_stage_wall_s = 0.0
-        experimental_energy_qr_monitor_difference: dict[str, Any] | None = None
-        if bool(args.experimental_energy_qr):
+        reference_energy_qr_metadata: dict[str, Any] = {}
+        reference_energy_qr_stage_wall_s = 0.0
+        reference_energy_qr_monitor_difference: dict[str, Any] | None = None
+        if bool(args.reference_energy_qr):
             required_raw = {"raw_Kq", "raw_Bq"}
             missing_raw = sorted(required_raw.difference(operators))
             if missing_raw:
                 raise RuntimeError(
-                    "Experimental energy QR requires frozen raw Ritz blocks: "
+                    "Reference-energy QR requires frozen raw Ritz blocks: "
                     + ", ".join(missing_raw)
                 )
             energy_qr_started = time.perf_counter()
@@ -2103,12 +2179,12 @@ def main() -> int:
                 if not monitor_truth.empty
                 else pd.DataFrame()
             )
-            energy_operators, experimental_energy_qr_metadata = (
-                reduced._experimental_energy_qr_recompile(
+            energy_operators, reference_energy_qr_metadata = (
+                reduced._reference_energy_qr_recompile(
                     raw_Kq=operators["raw_Kq"],
                     raw_Bq=operators["raw_Bq"],
                     Dq=operators["Dq"],
-                    reference_coefficients=experimental_energy_qr_reference,
+                    reference_coefficients=reference_energy_qr_reference,
                 )
             )
             operators["Kq"] = energy_operators["Kq"]
@@ -2130,35 +2206,35 @@ def main() -> int:
                     0, "monitor_id", monitor["monitor_id"].to_numpy(dtype=int)
                 )
                 energy_monitor.to_csv(
-                    run_dir / "experimental_energy_qr_monitor_results.csv",
+                    run_dir / "reference_energy_qr_monitor_results.csv",
                     index=False,
                 )
-                experimental_energy_qr_monitor_difference = (
+                reference_energy_qr_monitor_difference = (
                     rom_tensor_difference_stats(raw_monitor, energy_monitor)
                 )
-            experimental_energy_qr_stage_wall_s = float(
+            reference_energy_qr_stage_wall_s = float(
                 time.perf_counter() - energy_qr_started
             )
-            experimental_energy_qr_metadata.update(
+            reference_energy_qr_metadata.update(
                 {
-                    "experimental": True,
+                    "principal_route": True,
                     "reference_policy": "candidate_affine_mean",
                     "training_monitor_coordinates": "raw_snapshot",
                     "frozen_coordinates": "reference_energy_qr",
-                    "stage_wall_s": experimental_energy_qr_stage_wall_s,
+                    "stage_wall_s": reference_energy_qr_stage_wall_s,
                     "monitor_raw_coordinate_difference": (
-                        experimental_energy_qr_monitor_difference
+                        reference_energy_qr_monitor_difference
                     ),
                 }
             )
             write_json(
-                run_dir / "experimental_energy_qr_manifest.json",
-                experimental_energy_qr_metadata,
+                run_dir / "reference_energy_qr_manifest.json",
+                reference_energy_qr_metadata,
             )
             print(
-                "[SOBOL-POD] experimental energy QR freeze | "
+                "[SOBOL-POD] reference-energy QR freeze | "
                 f"rank={operators['Kq'].shape[1]} | "
-                f"stage={experimental_energy_qr_stage_wall_s:.3f}s | "
+                f"stage={reference_energy_qr_stage_wall_s:.3f}s | "
                 "voxel_passes=0",
                 flush=True,
             )
@@ -2311,9 +2387,13 @@ def main() -> int:
                 "ritz_gram_backend": str(args.ritz_gram_backend),
                 "ritz_gram_rank_rtol": float(args.ritz_gram_rank_rtol),
                 "overlap_cpu_gram_gpu": bool(args.overlap_cpu_gram_gpu),
-                "experimental_energy_qr": bool(args.experimental_energy_qr),
-                "experimental_energy_qr_metadata": (
-                    experimental_energy_qr_metadata
+                "reference_energy_qr": bool(args.reference_energy_qr),
+                "factorized_ritz": bool(
+                    args.factorized_ritz
+                ),
+                "async_ritz": bool(args.async_ritz),
+                "reference_energy_qr_metadata": (
+                    reference_energy_qr_metadata
                 ),
             },
         )
@@ -2727,7 +2807,7 @@ def main() -> int:
             + affine_setup_wall_s
             + monitor_fft_stage_wall_s
             + training_stage_wall_s
-            + experimental_energy_qr_stage_wall_s
+            + reference_energy_qr_stage_wall_s
         )
         fom_material_median_s = float(fom_timing_results["solve_wall_s"].median())
         rom_material_median_s = float(rom_timing["warm_single_query_median_s"])
@@ -2768,8 +2848,8 @@ def main() -> int:
                     "wall_s": experimental_qr_stage_wall_s,
                 },
                 {
-                    "stage": "experimental_reference_energy_qr_freeze",
-                    "wall_s": experimental_energy_qr_stage_wall_s,
+                    "stage": "reference_energy_qr_freeze",
+                    "wall_s": reference_energy_qr_stage_wall_s,
                 },
                 {
                     "stage": "final_independent_fft_validation",
@@ -2845,19 +2925,23 @@ def main() -> int:
             "ritz_gram_backend": str(args.ritz_gram_backend),
             "ritz_gram_rank_rtol": float(args.ritz_gram_rank_rtol),
             "overlap_cpu_gram_gpu": bool(args.overlap_cpu_gram_gpu),
-            "experimental_energy_qr_enabled": bool(args.experimental_energy_qr),
-            "experimental_energy_qr_reference_policy": "candidate_affine_mean",
-            "experimental_energy_qr_reference_coefficients": (
-                experimental_energy_qr_reference
-                if bool(args.experimental_energy_qr)
+            "reference_energy_qr_enabled": bool(args.reference_energy_qr),
+            "factorized_ritz_enabled": bool(
+                args.factorized_ritz
+            ),
+            "async_ritz_enabled": bool(args.async_ritz),
+            "reference_energy_qr_reference_policy": "candidate_affine_mean",
+            "reference_energy_qr_reference_coefficients": (
+                reference_energy_qr_reference
+                if bool(args.reference_energy_qr)
                 else None
             ),
-            "experimental_energy_qr_metadata": experimental_energy_qr_metadata,
-            "experimental_energy_qr_monitor_raw_coordinate_difference": (
-                experimental_energy_qr_monitor_difference
+            "reference_energy_qr_metadata": reference_energy_qr_metadata,
+            "reference_energy_qr_monitor_raw_coordinate_difference": (
+                reference_energy_qr_monitor_difference
             ),
-            "experimental_energy_qr_stage_wall_s": (
-                experimental_energy_qr_stage_wall_s
+            "reference_energy_qr_stage_wall_s": (
+                reference_energy_qr_stage_wall_s
             ),
             "experimental_qr_audit_enabled": bool(args.experimental_qr_audit),
             "experimental_qr_block_max_gib": float(
@@ -3027,9 +3111,9 @@ def main() -> int:
                 if not experimental_qr_validation.empty
                 else None
             ),
-            "experimental_energy_qr_monitor_csv": (
-                str(run_dir / "experimental_energy_qr_monitor_results.csv")
-                if bool(args.experimental_energy_qr) and not monitor_truth.empty
+            "reference_energy_qr_monitor_csv": (
+                str(run_dir / "reference_energy_qr_monitor_results.csv")
+                if bool(args.reference_energy_qr) and not monitor_truth.empty
                 else None
             ),
             "fom_timing_csv": str(run_dir / "fom_timing_results.csv"),

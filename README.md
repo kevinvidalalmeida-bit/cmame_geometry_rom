@@ -25,19 +25,21 @@ Run the existing geometries with:
 python scripts/cmame_interpretable_pipeline/main.py --stage pipeline
 ```
 
-The optimized offline backend stores the complete raw snapshot span
-contiguously in `float32`, evaluates the snapshot Gram products on the CPU in
-`float64`, applies the orientation-grouped affine voxel kernels on the GPU in
-`float32`, and performs the small transformations in `float64`. A
-`1e-15` machine-zero guard removed no direction in the reported campaign; no
-regularization or automatic rebuild is used. Online material batches use
-vectorized CUDA algebra. The adaptive run solves five monitor materials once
-and uses them only for stopping. After the ROM is frozen, an independent
-20-material maximin design selected from a 4096-point Sobol pool validates the
-ROM and never controls its construction. Validation reports the observed
-counts below `1e-4` and `1e-3`, equivalent to `0.01%` and `0.1%` relative
-Frobenius error. These percentages are empirical and are not presented as
-coverage of the entire continuous material domain.
+The principal offline backend stores the complete raw snapshot span
+contiguously in `float32` and never forms its Euclidean Gram matrix during
+enrichment. It evaluates the exact constitutive-rank affine contractions on
+the GPU in `float32`, keeps the reduced `float64` accumulators resident, and
+overlaps pinned snapshot transfers with the next contraction. Once stopping
+is reached, a reference-energy Cholesky QR orthonormalizes the full span from
+the already assembled raw Ritz blocks, without another voxel pass. No
+snapshot direction, affine coefficient, or POD mode is truncated. Online
+material batches use vectorized CUDA algebra. The adaptive run solves five
+monitor materials once and uses them only for stopping. After the ROM is
+frozen, an independent 20-material maximin design selected from a 4096-point
+Sobol pool validates the ROM and never controls its construction. Validation
+reports the observed counts below `1e-4` and `1e-3`, equivalent to `0.01%` and
+`0.1%` relative Frobenius error. These percentages are empirical and are not
+presented as coverage of the entire continuous material domain.
 
 The active configuration points to the completed `60`, `150`, and `240` voxel
 geometries. The final validation set provides finite empirical error evidence;
@@ -45,7 +47,9 @@ the workflow makes no global certification claim over the continuous material
 domain.
 
 For full-rank operation, raw-snapshot memory grows as `O(Nvox*p)`,
-offline POD and K/B/D contractions as `O(Nvox*p^2)`, and dense online solves
-as `O(r^3)`, with `r=p` in the reported campaign. The active pipeline shrinks
-POD, K/B/D, and ROM batches as rank grows. It fails before creating output
-only when the snapshots plus minimum workspaces cannot fit.
+offline K/B/D contractions as `O(Nvox*p^2)`, and dense online solves as
+`O(r^3)`, with `r=p` in the reported campaign. The active pipeline solves and
+loads one material at a time. Its two asynchronous buffers are voxel chunks,
+not material batches, and their total pinned-memory cap is `1 GiB`. The
+historical Gram compiler remains available through the three `--no-*` route
+switches documented in the pipeline README.
