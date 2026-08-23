@@ -1,12 +1,14 @@
-# Exact factorized Ritz experiment
+# Exact factorized Ritz route
 
 Date: 2026-08-23
 
-Status: experimental. The nominal campaign path and paper are unchanged.
+Status: principal compiler route. Promoted after exactness tests and the G03/G09
+timing study below. The paper remains unchanged until the complete G00--G09
+campaign is rerun with this route.
 
 ## Route
 
-The experimental compiler combines three changes:
+The principal compiler combines three changes:
 
 1. Exact algebraic-rank factorization of each symmetric 6x6 affine Mandel
    basis, `A_q = U_q diag(d_q) U_q^T`.
@@ -24,14 +26,14 @@ The exact nonzero constitutive ranks are:
 These are exact ranks of the fixed 6x6 constitutive bases. No snapshot
 direction, POD mode, or affine coefficient is truncated.
 
-Use the route only with raw Ritz enrichment and reference-energy QR:
+The route is enabled by default in `campaign_config.json`. An explicit run is:
 
 ```bash
 python scripts/cmame_interpretable_pipeline/04_sobol_pod_pipeline.py \
   --geometry-id 9 --adaptive \
-  --experimental-energy-qr \
-  --experimental-factorized-ritz \
-  --experimental-async-ritz
+  --reference-energy-qr \
+  --factorized-ritz \
+  --async-ritz
 ```
 
 ## Measurements
@@ -59,7 +61,7 @@ an adjusted compilation time of about 179.75 s, or an 18.3% reduction.
 
 At the largest G09 prefix, the asynchronous route used at most 1.00 GiB of
 pinned host buffers and 0.98 GiB of factor workspace. The two GPU snapshot
-buffers use approximately another 1.00 GiB, so the experimental GPU peak is
+buffers use approximately another 1.00 GiB, so the measured GPU peak is
 about 1.98 GiB plus small CuPy caches and reduced accumulators. This is viable
 on the 16 GiB device and does not change `load_batch_size=1`.
 
@@ -77,7 +79,21 @@ selected the same training counts and ranks: 11/66 for G03 and 16/96 for G09.
 
 ## Decision
 
-The factorized asynchronous route is promising for large voxel grids such as
-G09. It is not useful for G03-sized grids, where pinned staging and stream
-coordination dominate. Keep both optimizations behind explicit experimental
-flags until the full G00--G09 campaign confirms a size-based activation rule.
+Use the factorized asynchronous route for all campaign geometries. Its small
+G03 overhead is negligible in absolute compilation time, while the G09
+assembly reduction is substantial. Keeping one deterministic route also
+avoids a grid-size policy becoming another campaign variable. The historical
+CPU-Gram route remains available through explicit `--no-*` switches for
+audits.
+
+## Next exact candidate
+
+A fixed geometry-dependent orthogonal change of coordinates can rotate each
+fiber voxel into its local Mandel frame when the snapshot is first stored:
+`S_local = P.T @ S`. Using `K_q_local = P.T @ K_q @ P` and
+`B_q_local = P.T @ B_q` leaves every Ritz and Schur operator unchanged. In
+these coordinates all fiber orientations share the same five sparse local
+bases, so later enrichments need not repeat orientation-group spectral
+transforms over the old snapshots. This does not improve the exact
+`O(Nvox*p^2)` scaling, but it may lower its constant substantially. It should
+be prototyped and benchmarked separately before entering the campaign route.

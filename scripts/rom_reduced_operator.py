@@ -1444,7 +1444,7 @@ def _contract_gpu_batch(left_gpu: Any, right_gpu: Any) -> np.ndarray:
     return np.asarray(cp.asnumpy(products), dtype=np.float64)
 
 
-def _experimental_factorized_chunk_gpu(
+def _factorized_chunk_gpu(
     *,
     affine: Any,
     support: str,
@@ -1593,7 +1593,7 @@ def _experimental_factorized_chunk_gpu(
     return cross, diagonal, sums, workspace_bytes
 
 
-def _experimental_factorized_raw_gpu(
+def _factorized_raw_gpu(
     *,
     affine: Any,
     old_basis: np.ndarray | list[np.ndarray] | None,
@@ -1633,7 +1633,7 @@ def _experimental_factorized_raw_gpu(
     if bool(async_transfers):
         if storage_dtype != requested_dtype:
             raise ValueError(
-                "experimental async Ritz requires matching storage and compute dtypes"
+                "asynchronous Ritz requires matching storage and compute dtypes"
             )
         pinned_limit = max(
             4096,
@@ -1770,7 +1770,7 @@ def _experimental_factorized_raw_gpu(
             with compute_stream:
                 compute_stream.wait_event(slot["ready"])
                 cross, diagonal, b_block, workspace_bytes = (
-                    _experimental_factorized_chunk_gpu(
+                    _factorized_chunk_gpu(
                         affine=affine,
                         support=support,
                         support_offset=global_start - support_start,
@@ -1823,13 +1823,13 @@ def _experimental_factorized_raw_gpu(
             )
             new_gpu = _gpu_flat_compute(new_values, compute_dtype=requested_dtype)
             if new_gpu is None or (old_values is not None and old_gpu is None):
-                raise RuntimeError("experimental factorized Ritz requires CUDA/CuPy")
+                raise RuntimeError("factorized Ritz requires CUDA/CuPy")
             upload_wall_s += float(time.perf_counter() - upload_started)
             basis_gpu_uploads += 1 + int(old_gpu is not None)
 
             enqueue_started = time.perf_counter()
             cross, diagonal, b_block, workspace_bytes = (
-                _experimental_factorized_chunk_gpu(
+                _factorized_chunk_gpu(
                     affine=affine,
                     support=support,
                     support_offset=global_start - support_start,
@@ -2327,7 +2327,7 @@ def _experimental_tsqr_recompile(
     return operators, metadata
 
 
-def _experimental_energy_qr_recompile(
+def _reference_energy_qr_recompile(
     *,
     raw_Kq: np.ndarray,
     raw_Bq: np.ndarray,
@@ -2407,7 +2407,7 @@ def _experimental_energy_qr_recompile(
     identity_error = normalized_reference - identity
     diagonal = np.diag(R)
     metadata = {
-        "energy_qr_experimental": True,
+        "energy_qr_principal_route": True,
         "energy_qr_method": "reference_energy_cholesky_qr",
         "energy_qr_compute_dtype": "float64",
         "energy_qr_forms_explicit_q": False,
@@ -2624,8 +2624,8 @@ def _assemble_reduced_operators(
     gram_backend: str = "auto",
     overlap_cpu_gram_gpu: bool = False,
     preserve_raw_coordinates: bool = False,
-    experimental_factorized_ritz: bool = False,
-    experimental_async_ritz: bool = False,
+    factorized_ritz: bool = False,
+    async_ritz: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Stream an exact reduced Ritz assembly without stacking the global basis.
 
@@ -2674,18 +2674,18 @@ def _assemble_reduced_operators(
     first_dtype = _field_component_voxel_view(
         basis[0] if isinstance(basis, list) else basis[0], nvox
     ).dtype
-    if bool(experimental_factorized_ritz):
+    if bool(factorized_ritz):
         if not bool(preserve_raw_coordinates):
             raise ValueError(
-                "experimental_factorized_ritz currently requires raw Ritz coordinates"
+                "factorized_ritz currently requires raw Ritz coordinates"
             )
-        _, raw_Kq, raw_Bq, factorized_meta = _experimental_factorized_raw_gpu(
+        _, raw_Kq, raw_Bq, factorized_meta = _factorized_raw_gpu(
             affine=affine,
             old_basis=None,
             new_basis=basis,
             nvox=nvox,
             compute_dtype=compute_dtype,
-            async_transfers=bool(experimental_async_ritz),
+            async_transfers=bool(async_ritz),
         )
         averaged = getattr(affine, "averaged_stiffness", None)
         Dq = np.asarray(averaged, dtype=np.float64).copy()
@@ -2695,7 +2695,7 @@ def _assemble_reduced_operators(
         invR = np.eye(r, dtype=np.float64)
         metadata = {
             "assembly_wall_s": float(time.perf_counter() - t0),
-            "assembly_mode": "experimental_factorized_gpu",
+            "assembly_mode": "factorized_gpu",
             "contraction_mode": "exact_constitutive_rank_factorization",
             "contraction_dtype": str(first_dtype),
             "gram_product_dtype": "not_computed",
@@ -2737,7 +2737,8 @@ def _assemble_reduced_operators(
             "effective_rank": int(r),
             "discarded_rank": 0,
             "gram_transform_mode": "raw_coordinates_no_gram",
-            "experimental_factorized_ritz": True,
+            "factorized_ritz": True,
+            "async_ritz": bool(async_ritz),
             **factorized_meta,
         }
         return raw_Kq.copy(), raw_Bq.copy(), Dq, metadata
@@ -3004,8 +3005,8 @@ def _extend_reduced_operators(
     gram_backend: str = "auto",
     overlap_cpu_gram_gpu: bool = False,
     preserve_raw_coordinates: bool = False,
-    experimental_factorized_ritz: bool = False,
-    experimental_async_ritz: bool = False,
+    factorized_ritz: bool = False,
+    async_ritz: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Exact streaming extension of raw Ritz blocks, followed by re-whitening."""
     t0 = time.perf_counter()
@@ -3048,8 +3049,8 @@ def _extend_reduced_operators(
             gram_backend=selected_gram_backend,
             overlap_cpu_gram_gpu=bool(overlap_cpu_gram_gpu),
             preserve_raw_coordinates=bool(preserve_raw_coordinates),
-            experimental_factorized_ritz=bool(experimental_factorized_ritz),
-            experimental_async_ritz=bool(experimental_async_ritz),
+            factorized_ritz=bool(factorized_ritz),
+            async_ritz=bool(async_ritz),
         )
         metadata.update({
             "assembly_mode": "incremental",
@@ -3096,19 +3097,19 @@ def _extend_reduced_operators(
     first_dtype = _field_component_voxel_view(
         new_basis[0] if isinstance(new_basis, list) else new_basis[0], nvox
     ).dtype
-    if bool(experimental_factorized_ritz):
+    if bool(factorized_ritz):
         if not bool(preserve_raw_coordinates):
             raise ValueError(
-                "experimental_factorized_ritz currently requires raw Ritz coordinates"
+                "factorized_ritz currently requires raw Ritz coordinates"
             )
         cross, diagonal, appended_Bq, factorized_meta = (
-            _experimental_factorized_raw_gpu(
+            _factorized_raw_gpu(
                 affine=affine_stress_batch,
                 old_basis=old_basis,
                 new_basis=new_basis,
                 nvox=nvox,
                 compute_dtype=compute_dtype,
-                async_transfers=bool(experimental_async_ritz),
+                async_transfers=bool(async_ritz),
             )
         )
         assert cross is not None
@@ -3126,7 +3127,7 @@ def _extend_reduced_operators(
         invR = np.eye(new_rank, dtype=np.float64)
         metadata = {
             "assembly_wall_s": float(time.perf_counter() - t0),
-            "assembly_mode": "incremental_experimental_factorized_gpu",
+            "assembly_mode": "incremental_factorized_gpu",
             "incremental_mode": "raw_block_extension_factorized_gpu",
             "contraction_mode": "exact_constitutive_rank_factorization",
             "contraction_dtype": str(first_dtype),
@@ -3169,7 +3170,8 @@ def _extend_reduced_operators(
             "effective_rank": int(new_rank),
             "discarded_rank": 0,
             "gram_transform_mode": "raw_coordinates_no_gram",
-            "experimental_factorized_ritz": True,
+            "factorized_ritz": True,
+            "async_ritz": bool(async_ritz),
             **factorized_meta,
         }
         return raw_Kq.copy(), raw_Bq.copy(), Dq, metadata

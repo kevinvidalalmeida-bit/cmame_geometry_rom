@@ -442,7 +442,7 @@ def test_incremental_raw_coordinates_skip_gram_and_energy_qr_matches_nominal():
             "nu_TT": 0.37,
         }
     )
-    energy, energy_meta = reduced._experimental_energy_qr_recompile(
+    energy, energy_meta = reduced._reference_energy_qr_recompile(
         raw_Kq=raw_Kq,
         raw_Bq=raw_Bq,
         Dq=raw_Dq,
@@ -652,7 +652,7 @@ def test_experimental_blocked_tsqr_matches_direct_householder_qr():
     assert metadata["qr_estimated_peak_temporary_bytes"] <= int(1.0e-5 * 1024**3)
 
 
-def test_experimental_energy_qr_preserves_full_ritz_operator():
+def test_reference_energy_qr_preserves_full_ritz_operator():
     rng = np.random.default_rng(20260921)
     q_count, rank = 4, 11
     raw_Kq = np.empty((q_count, rank, rank), dtype=np.float64)
@@ -665,7 +665,7 @@ def test_experimental_energy_qr_preserves_full_ritz_operator():
         Dq[q] = macro.T @ macro + np.eye(6)
     reference_coefficients = 0.5 + rng.random(q_count)
 
-    operators, metadata = reduced._experimental_energy_qr_recompile(
+    operators, metadata = reduced._reference_energy_qr_recompile(
         raw_Kq=raw_Kq,
         raw_Bq=raw_Bq,
         Dq=Dq,
@@ -1059,7 +1059,7 @@ def test_phase_supported_incremental_ritz_is_exact_and_memory_bounded():
     assert metadata["stress_workspace_peak_bytes"] < dense_workspace
 
 
-def test_experimental_factorized_gpu_ritz_preserves_raw_affine_blocks():
+def test_factorized_gpu_ritz_preserves_raw_affine_blocks():
     try:
         import cupy as cp
 
@@ -1095,7 +1095,7 @@ def test_experimental_factorized_gpu_ritz_preserves_raw_affine_blocks():
         affine_stress_batch=affine,
         contraction_compute_dtype="float32",
         preserve_raw_coordinates=True,
-        experimental_factorized_ritz=True,
+        factorized_ritz=True,
     )
     np.testing.assert_allclose(actual[0], expected[0], rtol=2.0e-6, atol=1.0e-5)
     np.testing.assert_allclose(actual[1], expected[1], rtol=2.0e-6, atol=2.0e-6)
@@ -1112,8 +1112,8 @@ def test_experimental_factorized_gpu_ritz_preserves_raw_affine_blocks():
         affine_stress_batch=affine,
         contraction_compute_dtype="float32",
         preserve_raw_coordinates=True,
-        experimental_factorized_ritz=True,
-        experimental_async_ritz=True,
+        factorized_ritz=True,
+        async_ritz=True,
     )
     for async_block, factorized_block in zip(
         asynchronous[:3], actual[:3], strict=True
@@ -1129,8 +1129,8 @@ def test_experimental_factorized_gpu_ritz_preserves_raw_affine_blocks():
         affine_stress_batch=affine,
         contraction_compute_dtype="float32",
         preserve_raw_coordinates=True,
-        experimental_factorized_ritz=True,
-        experimental_async_ritz=True,
+        factorized_ritz=True,
+        async_ritz=True,
     )
     incremental = reduced._extend_reduced_operators(
         existing={
@@ -1145,8 +1145,8 @@ def test_experimental_factorized_gpu_ritz_preserves_raw_affine_blocks():
         affine_stress_batch=affine,
         contraction_compute_dtype="float32",
         preserve_raw_coordinates=True,
-        experimental_factorized_ritz=True,
-        experimental_async_ritz=True,
+        factorized_ritz=True,
+        async_ritz=True,
     )
     np.testing.assert_allclose(incremental[0], actual[0], rtol=2.0e-6, atol=2.0e-6)
     np.testing.assert_allclose(incremental[1], actual[1], rtol=2.0e-6, atol=2.0e-6)

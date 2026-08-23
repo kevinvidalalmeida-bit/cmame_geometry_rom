@@ -178,7 +178,7 @@ def main() -> int:
     else:
         reference_coefficients = coefficients[0].copy()
 
-    operators, metadata = reduced._experimental_energy_qr_recompile(
+    operators, metadata = reduced._reference_energy_qr_recompile(
         raw_Kq=raw_Kq,
         raw_Bq=raw_Bq,
         Dq=Dq,
