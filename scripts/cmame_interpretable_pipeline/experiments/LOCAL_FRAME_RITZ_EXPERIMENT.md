@@ -1,21 +1,23 @@
-# Experimental local-frame Ritz contractions
+# Local-frame and gathered-factor Ritz study
 
 ## Purpose
 
-This experiment tests two exact alternatives to the grouped global-frame
+This study tested two exact alternatives to the grouped global-frame
 factorized Ritz compiler. Neither route changes the snapshot span, applies a
-low-rank truncation, or changes `load_batch_size=1`.
+low-rank truncation, or changes `load_batch_size=1`. The gathered-factor
+alternative was subsequently promoted to the nominal campaign route; the
+local-frame route remains experimental.
 
 1. `--experimental-local-frame-ritz` rotates the fiber-supported snapshot
    fields once into each voxel's local Mandel frame. All fiber orientations
    then share the same constitutive factors during the Ritz contraction.
-2. `--experimental-gathered-factor-ritz` keeps the snapshots in the global
+2. `--gathered-factor-ritz` keeps the snapshots in the global
    frame and gathers the rotated constitutive factors once per voxel chunk.
    This removes the repeated orientation-group loop without requiring a
    snapshot conversion.
 
-The two switches are mutually exclusive and require the factorized Ritz
-path. They are disabled by default.
+The two routes are mutually exclusive and require the factorized Ritz path.
+`gathered_factor_ritz` is enabled by default in `campaign_config.json`.
 
 ## Exact transformation
 
@@ -43,12 +45,12 @@ equivalent global factors `M_g @ F_local` in one gathered tensor operation.
 python scripts/cmame_interpretable_pipeline/04_sobol_pod_pipeline.py \
   --geometry-id 3 --adaptive --final-validation-count 1 \
   --run-name experimental_gathered_factor_g03_active_20260823 \
-  --experimental-gathered-factor-ritz --overwrite
+  --gathered-factor-ritz --overwrite
 
 python scripts/cmame_interpretable_pipeline/04_sobol_pod_pipeline.py \
   --geometry-id 9 --adaptive --final-validation-count 1 \
   --run-name experimental_gathered_factor_g09_active_20260823 \
-  --experimental-gathered-factor-ritz --overwrite
+  --gathered-factor-ritz --overwrite
 ```
 
 ## Results
@@ -77,10 +79,10 @@ affine blocks were `1.76e-7` for `Kq`, `1.17e-7` for `Bq`, and zero for `Dq`.
 
 ## Decision
 
-The gathered-factor route is the preferred experimental alternative. It
-delivers a meaningful reduction on G09 and avoids the one-time PCIe round
-trip required by local-frame snapshot storage. The local-frame implementation
-is retained only as an exact reference experiment.
+The gathered-factor route was promoted to the nominal compiler. It delivers
+a meaningful reduction on G09 and avoids the one-time PCIe round trip
+required by local-frame snapshot storage. The local-frame implementation is
+retained only as an exact reference experiment.
 
 The next promising optimization is a material-block contraction layout.
 The current G09 gathered run spends 23.35 s packing rank-major snapshots into

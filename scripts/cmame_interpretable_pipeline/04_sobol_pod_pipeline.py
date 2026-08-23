@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run fixed or explicitly adaptive Sobol + full-rank POD validation."""
+"""Run fixed or explicitly adaptive Sobol + full-span Ritz validation."""
 
 from __future__ import annotations
 
@@ -1323,7 +1323,7 @@ def write_plot(curve: pd.DataFrame, path: Path, target_error: float) -> None:
             linewidth=1.0,
             label=f"{percent_scale * target_error:g}% target",
         )
-        ax.set_xlabel("Sobol training materials used for full-rank POD")
+        ax.set_xlabel("Sobol training materials used for full-span Ritz")
         ax.set_ylabel("Relative Frobenius error on FFT monitor set (%)")
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}%"))
         ax.grid(True, which="both", alpha=0.25)
@@ -1539,13 +1539,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--experimental-gathered-factor-ritz",
+        "--gathered-factor-ritz",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=bool(pipeline.get("gathered_factor_ritz", True)),
         help=(
             "Gather orientation-dependent spectral factors per voxel and use "
             "large CUDA contractions without changing snapshot coordinates."
         ),
+    )
+    parser.add_argument(
+        "--experimental-gathered-factor-ritz",
+        dest="gathered_factor_ritz",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--pod-batch-max-gib",
@@ -1663,6 +1670,12 @@ def main() -> int:
                 raise ValueError(
                     "reference_energy_qr requires full_rank_basis_mode=raw-ritz."
                 )
+            if bool(args.overlap_cpu_gram_gpu):
+                raise ValueError(
+                    "reference_energy_qr does not form a CPU snapshot Gram; "
+                    "disable overlap_cpu_gram_gpu and use async_ritz for "
+                    "CPU/GPU chunk overlap."
+                )
             if bool(args.experimental_qr_audit):
                 raise ValueError(
                     "Householder TSQR and reference-energy QR are separate experiments."
@@ -1694,13 +1707,13 @@ def main() -> int:
             raise ValueError(
                 "structural_audit is not implemented for local-frame snapshots."
             )
-        if bool(args.experimental_gathered_factor_ritz) and not bool(
+        if bool(args.gathered_factor_ritz) and not bool(
             args.factorized_ritz
         ):
             raise ValueError(
-                "experimental_gathered_factor_ritz requires factorized_ritz."
+                "gathered_factor_ritz requires factorized_ritz."
             )
-        if bool(args.experimental_gathered_factor_ritz) and bool(
+        if bool(args.gathered_factor_ritz) and bool(
             args.experimental_local_frame_ritz
         ):
             raise ValueError(
@@ -1922,8 +1935,8 @@ def main() -> int:
                 "experimental_local_frame_ritz": bool(
                     args.experimental_local_frame_ritz
                 ),
-                "experimental_gathered_factor_ritz": bool(
-                    args.experimental_gathered_factor_ritz
+                "gathered_factor_ritz": bool(
+                    args.gathered_factor_ritz
                 ),
                 "reference_energy_qr_reference_policy": "candidate_affine_mean",
                 "reference_energy_qr_reference_coefficients": (
@@ -1959,8 +1972,8 @@ def main() -> int:
                     "experimental_local_frame_factorized_gpu_async"
                     if bool(args.experimental_local_frame_ritz)
                     else (
-                        "experimental_gathered_factorized_gpu_async"
-                        if bool(args.experimental_gathered_factor_ritz)
+                        "exact_gathered_factorized_gpu_async"
+                        if bool(args.gathered_factor_ritz)
                         else (
                             "exact_factorized_gpu_async"
                             if bool(args.async_ritz)
@@ -1999,7 +2012,7 @@ def main() -> int:
             operator_phase,
             operator_ori,
             local_frame_snapshots=bool(args.experimental_local_frame_ritz),
-            gathered_factor_ritz=bool(args.experimental_gathered_factor_ritz),
+            gathered_factor_ritz=bool(args.gathered_factor_ritz),
         )
         affine_setup_wall_s = float(time.perf_counter() - affine_started)
         reconstruction_check = reduced.affine_constitutive_reconstruction_error(
@@ -2487,8 +2500,8 @@ def main() -> int:
                 "experimental_local_frame_ritz": bool(
                     args.experimental_local_frame_ritz
                 ),
-                "experimental_gathered_factor_ritz": bool(
-                    args.experimental_gathered_factor_ritz
+                "gathered_factor_ritz": bool(
+                    args.gathered_factor_ritz
                 ),
                 "reference_energy_qr_metadata": (
                     reference_energy_qr_metadata
@@ -3032,8 +3045,8 @@ def main() -> int:
             "experimental_local_frame_ritz_enabled": bool(
                 args.experimental_local_frame_ritz
             ),
-            "experimental_gathered_factor_ritz_enabled": bool(
-                args.experimental_gathered_factor_ritz
+            "gathered_factor_ritz_enabled": bool(
+                args.gathered_factor_ritz
             ),
             "reference_energy_qr_reference_policy": "candidate_affine_mean",
             "reference_energy_qr_reference_coefficients": (

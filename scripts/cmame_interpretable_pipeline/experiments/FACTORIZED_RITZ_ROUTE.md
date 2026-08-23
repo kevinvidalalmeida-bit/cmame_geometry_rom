@@ -3,12 +3,12 @@
 Date: 2026-08-23
 
 Status: principal compiler route. Promoted after exactness tests and the G03/G09
-timing study below. The paper remains unchanged until the complete G00--G09
-campaign is rerun with this route.
+timing studies. The gathered-factor schedule described in the companion
+study is now part of this route.
 
 ## Route
 
-The principal compiler combines three changes:
+The principal compiler combines four changes:
 
 1. Exact algebraic-rank factorization of each symmetric 6x6 affine Mandel
    basis, `A_q = U_q diag(d_q) U_q^T`.
@@ -17,6 +17,8 @@ The principal compiler combines three changes:
 3. An optional two-stream CUDA pipeline overlaps factorized contractions with
    pinned host-to-device snapshot transfers. The total pinned-buffer cap is
    1 GiB. Training still loads and solves one material at a time.
+4. Orientation-dependent fiber factors are gathered once per voxel chunk and
+   reused across the five supported affine coefficients.
 
 The exact nonzero constitutive ranks are:
 
@@ -33,7 +35,8 @@ python scripts/cmame_interpretable_pipeline/04_sobol_pod_pipeline.py \
   --geometry-id 9 --adaptive \
   --reference-energy-qr \
   --factorized-ritz \
-  --async-ritz
+  --async-ritz \
+  --gathered-factor-ritz
 ```
 
 ## Measurements
@@ -86,14 +89,21 @@ avoids a grid-size policy becoming another campaign variable. The historical
 CPU-Gram route remains available through explicit `--no-*` switches for
 audits.
 
-## Next exact candidate
+## Full campaign confirmation
 
-A fixed geometry-dependent orthogonal change of coordinates can rotate each
-fiber voxel into its local Mandel frame when the snapshot is first stored:
-`S_local = P.T @ S`. Using `K_q_local = P.T @ K_q @ P` and
-`B_q_local = P.T @ B_q` leaves every Ritz and Schur operator unchanged. In
-these coordinates all fiber orientations share the same five sparse local
-bases, so later enrichments need not repeat orientation-group spectral
-transforms over the old snapshots. This does not improve the exact
-`O(Nvox*p^2)` scaling, but it may lower its constant substantially. It should
-be prototyped and benchmarked separately before entering the campaign route.
+The promoted route was rerun for G00--G09 as
+`full_span_gathered_20260823`, with 20 independent float64 held-out
+references per geometry. All ten geometries reached the monitor target, no
+reduced evaluation failed, and the selected training sizes/ranks ranged from
+6/36 to 16/96. The campaign-wide held-out mean and maximum errors were
+`2.138e-4` and `1.306e-3`; 89/200 cases met `1e-4` and 195/200 met `1e-3`.
+
+The measured compilation times ranged from 1.79 s to 174.93 s. For the two
+largest grids, G04 compiled in 128.80 s and G09 in 174.93 s, reductions of
+37.5% and 33.3% from the preceding component-action/Euclidean-Gram campaign.
+The comparison includes both the gathered factor schedule and removal of the
+repeated Euclidean-Gram transformations, so it is an end-to-end route result.
+
+The local-frame alternative was also implemented and benchmarked; the
+companion `LOCAL_FRAME_RITZ_EXPERIMENT.md` records why it remains an audit
+route rather than the campaign default.

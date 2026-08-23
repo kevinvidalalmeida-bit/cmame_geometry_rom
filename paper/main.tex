@@ -29,10 +29,10 @@
   linkcolor=blue,
   citecolor=blue,
   urlcolor=blue,
-  pdftitle={Full-Rank Sobol-POD Transfer Operators for Parametric FFT Homogenization},
+  pdftitle={Full-Span Sobol-Ritz Transfer Operators for Parametric FFT Homogenization},
   pdfauthor={Kevin Vidal, Victor Alulema, Victor Berrazueta, Patrick Vandewalle, Esteban Valencia},
-  pdfsubject={Full-rank Sobol-POD transfer operators for parametric computational homogenization},
-  pdfkeywords={computational homogenization, FFT homogenization, transfer operators, proper orthogonal decomposition, geometry--material separation, held-out validation}
+  pdfsubject={Full-span Sobol-Ritz transfer operators for parametric computational homogenization},
+  pdfkeywords={computational homogenization, FFT homogenization, transfer operators, Ritz projection, reference-energy QR, geometry--material separation, held-out validation}
 }
 
 \newcommand{\R}{\mathbb{R}}
@@ -54,13 +54,13 @@
 \renewcommand{\bibfont}{\normalsize}
 \let\WriteBookmarks\relax
 
-\shorttitle{Full-Rank Sobol--POD Transfer Operators}
+\shorttitle{Full-Span Sobol--Ritz Transfer Operators}
 \shortauthors{Vidal et al.}
 
 \title[mode=title]{\texorpdfstring{
-Full-Rank Sobol--POD Transfer Operators\\
+Full-Span Sobol--Ritz Transfer Operators\\
 for Parametric FFT Homogenization}{
-Full-Rank Sobol--POD Transfer Operators for Parametric FFT Homogenization}}
+Full-Span Sobol--Ritz Transfer Operators for Parametric FFT Homogenization}}
 
 \author[1]{Kevin Vidal}[orcid=0009-0006-8667-4525]
 \cormark[1]
@@ -108,9 +108,11 @@ Schur map, while material dependence is separated from the fixed geometry
 through an affine operator representation. During the offline stage, one
 fixed Sobol sequence is traversed with the full-order Fourier--Galerkin model
 and the resulting microscopic responses are appended to a common snapshot
-matrix. Proper orthogonal decomposition is used only to orthonormalize the
-complete snapshot span; no energy-retention threshold, numerical-rank
-truncation, or prescribed reduced dimension is introduced. Because the raw
+matrix. The complete snapshot span is retained without an energy threshold,
+numerical-rank truncation, or prescribed reduced dimension. At model freeze,
+an exact reference-energy Cholesky--QR transformation normalizes this span
+using only the already contracted affine blocks and no additional voxel pass.
+Because the raw
 snapshot spaces are nested under enrichment, the resulting Ritz--Schur
 operators converge monotonically in the Loewner sense in exact arithmetic.
 Their difference from the full-order operator is positive semidefinite and
@@ -124,15 +126,15 @@ its FOM responses have no role in snapshot enrichment, span construction, or
 stopping.
 Across ten elastic microstructures, the adaptive construction selects between
 6 and 16 training materials and full snapshot ranks between 36 and 96. The
-wider held-out design exposes a generalization gap: 91 of 200
-material--geometry pairs satisfy the \(10^{-4}\) target and 198 satisfy
+wider held-out design exposes a generalization gap: 89 of 200
+material--geometry pairs satisfy the \(10^{-4}\) target and 195 satisfy
 \(10^{-3}\), with mean and maximum relative tensor errors of
-\(2.134\times10^{-4}\) and \(1.297\times10^{-3}\), respectively.
+\(2.138\times10^{-4}\) and \(1.306\times10^{-3}\), respectively.
 All held-out reduced systems and stiffness tensors remain positive definite.
 At the same geometry-wise training counts, the ROM has lower error than
 training-only-tuned radial-basis-function and Kriging surrogates for all 200
 paired comparisons; their aggregate mean errors are
-\(6.256\times10^{-2}\) and \(7.585\times10^{-2}\), respectively.
+\(6.293\times10^{-2}\) and \(7.258\times10^{-2}\), respectively.
 The online stage uses only reduced dense systems assembled from the
 precomputed affine blocks.
 \end{abstract}
@@ -140,15 +142,15 @@ precomputed affine blocks.
 \begin{highlights}
 \item A common transfer formulation covers linear coercive transport and elasticity cell problems.
 \item Exact affine separation compiles fixed geometry while queried material enters only through constitutive coefficients.
-\item Sobol sampling and full-rank POD retain the complete snapshot span without energy truncation.
-\item Nested full-rank Ritz spaces give monotone Loewner convergence and an exact operator-error energy identity.
+\item Sobol sampling and reference-energy QR retain the complete snapshot span without truncation.
+\item Nested full-span Ritz spaces give monotone Loewner convergence and an exact operator-error energy identity.
 \item Same-prefix RBF and Kriging benchmarks demonstrate the sample efficiency of the physics-based transfer space.
 \end{highlights}
 
 \begin{keywords}
 Computational homogenization \sep FFT homogenization
 \sep Transfer operators \sep Geometry--material separation
-\sep Proper orthogonal decomposition \sep Reduced-order modeling
+\sep Ritz projection \sep Reference-energy QR \sep Reduced-order modeling
 \end{keywords}
 
 \maketitle
@@ -192,9 +194,9 @@ Symbol & Meaning & Symbol & Meaning \\
 \(\eta_{\mathrm{Schur}},\rho_K\) & Normalized Schur-ordering indicator and spectral SPD margin. \\
 \(N_x,N_y,N_z,N_{\mathrm{vox}}\) & Grid dimensions and total voxel count, \(N_{\mathrm{vox}}=N_xN_yN_z\). &
 \(I_{\mathrm{CG}}\) & Representative conjugate-gradient iteration count per loading problem. \\
-\(S,G_S\) & Snapshot matrix and its normalized small Gram matrix. &
-\(\lambda_i,\tau_{\mathrm{mach}}\) & Gram eigenvalues and machine-zero guard used only to identify arithmetic zeros. \\
-\(r,V_r\) & Full snapshot rank and corresponding POD/Ritz basis. \\
+\(S,\widetilde K_q,\widetilde B_q\) & Snapshot matrix and affine blocks in raw snapshot coordinates. &
+\(K_{\mathrm{ref}},G_{\mathrm{ref}},R_{\mathrm{ref}}\) & Reference operator, reference-energy Gram matrix, and its upper Cholesky factor. \\
+\(r,V_r\) & Full snapshot rank and corresponding reference-energy Ritz basis. \\
 \(X_r,\widehat X_r\) & Reduced microscopic response and its reduced coordinates. &
 \(E_X,R\) & Microscopic response error and full-order residual. \\
 \(K_r,B_r\) & Reduced microscopic and coupling operators. &
@@ -260,54 +262,73 @@ individual full-order solve. If the microstructure is fixed but its local
 constitutive properties are changed repeatedly, each new material point still
 requires the solution of a high-dimensional microscopic problem.
 
-Projection-based model reduction addresses this repeated cost by exploiting the low-dimensional structure of families of microscopic solutions. Reduced-basis and POD approaches have therefore been developed for computational homogenization in a variety of linear and nonlinear settings \cite{boyaval2008homogenization,yvonnet2007r3m,fritzen2013hybrid, hernandez2014highperformance,kunc2019finite,pham2025rbhm}, while transformation-field and clustering approaches provide alternative reduced descriptions of microscopic states \cite{michel2003ntfa,michel2016variational,liu2016sca}. Classical
-reduced-basis methodology also established offline--online decomposition and
-a posteriori error control for affinely parametrized coercive problems
-\cite{prudhomme2002reliable,quarteroni2011certified}, with certification
-strategies later adapted to computational homogenization and parametrized
-elasticity \cite{kerfriden2014cre,hoang2016twofield}. Related developments include successive-constraint and hierarchical error estimators \cite{huynh2007scm,hain2019hierarchical} and reduced static-condensation formulations for parametrized component problems \cite{huynh2013scrbe,eftang2013port,smetana2015certification}. These works establish that parametric microscopic solution families can often be represented in spaces substantially smaller than the underlying discretized problem.
+Projection-based model reduction addresses this repeated cost by exploiting
+the low-dimensional structure of families of microscopic solutions.
+Reduced-basis and POD approaches have consequently been developed for
+computational homogenization in linear and nonlinear settings
+\cite{boyaval2008homogenization,yvonnet2007r3m,fritzen2013hybrid,
+hernandez2014highperformance,kunc2019finite}. The most directly related work
+is that of Pham and Lee \cite{pham2025rbhm}, which already combines periodic
+homogenization, reduced-basis offline--online decomposition, variable
+constituent properties, and thermal and elastic effective responses. Thus,
+neither the fixed-geometry many-material setting nor the use of a reduced
+basis and an offline--online split is claimed as new here.
 
-A complementary direction reduces the spatial complexity of FFT homogenization itself. Sparse sampling, low-rank tensor approximations, and tensor-train Fourier representations decrease the computational or storage requirements of the full-field solver \cite{kochmann2019sparsefft,vondrejc2020lowrank,hauck2026sfft}. At the same time, non-intrusive reduced models have combined POD with regression to learn effective constitutive responses from microscopic simulations under varying material or geometric parameters \cite{guo2021constitutive,guo2024geometric}, and sensitivity-based reduction has recently been explored for nonlinear hyperelastic homogenization \cite{lukes2026sensitivity}. These approaches address important aspects of spatial reduction, parametric approximation, or direct response prediction, but the fixed-geometry many-material setting introduces a specific form of redundancy: phase distribution, interfaces, local orientations, and discretization remain unchanged while only the constitutive properties vary. This suggests that the geometry-dependent contribution to the cell operators should be isolated once and reused across material queries. At the same time, an effective many-query formulation should remove voxel-scale operations from the deployed query, retain the variational structure of the microscopic problem rather than relying exclusively on regression of the homogenized output, and distinguish adaptive model construction from genuinely independent final assessment.
+Several neighboring developments further delimit the present contribution.
+Classical reduced-basis methodology established affine offline--online
+decomposition and error control for coercive parametrized problems
+\cite{prudhomme2002reliable,quarteroni2011certified}, including adaptations to
+homogenization and elasticity \cite{kerfriden2014cre,hoang2016twofield}.
+Static-condensation reduced-basis methods already treat reduced Schur
+complements, port reduction, and certification
+\cite{huynh2013scrbe,eftang2013port,smetana2015certification}, while
+variationally consistent micromechanical reduction predates the present work
+\cite{michel2016variational}. Non-intrusive approaches have
+combined microscopic POD information with regression of constitutive
+responses under material or geometric variation
+\cite{guo2021constitutive,guo2024geometric}. Within FFT homogenization,
+sparse sampling, low-rank tensors, and tensor trains reduce spatial solution
+or storage cost \cite{kochmann2019sparsefft,vondrejc2020lowrank,hauck2026sfft}.
+Sensitivity-based reduction has also been considered for nonlinear
+hyperelastic homogenization \cite{lukes2026sensitivity}. Accordingly, POD,
+affine parametrization, Schur condensation, and preservation of variational
+structure are established ingredients rather than separate novelty claims.
 
+The methodological contribution pursued here is their specific integration
+into an FFT-based constitutive compiler for one fully resolved periodic
+geometry. The Fourier--Galerkin cell equations for all independent
+macroscopic loadings are written as one effective Schur map; the local
+constitutive family is separated exactly into reusable geometry-dependent
+blocks \(\{K_q,B_q,D_q\}_{q=1}^{Q}\); and those blocks are projected onto the
+complete span of a fixed Sobol prefix of microscopic responses. Retaining the
+entire snapshot span, rather than selecting an energy fraction or a
+prescribed reduced dimension, makes the prefix spaces nested. In this
+specific construction, the reduced--full-order Schur difference admits the
+exact microscopic energy identity in Eq.~\eqref{eq:ritz_schur_identity}, and
+successive prefix operators obey the Loewner ordering in
+Eq.~\eqref{eq:fullrank_monotone_schur}. After compilation, a material query
+uses only affine coefficient evaluation, reduced dense assembly, and a small
+solve; neither an FFT iteration nor a voxel-scale reconstruction remains in
+the deployed query. The contribution therefore lies in this combined
+FFT--affine--Ritz--Schur construction and its consequences rather than in any
+one of its constituent techniques.
 
-The proposed framework addresses these requirements by recasting repeated
-homogenization of a fixed periodic microstructure as a reusable Ritz--Schur
-constitutive transfer problem. The macroscopic loading cases are collected
-into a common microscopic response matrix, while a finite affine
-representation separates the queried constitutive coefficients from the fixed
-spatial information of the microstructure, allowing the geometry-dependent
-operator contributions to be precomputed. Since this separation alone does
-not eliminate the microscopic solve, full-order responses sampled along a
-fixed Sobol sequence are used to construct a full-rank POD basis that retains
-the complete snapshot span and defines the corresponding Ritz trial space
-without prescribing a reduced dimension, energy-retention threshold, or
-numerical-rank truncation. Projection of the affine operators onto this space produces a
-compact transfer model for which a new material query requires only
-constitutive-coefficient evaluation, reduced assembly, and a small dense
-solve, with no further Fourier--Galerkin iteration or voxel-scale field
-reconstruction. The resulting reduced Schur operator remains variationally
-consistent with the full-order problem, yielding in exact arithmetic an
-energy identity for the reduced--full-order difference. Because each Sobol
-enrichment appends columns without removing any previous snapshot direction,
-the trial spaces are nested and the effective operators converge
-monotonically in the Loewner sense. The offline construction is controlled by
-an independent monitor set, whereas a separate space-filling design is used
-only after the model has been frozen; RBF and Kriging surrogates trained on
-the same material prefixes provide data-only references. Within the
+The numerical study then evaluates whether this construction is useful under
+a deliberately separated protocol. Five independent FOM materials control
+Sobol-prefix enrichment, after which the reduced operators are frozen and a
+second maximin design is used only for final assessment. Training-only-tuned
+RBF and Kriging models provide same-prefix data-only references. Within the
 assumptions of linearity, symmetry, coercivity, and finite affine constitutive
-separability, the framework is intended for repeated evaluations in material
-screening, sensitivity and uncertainty analysis, inverse identification and
-calibration, optimization, effective-property database generation, and
-multiscale workflows, and the same algebra applies to conduction, diffusion,
-dielectric, Darcy, and elasticity cell problems. The numerical assessment
-specializes the formulation to three-dimensional linear elasticity in
+separability, the transfer algebra also covers conduction, diffusion,
+dielectric, Darcy, and elasticity cell problems, although the numerical
+assessment is restricted to three-dimensional linear elasticity in
 short-fiber composites.
 
 
 The remainder of this paper is organized as follows.
 Section~\ref{sec:homogenization} develops the general periodic cell problem,
 its discrete Schur representation, and the geometry--material affine
-separation. Section~\ref{sec:transfer} introduces the Sobol--POD Ritz transfer
+separation. Section~\ref{sec:transfer} introduces the Sobol--Ritz transfer
 operator, its variational properties, and the adaptive monitoring and
 held-out validation protocol. Section~\ref{sec:numerical_examples}
 specializes the formulation to three-dimensional elasticity and presents the
@@ -637,14 +658,14 @@ only through its constitutive coefficients. A change in \(\G\), however,
 requires a new offline compilation.
 
 
-\section{Sobol--POD transfer operator}
+\section{Sobol--Ritz transfer operator}
 \label{sec:transfer}
 
 The affine separation in Eq.~\eqref{eq:affine_operators} isolates the material
 dependence from the fixed microstructure, but it does not eliminate the
 full-order microscopic solve in Eq.~\eqref{eq:fom_response}. To remove this
 cost from the online stage, full-order responses sampled over the admissible
-material domain are used to construct a common Sobol--POD Ritz space. The
+material domain are used to construct a common Sobol--Ritz space. The
 geometry-dependent affine operators are then projected once offline, so that
 subsequent material queries require only reduced dense algebra.
 
@@ -681,67 +702,103 @@ Equation~\eqref{eq:snapshot_matrix} shows that, although each microscopic
 response belongs to the \(n\)-dimensional full-order space, the sampled
 response space has dimension at most \(p\).
 
-The POD space is constructed by the method of snapshots. Rather than
-diagonalizing an \(n\times n\) correlation operator, the response
-correlations are represented by the small Gram matrix
-\(G_S=\langle S,S\rangle_h=W\Lambda W^T\in\R^{p\times p}\), with
-\(\lambda_1\geq\lambda_2\geq\cdots\geq0\). The complete independent
-snapshot span has dimension
+The complete independent snapshot span has dimension
 \begin{equation}
 \label{eq:full_snapshot_rank}
 r
 =
 \operatorname{rank}(S)
-=
-\operatorname{rank}(G_S)
-=
-\#\{i:\lambda_i>0\}.
+\leq p.
 \end{equation}
-Every direction in Eq.~\eqref{eq:full_snapshot_rank} is retained. The
-corresponding full-rank POD/Ritz basis is
-\begin{equation}
-\label{eq:fullrank_pod}
-V_r
-=
-S W_r\Lambda_r^{-1/2}
-\in\R^{n\times r}.
-\end{equation}
-In Eq.~\eqref{eq:fullrank_pod},
-\(W_r\in\R^{p\times r}\) and
-\(\Lambda_r\in\R^{r\times r}\) contain all nonzero Gram eigendirections.
-Thus, POD changes coordinates but does not truncate the sampled response
-space: no prescribed reduced dimension, numerical-rank approximation, or POD
-energy fraction is introduced. In floating-point arithmetic, a relative
-machine-zero guard \(\tau_{\mathrm{mach}}\) is used only to avoid division by
-arithmetic zero. The campaign uses \(\tau_{\mathrm{mach}}=10^{-15}\), and no
-snapshot direction is removed in any of the ten final constructions.
-Here, \emph{full rank} refers to the complete rank of the snapshot matrix,
-not to the full microscopic dimension: \(r=\operatorname{rank}(S)\leq p\ll n\).
-The online model therefore remains reduced with respect to the voxel space
-while introducing no truncation inside the sampled response space.
+Every direction in Eq.~\eqref{eq:full_snapshot_rank} is retained. Thus, no
+prescribed reduced dimension, numerical-rank approximation, or energy
+fraction is introduced. In every accepted prefix of the reported campaign,
+the snapshot columns are independent and hence \(r=p\). Here, \emph{full
+span} refers to the complete range of the snapshot matrix, not to the full
+microscopic dimension: \(r=\operatorname{rank}(S)\leq p\ll n\).
 
-The full voxel basis \(V_r\) in Eq.~\eqref{eq:fullrank_pod} need not be
-formed explicitly. Defining
-\(T_r=\Lambda_r^{-1/2}W_r^T\in\R^{r\times p}\), the affine operators are
-first contracted in the raw snapshot coordinates as
-\(\widetilde K_q=S^TK_qS\in\R^{p\times p}\) and
-\(\widetilde B_q=S^TB_q\in\R^{p\times m}\). The final reduced blocks are
-obtained through
+The affine operators are first contracted in the raw snapshot coordinates,
+\begin{equation}
+\label{eq:raw_affine_blocks}
+\widetilde K_q=S^TK_qS\in\R^{p\times p},
+\qquad
+\widetilde B_q=S^TB_q\in\R^{p\times m}.
+\end{equation}
+These blocks define a valid Ritz problem directly and are used for all
+adaptive monitor evaluations. After the stopping prefix has been selected,
+the frozen model is normalized once in a coercive reference-energy inner
+product. The reference coefficients and operator are
+\begin{equation}
+\label{eq:reference_energy_operator}
+\overline{\boldsymbol\gamma}
+=
+\frac{1}{N_C}\sum_{j=1}^{N_C}
+\boldsymbol\gamma(\boldsymbol\xi_C^{(j)}),
+\qquad
+K_{\mathrm{ref}}
+=
+\sum_{q=1}^{Q}\overline\gamma_qK_q.
+\end{equation}
+The reference-energy Gram matrix is available without another voxel-scale
+contraction because
+\begin{equation}
+\label{eq:reference_energy_qr}
+G_{\mathrm{ref}}
+=S^TK_{\mathrm{ref}}S
+=\sum_{q=1}^{Q}\overline\gamma_q\widetilde K_q
+=R_{\mathrm{ref}}^TR_{\mathrm{ref}},
+\qquad
+V_r=SR_{\mathrm{ref}}^{-1}.
+\end{equation}
+Here, \(R_{\mathrm{ref}}\) is the upper Cholesky factor computed in
+\texttt{float64}. Coercivity of \(K_{\mathrm{ref}}\) and independence of the
+snapshot columns make \(G_{\mathrm{ref}}\) positive definite. Equation~
+\eqref{eq:reference_energy_qr} gives
+\(V_r^TK_{\mathrm{ref}}V_r=I\) and changes coordinates without changing
+\(\operatorname{range}(S)\). No explicit voxel-scale \(V_r\), Euclidean
+snapshot Gram matrix, or POD eigendecomposition is formed.
+
+The final reduced affine blocks are obtained entirely in snapshot
+coordinates through
 \begin{equation}
 \label{eq:raw_ritz_transform}
 K_{q,r}
 =
-T_r\widetilde K_qT_r^T,
+R_{\mathrm{ref}}^{-T}\widetilde K_qR_{\mathrm{ref}}^{-1},
 \qquad
 B_{q,r}
 =
-T_r\widetilde B_q.
+R_{\mathrm{ref}}^{-T}\widetilde B_q.
 \end{equation}
 Equation~\eqref{eq:raw_ritz_transform} gives
 \(K_{q,r}\in\R^{r\times r}\) and
 \(B_{q,r}\in\R^{r\times m}\), and is algebraically equivalent to direct
-projection with Eq.~\eqref{eq:fullrank_pod}. The explicit construction of a
-global voxel-scale basis is therefore avoided.
+projection with the reference-energy basis in
+Eq.~\eqref{eq:reference_energy_qr}. The online model therefore remains
+reduced with respect to the voxel space while introducing no truncation
+inside the sampled response space.
+
+The voxel-scale contractions in Eq.~\eqref{eq:raw_affine_blocks} exploit the
+exact small constitutive rank. For each phase and orientation group, the
+symmetric affine field has a signed spectral factorization
+\begin{equation}
+\label{eq:constitutive_factor_ritz}
+\mathbb A_q(\boldsymbol x;\G)
+=F_q(\boldsymbol x)W_qF_q(\boldsymbol x)^T,
+\qquad W_q\ \text{diagonal},
+\end{equation}
+so a chunk contribution to \(S^TK_qS\) is assembled from the feature fields
+\(F_q^TS\) and their diagonal weights. This is an exact rearrangement of the
+affine action, not a low-rank approximation of the snapshot space. Snapshot
+voxels are stored by phase and local orientation. For each voxel chunk, the
+GPU receives the old and newly appended snapshot columns once; the
+orientation-dependent factors are gathered once per fiber voxel and reused
+to assemble all supported affine \(K_q\) and \(B_q\) blocks. Two CUDA streams
+and two pinned host buffers overlap preparation and transfer of the next
+chunk with contraction of the current chunk. The reduced accumulators remain
+on the GPU until the chunk traversal is complete. Only one material, with its
+\(m\) loading fields, is appended at a time; the asynchronous chunk pipeline
+does not increase the material batch size.
 
 The complete transition from the full-order responses to the compiled
 reduced transfer quantities can be summarized as
@@ -754,9 +811,9 @@ X(\boldsymbol\xi^{(j)})\in\R^{n\times m}
 \;\longrightarrow\;
 S\in\R^{n\times p}
 \;\longrightarrow\;
-G_S\in\R^{p\times p}
+\{\widetilde K_q,\widetilde B_q\}_{q=1}^{Q}
 \;\longrightarrow\;
-r
+R_{\mathrm{ref}}\in\R^{r\times r}
 \\[-1mm]
 &
 \hspace{32mm}\longrightarrow\;
@@ -904,7 +961,7 @@ constructed on nested trial spaces. If
 \Hr.
 }
 \end{equation}
-In the present full-rank construction, nesting is automatic. If \(S_\ell\)
+In the present full-span construction, nesting is automatic. If \(S_\ell\)
 denotes the snapshot matrix after \(\ell\) materials, appending the next
 response block gives
 \begin{equation}
@@ -928,7 +985,7 @@ both operator differences are positive semidefinite, it also implies
 \(\|H_{\ell+1}^{\mathrm{eff}}-\Hfom\|_F
 \leq\|H_{\ell}^{\mathrm{eff}}-\Hfom\|_F\) in exact arithmetic. Hence each
 monitor error, and therefore their maximum, is nonincreasing under exact
-full-rank Ritz enrichment. The derivation of
+full-span Ritz enrichment. The derivation of
 Eqs.~\eqref{eq:ritz_schur_identity} and
 \eqref{eq:nested_ritz_ordering} is provided in
 Appendix~\ref{app:ritz_schur}. Finite-precision contractions and iterative
@@ -947,7 +1004,8 @@ computed once, while the monitor fields are never included in the snapshot
 matrix of Eq.~\eqref{eq:snapshot_matrix}. After \(\ell\) Sobol materials
 have been incorporated, the reduced space and affine blocks are updated
 according to Eqs.~\eqref{eq:full_snapshot_rank} and
-\eqref{eq:raw_ritz_transform}, and the worst-case monitor error is evaluated as
+\eqref{eq:raw_affine_blocks} in raw snapshot coordinates, and the worst-case
+monitor error is evaluated as
 \begin{equation}
 \label{eq:monitor_stopping}
 e_M^{(\ell)}
@@ -987,7 +1045,7 @@ Equation~\eqref{eq:adaptive_stop} therefore determines the training set
 satisfies the tolerance, the target is reported as unmet.
 Because it uses only five finite monitor points, this first crossing remains
 a heuristic stopping criterion rather than a uniform error bound over
-\(\Xi\). Within the exact full-rank Ritz algebra it is stable under further
+\(\Xi\). Within the exact full-span Ritz algebra it is stable under further
 enrichment by Eq.~\eqref{eq:fullrank_monotone_schur}; in the implementation,
 its realized behavior is also checked directly from the recorded monitor
 history.
@@ -1058,8 +1116,8 @@ the ideal Ritz identity.
 
 The complete procedure is summarized in Algorithm~\ref{alg:offline_online}.
 For each fixed microstructure \(\G\), all Fourier--Galerkin solves, snapshot
-generation, full-span orthonormalization, adaptive monitoring, and affine
-Ritz contractions are confined to the offline stage. Once the reduced
+generation, adaptive monitoring, affine Ritz contractions, and the final
+reference-energy QR normalization are confined to the offline stage. Once the reduced
 operators have been frozen, a new material query requires only evaluation of
 \(\boldsymbol\gamma(\boldsymbol\xi^\star)\), assembly of \(K_r\) and \(B_r\)
 through Eq.~\eqref{eq:online_assembly} and of \(D\) through
@@ -1070,7 +1128,7 @@ reconstruction is required online.
 
 
 \begin{algorithm}[H]
-\caption{Adaptive Sobol--POD transfer operator for one fixed microstructure
+\caption{Adaptive Sobol--Ritz transfer operator for one fixed microstructure
 \(\G\).}
 \label{alg:offline_online}
 \small
@@ -1109,8 +1167,8 @@ to the snapshot matrix \(S\). \\
 \> Retain the complete independent snapshot span using
 Eq.~\eqref{eq:full_snapshot_rank}. \\
 
-\> Update the reduced affine blocks using
-Eq.~\eqref{eq:raw_ritz_transform}. \\[1mm]
+\> Update \(\{\widetilde K_q,\widetilde B_q,D_q\}_{q=1}^{Q}\) in raw
+snapshot coordinates using Eq.~\eqref{eq:raw_affine_blocks}. \\[1mm]
 
 \> \textbf{if} \(\ell\geq\ell_{\min}\) \textbf{then} \\
 
@@ -1137,6 +1195,9 @@ Eq.~\eqref{eq:monitor_stopping}. \\
 \> Report the prescribed tolerance as unmet. \\
 
 \textbf{else} \\
+
+\> Form \(R_{\mathrm{ref}}\) using Eq.~\eqref{eq:reference_energy_qr} and
+transform the raw blocks using Eq.~\eqref{eq:raw_ritz_transform}. \\
 
 \> Freeze
 \(\{K_{q,r},B_{q,r},D_q\}_{q=1}^{Q}\) and record its hash. \\
@@ -1197,7 +1258,7 @@ Eq.~\eqref{eq:reduced_transfer}. \\
 \section{Numerical examples}
 \label{sec:numerical_examples}
 
-The proposed Sobol--POD transfer formulation is assessed through
+The proposed Sobol--Ritz transfer formulation is assessed through
 three-dimensional linear elasticity over a set of periodic composite
 microstructures. The numerical examples verify the FFTHomPy adaptations and
 voxel resolution, examine adaptive construction and held-out accuracy,
@@ -1277,7 +1338,7 @@ ratio, and orientation distribution, as summarized in
 Table~\ref{tab:geometry_campaign}. The reported volume fractions are measured
 from the binary voxel fields, and the orientation entries are the prescribed
 diagonal components of the second-order orientation tensor. Each
-microstructure is compiled independently; no snapshot, POD basis, or reduced
+microstructure is compiled independently; no snapshot, Ritz basis, or reduced
 affine operator is transferred between geometries. The cubic grids range from
 \(60^3\) to \(240^3\), corresponding to
 \(N_{\mathrm{vox}}=216{,}000\) to \(13{,}824{,}000\).
@@ -1343,15 +1404,15 @@ Training, monitoring, and FOM timing use Fourier--Galerkin/CG in
 corresponding converged timing field; the refinement time is excluded from
 \(t_{\mathrm{FOM}}\). Thus, the more accurate held-out solve is used only as
 an error reference and does not alter the nominal reduced model. Raw
-snapshots and voxel-scale affine Ritz actions use \texttt{float32}. The
-snapshot Gram products are evaluated in \texttt{float64} on the CPU, while
-the reduced accumulation, Gram transformation, and online dense solves use
-\texttt{float64}. This hybrid path avoids the low FP64 throughput of the
-consumer GPU without evaluating an ill-conditioned full-rank Gram product in
-\texttt{float32}. The machine-zero guard is
-\(\tau_{\mathrm{mach}}=10^{-15}\); it removes no snapshot direction in the
-reported campaign, so \(r=6N_s\) for every final ROM. No SPD probe,
-automatic rebuild, or diagonal regularization is used.
+snapshots and the exact constitutive-factor contractions use
+\texttt{float32} on the GPU, while the small affine blocks are accumulated in
+\texttt{float64}. At freeze, the reference-energy matrix in
+Eq.~\eqref{eq:reference_energy_qr}, its Cholesky factor, the triangular
+transformations, and the online dense solves are evaluated in
+\texttt{float64}. No Euclidean snapshot Gram matrix or POD eigendecomposition
+is evaluated on the nominal path. Every accepted snapshot matrix has full
+column rank, so \(r=6N_s\) for every final ROM. No SPD probe, automatic
+rebuild, rank truncation, or diagonal regularization is used.
 Complete implementation, memory, sampling, and reproducibility settings are
 reported in Appendix~\ref{app:campaign_reproducibility}.
 
@@ -1387,16 +1448,20 @@ Periodic laminate & Computed and analytical effective stiffness & \num{2.502e-15
 Affine reconstruction & Direct and seven-term voxel constitutive fields & \num{3.543e-17} \\
 CPU--GPU effective response & Effective stiffness tensors & \num{1.728e-14} \\
 CPU--GPU snapshots & Six microscopic response fields & \num{8.174e-16} \\
+Grouped--gathered Ritz assembly & Maximum over raw \(K_q\), \(B_q\), and \(D_q\) blocks & \num{1.760e-7} \\
 \bottomrule
 \end{tabularx}
 \end{minipage}
 \end{center}
 
-All tests are performed in \texttt{float64}. Their agreement verifies that
-the same constitutive bases, orientation grouping, and energy-preserving
-Mandel rotations are used by the full-order and reduced affine actions. It
-does not constitute a new validation claim for upstream FFTHomPy; it checks
-the modifications needed by this implementation.
+The first six tests are performed in \texttt{float64}. The final row compares
+the grouped and gathered-factor compilers in the nominal \texttt{float32}
+contraction precision; its value is the largest relative Frobenius difference
+among the three raw affine block families. Their agreement verifies that the
+same constitutive bases, orientation grouping, energy-preserving Mandel
+rotations, and signed factors are used by the full-order and reduced affine
+actions. It does not constitute a new validation claim for upstream
+FFTHomPy; it checks the modifications needed by this implementation.
 
 \subsection{Voxel-resolution convergence}
 \label{subsec:voxel_resolution}
@@ -1470,7 +1535,7 @@ percentage changes of the nine engineering constants are reported in
 Appendix~\ref{app:voxel_resolution}.
 
 
-\subsection{Adaptive full-rank construction}
+\subsection{Adaptive full-span construction}
 \label{subsec:adaptive_results}
 
 The first numerical assessment examines the number of full-order training
@@ -1485,7 +1550,7 @@ reports the selected prefix length \(N_s\), the resulting full snapshot rank
 \captionsetup{hypcap=false}
 \centering
 \scriptsize
-\captionof{table}{Adaptive full-rank Sobol--POD construction for the considered
+\captionof{table}{Adaptive full-span Sobol--Ritz construction for the considered
 microstructures.}
 \label{tab:adaptive_summary}
 \resizebox{\textwidth}{!}{
@@ -1497,17 +1562,17 @@ G05 & G06 & G07 & G08 & G09 \\
 \midrule
 \(N_s\) &
 11 & 6 & 15 & 11 & 12 &
-11 & 11 & 11 & 6 & 16 \\
+11 & 11 & 12 & 6 & 16 \\
 
 \(r\) &
 66 & 36 & 90 & 66 & 72 &
-66 & 66 & 66 & 36 & 96 \\
+66 & 66 & 72 & 36 & 96 \\
 
 \(e_M^{(N_s)}\) &
-\num{9.159e-5} & \num{8.968e-5} & \num{9.048e-5} &
-\num{8.287e-5} & \num{8.891e-5} & \num{8.801e-5} &
-\num{8.157e-5} & \num{9.484e-5} & \num{9.217e-5} &
-\num{9.483e-5} \\
+\num{9.831e-5} & \num{9.060e-5} & \num{9.218e-5} &
+\num{8.025e-5} & \num{8.917e-5} & \num{9.966e-5} &
+\num{9.006e-5} & \num{7.875e-5} & \num{9.197e-5} &
+\num{9.540e-5} \\
 \bottomrule
 \end{tabular}}
 \end{minipage}
@@ -1518,7 +1583,7 @@ Across the campaign, the selected training length ranges from
 \(r=36\) to \(r=96\).
 This variation indicates that the dimension of the sampled constitutive
 response space depends on the fixed microstructure, despite using the same
-constitutive domain, full-rank construction, and adaptive stopping rule.
+constitutive domain, full-span construction, and adaptive stopping rule.
 
 The two dilute cells, G01 and G08, reach the target with six materials and
 rank 36. In contrast, the dense long-fiber cell G09 requires 16 materials and
@@ -1546,7 +1611,8 @@ Table~\ref{tab:validation_summary} reports the resulting 200 comparisons.
 \centering
 \scriptsize
 \captionof{table}{Held-out accuracy and positive-definiteness diagnostics of
-the frozen Sobol--POD operators. Eigenvalues are in \si{\giga\pascal}.}
+the frozen Sobol--Ritz operators. The eigenvalues of \(K_r\) are dimensionless
+in reference-energy coordinates; those of \(\Cr\) are in \si{\giga\pascal}.}
 \label{tab:validation_summary}
 \resizebox{\textwidth}{!}{
 \begin{tabular}{@{}lrrrrrr@{}}
@@ -1555,26 +1621,26 @@ Geometry & Mean error & Maximum error &
 \(e\leq10^{-4}\) & \(e\leq10^{-3}\) &
 \(\min\lambda_{\min}(K_r)\) & \(\min\lambda_{\min}(\Cr)\) \\
 \midrule
-G00 & \num{2.239e-4} & \num{8.564e-4} & 8/20  & 20/20 & \num{1.341} & \num{1.656} \\
-G01 & \num{1.804e-4} & \num{5.234e-4} & 7/20  & 20/20 & \num{1.538} & \num{1.048} \\
-G02 & \num{2.334e-4} & \num{1.028e-3} & 11/20 & 19/20 & \num{1.284} & \num{2.335} \\
-G03 & \num{1.674e-4} & \num{6.435e-4} & 10/20 & 20/20 & \num{1.175} & \num{1.323} \\
-G04 & \num{1.993e-4} & \num{7.713e-4} & 9/20  & 20/20 & \num{1.232} & \num{1.773} \\
-G05 & \num{2.215e-4} & \num{8.246e-4} & 9/20  & 20/20 & \num{1.295} & \num{1.202} \\
-G06 & \num{2.413e-4} & \num{8.797e-4} & 10/20 & 20/20 & \num{1.320} & \num{1.137} \\
-G07 & \num{2.408e-4} & \num{8.768e-4} & 9/20  & 20/20 & \num{1.344} & \num{1.342} \\
-G08 & \num{1.788e-4} & \num{7.947e-4} & 8/20  & 20/20 & \num{1.490} & \num{0.931} \\
-G09 & \num{2.476e-4} & \num{1.297e-3} & 10/20 & 19/20 & \num{1.172} & \num{2.659} \\
+G00 & \num{2.374e-4} & \num{1.008e-3} & 7/20  & 19/20 & \num{0.326} & \num{1.656} \\
+G01 & \num{1.827e-4} & \num{5.248e-4} & 7/20  & 20/20 & \num{0.332} & \num{1.048} \\
+G02 & \num{2.387e-4} & \num{1.026e-3} & 11/20 & 19/20 & \num{0.327} & \num{2.335} \\
+G03 & \num{1.642e-4} & \num{5.955e-4} & 10/20 & 20/20 & \num{0.325} & \num{1.323} \\
+G04 & \num{2.057e-4} & \num{7.792e-4} & 9/20  & 20/20 & \num{0.327} & \num{1.773} \\
+G05 & \num{2.427e-4} & \num{1.063e-3} & 9/20  & 19/20 & \num{0.325} & \num{1.202} \\
+G06 & \num{2.518e-4} & \num{1.024e-3} & 9/20  & 19/20 & \num{0.326} & \num{1.137} \\
+G07 & \num{1.853e-4} & \num{6.931e-4} & 10/20 & 20/20 & \num{0.326} & \num{1.342} \\
+G08 & \num{1.783e-4} & \num{7.947e-4} & 8/20  & 20/20 & \num{0.329} & \num{0.931} \\
+G09 & \num{2.515e-4} & \num{1.306e-3} & 9/20  & 19/20 & \num{0.327} & \num{2.659} \\
 \bottomrule
 \end{tabular}}
 \end{minipage}
 \end{center}
 
 Across all pairs, the mean, median, 95th-percentile, and maximum errors are
-\(2.134\times10^{-4}\), \(1.392\times10^{-4}\),
-\(7.725\times10^{-4}\), and \(1.297\times10^{-3}\), respectively.
-Although only 91 of 200 pairs satisfy the monitor-level threshold
-\(10^{-4}\), 198 satisfy \(10^{-3}\). No held-out information is used to add
+\(2.138\times10^{-4}\), \(1.399\times10^{-4}\),
+\(7.703\times10^{-4}\), and \(1.306\times10^{-3}\), respectively.
+Although only 89 of 200 pairs satisfy the monitor-level threshold
+\(10^{-4}\), 195 satisfy \(10^{-3}\). No held-out information is used to add
 snapshots after this result. The first-crossing rule over five monitors is
 therefore an effective adaptive heuristic for the sampled monitor set, but it
 does not guarantee the same tolerance on the more widely separated maximin
@@ -1586,7 +1652,7 @@ visible.
 \captionsetup{hypcap=false}
 \centering
 \includegraphics[width=\textwidth]{numerical_adaptive_validation.pdf}
-\captionof{figure}{Adaptive full-rank construction and independent validation.
+\captionof{figure}{Adaptive full-span construction and independent validation.
 (a) Maximum monitor error during nested Sobol-prefix enrichment; each curve
 ends at its first crossing of the \(10^{-4}\) target. (b) Errors for the 20 held-out
 materials per geometry; horizontal black segments denote geometry-wise
@@ -1599,11 +1665,11 @@ All 200 validation references converged for their six macroscopic loadings at
 the specified \(10^{-6}\) tolerance, and no reduced evaluation failed
 numerically. Every held-out reduced system and
 stiffness tensor remained positive definite: the campaign-wide minima were
-\(\lambda_{\min}(K_r)=1.172~\si{\giga\pascal}\),
-\(\rho_K=1.550\times10^{-2}\), and
+\(\lambda_{\min}(K_r)=0.325\) in reference-energy coordinates,
+\(\rho_K=2.373\times10^{-1}\), and
 \(\lambda_{\min}(\Cr)=0.931~\si{\giga\pascal}\). The raw Schur indicators
 are reported by geometry in Appendix~\ref{app:campaign_reproducibility}; their
-minimum is \(-4.119\times10^{-6}\). This secondary finite-precision
+minimum is \(-4.024\times10^{-6}\). This secondary finite-precision
 diagnostic does not affect the observed positive definiteness, but confirms
 that the exact-arithmetic ordering should not be read as a bitwise certificate
 for a finite-precision implementation.
@@ -1613,7 +1679,7 @@ The comparison across G00--G09 assesses the robustness of the
 microstructure. Each geometry has its own independently constructed response
 space and reduced affine blocks; therefore, the results do not imply the
 existence of a geometry-independent universal basis. Rather, they determine
-whether the same Sobol--POD construction and stopping criterion remain
+whether the same Sobol--Ritz construction and stopping criterion remain
 effective across distinct fixed microstructures.
 
 \subsection{Comparison with data-only surrogates}
@@ -1640,11 +1706,11 @@ Appendix~\ref{app:surrogate_hyperparameters}; the winning prefix-wise
 configurations are retained in the campaign manifest.
 
 Table~\ref{tab:surrogate_baselines} reports the final geometry-wise prefixes.
-The Sobol--POD model has lower error than each data-only surrogate for every
+The Sobol--Ritz model has lower error than each data-only surrogate for every
 one of the 200 paired material--geometry comparisons. Its aggregate mean
-error is \(2.134\times10^{-4}\), compared with
-\(6.256\times10^{-2}\) for RBF and \(7.585\times10^{-2}\) for
-Kriging. The corresponding ratios are 293 and 355. Neither data-only
+error is \(2.138\times10^{-4}\), compared with
+\(6.293\times10^{-2}\) for RBF and \(7.258\times10^{-2}\) for
+Kriging. The corresponding ratios are 294 and 339. Neither data-only
 surrogate produces a case below \(10^{-4}\), although all 600 final-prefix
 predictions from the three methods are positive definite.
 
@@ -1662,18 +1728,18 @@ surrogates. All errors are relative Frobenius tensor errors on the common
 \toprule
 & & \multicolumn{3}{c}{Mean error} & \multicolumn{3}{c}{Maximum error} \\
 \cmidrule(lr){3-5}\cmidrule(lr){6-8}
-Geometry & \(N_s\) & Sobol--POD & RBF & Kriging & Sobol--POD & RBF & Kriging \\
+Geometry & \(N_s\) & Sobol--Ritz & RBF & Kriging & Sobol--Ritz & RBF & Kriging \\
 \midrule
-G00 & 11 & \num{2.239e-4} & \num{4.149e-2} & \num{5.654e-2} & \num{8.564e-4} & \num{1.438e-1} & \num{1.738e-1} \\
-G01 & 6  & \num{1.804e-4} & \num{1.422e-1} & \num{1.205e-1} & \num{5.234e-4} & \num{5.581e-1} & \num{4.442e-1} \\
-G02 & 15 & \num{2.334e-4} & \num{5.089e-2} & \num{3.483e-2} & \num{1.028e-3} & \num{1.817e-1} & \num{8.348e-2} \\
-G03 & 11 & \num{1.674e-4} & \num{2.401e-2} & \num{9.663e-2} & \num{6.435e-4} & \num{6.120e-2} & \num{3.348e-1} \\
-G04 & 12 & \num{1.993e-4} & \num{4.704e-2} & \num{5.119e-2} & \num{7.713e-4} & \num{1.790e-1} & \num{1.230e-1} \\
-G05 & 11 & \num{2.215e-4} & \num{5.628e-2} & \num{7.197e-2} & \num{8.246e-4} & \num{2.005e-1} & \num{2.770e-1} \\
-G06 & 11 & \num{2.413e-4} & \num{6.760e-2} & \num{8.009e-2} & \num{8.797e-4} & \num{2.384e-1} & \num{1.955e-1} \\
-G07 & 11 & \num{2.408e-4} & \num{4.943e-2} & \num{7.738e-2} & \num{8.768e-4} & \num{1.689e-1} & \num{2.052e-1} \\
-G08 & 6  & \num{1.788e-4} & \num{1.021e-1} & \num{1.446e-1} & \num{7.947e-4} & \num{4.139e-1} & \num{5.415e-1} \\
-G09 & 16 & \num{2.476e-4} & \num{4.459e-2} & \num{2.475e-2} & \num{1.297e-3} & \num{1.554e-1} & \num{5.718e-2} \\
+G00 & 11 & \num{2.374e-4} & \num{4.149e-2} & \num{5.654e-2} & \num{1.008e-3} & \num{1.438e-1} & \num{1.738e-1} \\
+G01 & 6  & \num{1.827e-4} & \num{1.422e-1} & \num{1.205e-1} & \num{5.248e-4} & \num{5.581e-1} & \num{4.442e-1} \\
+G02 & 15 & \num{2.387e-4} & \num{5.089e-2} & \num{3.483e-2} & \num{1.026e-3} & \num{1.817e-1} & \num{8.347e-2} \\
+G03 & 11 & \num{1.642e-4} & \num{2.401e-2} & \num{9.723e-2} & \num{5.955e-4} & \num{6.120e-2} & \num{3.345e-1} \\
+G04 & 12 & \num{2.057e-4} & \num{4.704e-2} & \num{5.119e-2} & \num{7.792e-4} & \num{1.790e-1} & \num{1.230e-1} \\
+G05 & 11 & \num{2.427e-4} & \num{5.628e-2} & \num{7.197e-2} & \num{1.063e-3} & \num{2.005e-1} & \num{2.770e-1} \\
+G06 & 11 & \num{2.518e-4} & \num{6.760e-2} & \num{8.008e-2} & \num{1.024e-3} & \num{2.384e-1} & \num{1.955e-1} \\
+G07 & 12 & \num{1.853e-4} & \num{5.310e-2} & \num{4.408e-2} & \num{6.931e-4} & \num{1.859e-1} & \num{1.089e-1} \\
+G08 & 6  & \num{1.783e-4} & \num{1.021e-1} & \num{1.446e-1} & \num{7.947e-4} & \num{4.139e-1} & \num{5.415e-1} \\
+G09 & 16 & \num{2.515e-4} & \num{4.459e-2} & \num{2.475e-2} & \num{1.306e-3} & \num{1.554e-1} & \num{5.717e-2} \\
 \bottomrule
 \end{tabular}}
 \end{minipage}
@@ -1682,7 +1748,7 @@ G09 & 16 & \num{2.476e-4} & \num{4.459e-2} & \num{2.475e-2} & \num{1.297e-3} & \
 The learning curves in Fig.~\ref{fig:surrogate_sample_efficiency} show that
 the separation appears well before the final adaptive stop. The comparison
 is deliberately equalized by the number of full-order training materials,
-not by the information retained from each solve: Sobol--POD uses the six
+not by the information retained from each solve: Sobol--Ritz uses the six
 microscopic fluctuation fields, whereas RBF and Kriging see only the effective
 tensor. Moreover, the five monitor solves are part of adaptive stopping but
 not surrogate fitting. The result therefore demonstrates the value of
@@ -1740,16 +1806,16 @@ Geometry & \(N_{\mathrm{vox}}\) & \(N_s\) & \(r\) &
 \(t_{\mathrm{FOM}}\) [s] & \(T_{\mathrm{compile}}\) [s] &
 \(t_{\mathrm{CUDA}}\) [\si{\micro\second}/query] & Speed-up & \(N_{\mathrm{BE}}\) \\
 \midrule
-G00 & 3,375,000  & 11 & 66 & 1.822 & 46.48  & 5.317 & \num{3.43e5} & 26 \\
-G01 & 3,375,000  & 6  & 36 & 1.729 & 24.55  & 2.331 & \num{7.42e5} & 15 \\
-G02 & 3,375,000  & 15 & 90 & 1.840 & 67.41  & 7.361 & \num{2.50e5} & 37 \\
-G03 & 216,000    & 11 & 66 & 0.139 & 3.84   & 5.354 & \num{2.59e4} & 28 \\
-G04 & 13,824,000 & 12 & 72 & 7.323 & 206.17 & 5.788 & \num{1.27e6} & 29 \\
-G05 & 3,375,000  & 11 & 66 & 1.806 & 46.47  & 5.351 & \num{3.38e5} & 26 \\
-G06 & 3,375,000  & 11 & 66 & 1.818 & 46.57  & 5.359 & \num{3.39e5} & 26 \\
-G07 & 3,375,000  & 11 & 66 & 1.817 & 46.55  & 5.351 & \num{3.40e5} & 26 \\
-G08 & 216,000    & 6  & 36 & 0.138 & 2.10   & 2.364 & \num{5.83e4} & 16 \\
-G09 & 13,824,000 & 16 & 96 & 7.442 & 262.23 & 7.825 & \num{9.51e5} & 36 \\
+G00 & 3,375,000  & 11 & 66 & 1.816 & 26.20  & 5.585 & \num{3.25e5} & 15 \\
+G01 & 3,375,000  & 6  & 36 & 1.735 & 12.83  & 2.423 & \num{7.16e5} & 8 \\
+G02 & 3,375,000  & 15 & 90 & 1.758 & 38.97  & 7.795 & \num{2.26e5} & 23 \\
+G03 & 216,000    & 11 & 66 & 0.131 & 3.49   & 5.613 & \num{2.33e4} & 27 \\
+G04 & 13,824,000 & 12 & 72 & 6.906 & 128.80 & 6.076 & \num{1.14e6} & 19 \\
+G05 & 3,375,000  & 11 & 66 & 1.721 & 31.68  & 5.637 & \num{3.05e5} & 19 \\
+G06 & 3,375,000  & 11 & 66 & 1.727 & 31.73  & 5.604 & \num{3.08e5} & 19 \\
+G07 & 3,375,000  & 12 & 72 & 1.741 & 34.46  & 6.072 & \num{2.87e5} & 20 \\
+G08 & 216,000    & 6  & 36 & 0.127 & 1.79   & 2.420 & \num{5.25e4} & 15 \\
+G09 & 13,824,000 & 16 & 96 & 7.019 & 174.93 & 8.276 & \num{8.48e5} & 25 \\
 \bottomrule
 \end{tabular}
 \end{minipage}
@@ -1759,10 +1825,18 @@ The measured FOM time increases with the FFT voxel count, whereas the online
 CUDA path follows the reduced rank and remains independent of
 \(N_{\mathrm{vox}}\) once the operators are frozen; these trends are shown in
 Fig.~\ref{fig:performance_scaling}. The synchronized batches require
-2.33--7.83~\si{\micro\second} per material after amortization, giving
-throughput speed-ups from \(2.59\times10^4\) to \(1.27\times10^6\). These
+2.42--8.28~\si{\micro\second} per material after amortization, giving
+throughput speed-ups from \(2.33\times10^4\) to \(1.14\times10^6\). These
 values characterize repeated batched evaluation rather than isolated-query
 latency.
+
+Relative to the preceding component-action/Euclidean-Gram implementation
+under the same campaign protocol, the new exact factorized, gathered, and
+streamed assembly reduces the measured compilation time from 206.17 to
+128.80~\si{\second} for G04 and from 262.23 to 174.93~\si{\second} for G09,
+corresponding to reductions of 37.5\% and 33.3\%. These end-to-end changes
+also include elimination of the repeated Euclidean-Gram transformations, so
+the reductions should not be attributed to the gathered kernel alone.
 
 \begin{center}
 \begin{minipage}{\textwidth}
@@ -1786,7 +1860,7 @@ N_{\mathrm{BE}}
 \right\rceil,
 \]
 where \(t_{\mathrm{ROM}}=t_{\mathrm{CUDA}}\) is the amortized CUDA time per
-query. The result ranges from 13 to 39 queries for the many-query throughput
+query. The result ranges from 8 to 27 queries for the many-query throughput
 scenario. Validation remains excluded because it assesses the model but is
 not required to deploy the frozen operator.
 
@@ -1800,19 +1874,24 @@ queries grows.
 \section{Conclusions}
 \label{sec:conclusions}
 
-A common Sobol--POD transfer formulation has been developed for
-repeated periodic homogenization with fixed geometry and varying local
-constitutive properties. The construction combines a Schur representation of
-the effective operator, an affine geometry--material separation, and a
-full-rank POD Ritz representation of the complete snapshot span.
-In exact arithmetic, the Ritz restriction preserves the variational
-structure of the Schur map: the ROM--FOM operator difference is positive
-semidefinite and is exactly the \(K\)-energy of the microscopic response
-error. Since enrichment appends snapshots without truncation, the reduced
+Reduced-basis homogenization, affine offline--online decomposition, Schur
+condensation, and variational preservation are established ingredients. The
+methodological contribution of this work is their FFT-specific combination
+into a constitutive compiler for repeated material queries on one fixed,
+fully resolved periodic geometry. The construction collects all macroscopic
+loading problems in an effective Schur map, separates material coefficients
+from reusable voxel geometry blocks, and projects those blocks onto the
+complete Sobol snapshot span. In exact arithmetic, this particular
+Ritz--Schur construction makes the ROM--FOM operator difference positive
+semidefinite and exactly equal to the \(K\)-energy of the microscopic response
+error. Because enrichment appends snapshots without truncation, the trial
 spaces are nested and the effective operators are ordered monotonically
-toward the full-order operator. The nominal hybrid contractions are assessed
-numerically and are not treated as a floating-point certificate of the exact
-identity.
+toward the full-order operator. The implementation forms the raw affine
+blocks with exact signed spectral factors, gathers orientation-dependent
+factors once per voxel chunk, overlaps pinned transfers with GPU computation,
+and applies one reference-energy Cholesky--QR transformation at freeze. The
+mixed-precision realization is assessed numerically and is not treated as a
+bitwise certificate of the exact identity.
 
 The formulation is not restricted to elasticity. It applies directly to
 linear, symmetric, and coercive periodic cell problems such as thermal and
@@ -1823,17 +1902,17 @@ macroscopic loadings changes with the physics, but the transfer algebra
 remains unchanged.
 
 Geometry is handled implicitly through the full-order operators and snapshots
-used by the small-Gram POD construction. Consequently, no
+used by the full-span Ritz construction. Consequently, no
 morphology-specific reduced descriptor is required. The framework is
 independent of the geometry class, while each compiled operator remains
 specific to the fixed geometry from which it was constructed.
 
 The ten three-dimensional elasticity examples selected Sobol prefixes between
 6 and 16 materials and full snapshot ranks between 36 and 96. On the
-independent 20-point affine-maximin design, 91 of 200 material--geometry pairs
-satisfied the \(10^{-4}\) relative Frobenius target and 198 satisfied
-\(10^{-3}\); the mean and maximum errors were \(2.134\times10^{-4}\) and
-\(1.297\times10^{-3}\). Thus, stopping at the
+independent 20-point affine-maximin design, 89 of 200 material--geometry pairs
+satisfied the \(10^{-4}\) relative Frobenius target and 195 satisfied
+\(10^{-3}\); the mean and maximum errors were \(2.138\times10^{-4}\) and
+\(1.306\times10^{-3}\). Thus, stopping at the
 first crossing over five monitors does not certify the same tolerance on a
 wider space-filling design. No held-out point was used for subsequent
 enrichment, and every reduced system and stiffness tensor remained positive
@@ -1842,19 +1921,19 @@ finite-precision limit of the exact variational ordering.
 
 At the same geometry-wise Sobol prefixes, the physics-based transfer model
 outperformed direct RBF and Kriging surrogates in all 200 paired comparisons.
-The training-only-tuned baseline mean errors, \(6.256\times10^{-2}\) and
-\(7.585\times10^{-2}\), were approximately 293 and 355 times the
-Sobol--POD mean error. This comparison isolates the number of full-order
+The training-only-tuned baseline mean errors, \(6.293\times10^{-2}\) and
+\(7.258\times10^{-2}\), were approximately 294 and 339 times the
+Sobol--Ritz mean error. This comparison isolates the number of full-order
 training materials while recognizing that the transfer construction retains
 six microscopic fields per material and the data-only surrogates retain only
 the effective tensor.
 
 Across G00--G09, median FOM material times ranged from
-\(0.138\) to \(7.442~\si{\second}\), whereas synchronized CuPy/CUDA batches
-required 2.33--7.83~\si{\micro\second} per material after amortization. The
-corresponding throughput speed-ups were \(2.59\times10^4\) to
-\(1.27\times10^6\), and the measured compilation costs were recovered after
-15--37 material queries.
+\(0.127\) to \(7.019~\si{\second}\), whereas synchronized CuPy/CUDA batches
+required 2.42--8.28~\si{\micro\second} per material after amortization. The
+corresponding throughput speed-ups were \(2.33\times10^4\) to
+\(1.14\times10^6\), and the measured compilation costs were recovered after
+8--27 material queries.
 
 The resolution study further showed that voxel refinement is most important
 for the dense long-fiber geometry: its tensor error relative to the
@@ -2158,7 +2237,7 @@ which is equivalent to the Loewner ordering
 \preceq
 \Hr.
 \]
-This proves Eq.~\eqref{eq:nested_ritz_ordering}. In the present full-rank
+This proves Eq.~\eqref{eq:nested_ritz_ordering}. In the present full-span
 construction, the trial spaces are precisely
 \(\operatorname{range}(S_\ell)\). Appending a new response block preserves
 every previous column, so
@@ -2465,23 +2544,24 @@ frozen. Their storage therefore scales as
 \begin{equation}
 \mathcal O(N_{\mathrm{vox}}p).
 \end{equation}
-Incremental Gram and affine Ritz contractions over the complete Sobol prefix
+Incremental exact affine Ritz contractions over the complete Sobol prefix
 accumulate to
 \begin{equation}
-\mathcal O\!\left((Q+1)N_{\mathrm{vox}}p^2\right)
+\mathcal O\!\left(QN_{\mathrm{vox}}p^2\right)
 \end{equation}
 work, with retained small-block storage
-\(\mathcal O((Q+1)p^2)\) in addition to the snapshots. Repeated eigendecomposition
-of the Gram matrix and the raw-to-Ritz transformations in
-Eq.~\eqref{eq:raw_ritz_transform} involve only the snapshot coordinates. A
-conservative bound for the dense algebra accumulated over adaptive enrichment
-is
+\(\mathcal O(Qp^2)\) in addition to the snapshots. The constitutive
+factorization in Eq.~\eqref{eq:constitutive_factor_ritz} changes constants
+and data movement but not this leading order. After adaptive stopping, the
+reference-energy Cholesky factorization and all transformations in
+Eq.~\eqref{eq:raw_ritz_transform} are performed once, with the conservative
+dense-algebra bound
 \begin{equation}
-\mathcal O\!\left((Q+1)
-\sum_{\ell=\ell_{\min}}^{N_s}p_\ell^3\right).
+\mathcal O\!\left((Q+1)p^3\right).
 \end{equation}
 Accordingly, the only cubic offline dependence is on the small raw snapshot
-dimension \(p_\ell\), not on the voxel count.
+dimension \(p\), not on the voxel count. No eigendecomposition or dense
+coordinate transformation is repeated during enrichment.
 
 For one reduced material query, retaining the loading dimension explicitly,
 \begin{align}
@@ -2532,11 +2612,11 @@ Monitor-reference FOM solves
 Raw snapshot storage
 & ---
 & \(\mathcal O(N_{\mathrm{vox}}p)\) \\
-Incremental Gram/Ritz contractions
-& \(\mathcal O((Q+1)N_{\mathrm{vox}}p^2)\)
-& \(\mathcal O(N_{\mathrm{vox}}p+(Q+1)p^2)\) \\
-Rank reveal and Ritz transforms
-& \(\mathcal O((Q+1)\sum_\ell p_\ell^3)\)
+Incremental factorized Ritz contractions
+& \(\mathcal O(QN_{\mathrm{vox}}p^2)\)
+& \(\mathcal O(N_{\mathrm{vox}}p+Qp^2)\) \\
+Reference-energy QR freeze
+& \(\mathcal O((Q+1)p^3)\)
 & \(\mathcal O((Q+1)p^2)\) \\
 Adaptive monitor evaluations
 & \(\mathcal O\!\left(N_M\sum_\ell
@@ -2562,21 +2642,22 @@ Batch of \(c\) online materials
 
 The implementation bounds temporary memory without changing the resolved
 snapshot span. Raw snapshot fields are stored in a preallocated contiguous
-array at the configured storage precision and, when applicable, are ordered
-by phase and local orientation. Affine Ritz products are streamed in
-phase-supported coefficient blocks on the GPU, while the Gram products are
-formed incrementally on the CPU; the resulting small blocks are accumulated
-at the configured reduced-algebra precision.
-Only the Gram eigendecomposition and the transformations in
-Eq.~\eqref{eq:raw_ritz_transform} are repeated after each enrichment; no
-global POD projection pass is required. The coefficient-block size is chosen
-from the available memory, and the online batch size is reduced as necessary
-to respect the configured workspace cap.
+array at the configured storage precision and are ordered by phase and local
+orientation. Each phase-supported voxel chunk uses the exact signed spectral
+factors in Eq.~\eqref{eq:constitutive_factor_ritz}. For fiber chunks, the
+orientation-dependent factors are gathered once per voxel and reused across
+the five fiber coefficients. Old and new snapshot columns are likewise
+uploaded once per chunk. The resulting small blocks remain resident and are
+accumulated in \texttt{float64} on the GPU.
 
-The contraction precision and machine-zero guard are numerical configuration
-parameters. The guard is not an approximation tolerance: it only prevents
-division by arithmetic zero in Eq.~\eqref{eq:fullrank_pod}. No direction is
-discarded in the reported campaign, for which \(r=p\) at every accepted
+Pinned double buffering and separate transfer and compute streams overlap
+CPU packing and host-to-device transfer of chunk \(c+1\) with the factorized
+contractions of chunk \(c\). The pinned host allocation is capped at
+1~GiB, the GPU chunk size is chosen from the affine workspace limit, and one
+material is solved and appended at a time. Once the stopping prefix is known,
+Eq.~\eqref{eq:reference_energy_qr} and the triangular transforms are evaluated
+once in \texttt{float64}; they require no additional voxel pass. No direction
+is discarded in the reported campaign, for which \(r=p\) at every accepted
 prefix. The nominal workflow does not probe, regularize, or rebuild a frozen
 ROM. A failed reduced evaluation is recorded as a numerical failure.
 The concrete precisions, tolerances, and memory limits used in the numerical
@@ -2653,10 +2734,11 @@ Monitor profile & GPU Fourier--Galerkin/CG, \texttt{float32}, relative tolerance
 Timing profile & GPU Fourier--Galerkin/CG, \texttt{float32}, relative tolerance \(10^{-5}\) \\
 Validation profile & Fourier--Galerkin/CG, \texttt{float64}, relative tolerance \(10^{-6}\), initialized from the timing field; reference only, with no ROM modification \\
 Training solve order & Sobol prefix; matching load from the preceding material used as CG warm start \\
-Snapshot/Ritz path & Six \texttt{float32} fields per material; affine voxel actions in GPU \texttt{float32}, Gram products in CPU \texttt{float64}, and small transformations in \texttt{float64}; complete snapshot span retained with \(\tau_{\mathrm{mach}}=10^{-15}\) \\
-Reduced algebra & Reduced accumulation and dense online solves in \texttt{float64} \\
+Snapshot/Ritz path & Six \texttt{float32} fields per material, appended one material at a time; exact signed-factor GPU contractions in \texttt{float32}, GPU reduced accumulation in \texttt{float64}, and one reference-energy Cholesky--QR freeze in \texttt{float64}; no Euclidean snapshot Gram, eigendecomposition, or rank truncation \\
+Streaming path & Phase/orientation ordering; factors gathered once per fiber voxel chunk; pinned double buffering with separate CUDA transfer and compute streams; 1 GiB pinned-host cap \\
+Reduced algebra & Reference-energy transformations and dense online solves in \texttt{float64} \\
 Failure policy & Record any reduced numerical failure; no probe, regularization, or automatic rebuild \\
-Workspace policy & 8 GiB POD and affine caps, 4 GiB online cap, 0.8 memory-safety fraction \\
+Workspace policy & 8 GiB snapshot and affine caps, 4 GiB online cap, 0.8 memory-safety fraction \\
 Hardware & NVIDIA GeForce RTX 5070 Ti; CuPy 13.6.0 with CUDA runtime 13.0; 16 OpenBLAS threads for the campaign \\
 Online timing & One-shot CuPy/CUDA batches of 10,000 queries, seed 20260823, with ten synchronized repetitions; affine coefficients and result return included \\
 Surrogate baselines & Every prefix from 2 to \(N_s^\star\); eight RBF kernels, 16 shape scales, five smoothing levels, and admissible polynomial degrees selected by training-only leave-one-out error; ten Kriging covariance families selected by optimized training log marginal likelihood using two selection restarts and refitted with ten restarts; seed 20260830; no held-out tuning or additional FOM solves \\
@@ -2679,8 +2761,8 @@ are reported in Table~\ref{tab:campaign_selected_ranks}.
 \toprule
 Geometry & G00 & G01 & G02 & G03 & G04 & G05 & G06 & G07 & G08 & G09 \\
 \midrule
-\(N_s\) & 11 & 6 & 15 & 11 & 12 & 11 & 11 & 11 & 6 & 16 \\
-\(r\)   & 66 & 36 & 90 & 66 & 72 & 66 & 66 & 66 & 36 & 96 \\
+\(N_s\) & 11 & 6 & 15 & 11 & 12 & 11 & 11 & 12 & 6 & 16 \\
+\(r\)   & 66 & 36 & 90 & 66 & 72 & 66 & 66 & 72 & 36 & 96 \\
 \bottomrule
 \end{tabular}
 \end{minipage}
@@ -2696,7 +2778,8 @@ table. No value is clipped or used to modify a frozen ROM.
 \centering
 \scriptsize
 \captionof{table}{Minimum held-out spectral diagnostics for the nominal
-mixed-precision full-rank path. Eigenvalues are in
+mixed-precision full-span path. The eigenvalues of \(K_r\) are dimensionless
+in reference-energy coordinates; those of \(\Cr\) are in
 \si{\giga\pascal}.}
 \label{tab:campaign_spectral_diagnostics}
 \begin{tabular}{@{}lrrrr@{}}
@@ -2705,16 +2788,16 @@ Geometry & \(\min\eta_{\mathrm{Schur}}\) &
 \(\min\lambda_{\min}(K_r)\) & \(\min\rho_K\) &
 \(\min\lambda_{\min}(\Cr)\) \\
 \midrule
-G00 & \num{-8.418e-7} & 1.341 & \num{2.200e-2} & 1.656 \\
-G01 & \num{2.587e-9}  & 1.538 & \num{4.925e-2} & 1.048 \\
-G02 & \num{-1.368e-6} & 1.284 & \num{2.392e-2} & 2.335 \\
-G03 & \num{-2.317e-8} & 1.175 & \num{1.550e-2} & 1.323 \\
-G04 & \num{-2.380e-6} & 1.232 & \num{2.646e-2} & 1.773 \\
-G05 & \num{-1.529e-6} & 1.295 & \num{2.175e-2} & 1.202 \\
-G06 & \num{-1.036e-6} & 1.320 & \num{2.323e-2} & 1.137 \\
-G07 & \num{-9.332e-7} & 1.344 & \num{2.410e-2} & 1.342 \\
-G08 & \num{-4.501e-9} & 1.490 & \num{3.878e-2} & 0.931 \\
-G09 & \num{-4.119e-6} & 1.172 & \num{2.061e-2} & 2.659 \\
+G00 & \num{-7.497e-7} & 0.326 & \num{2.431e-1} & 1.656 \\
+G01 & \num{4.469e-9}  & 0.332 & \num{2.663e-1} & 1.048 \\
+G02 & \num{-1.163e-6} & 0.327 & \num{2.501e-1} & 2.335 \\
+G03 & \num{-3.024e-8} & 0.325 & \num{2.373e-1} & 1.323 \\
+G04 & \num{-2.195e-6} & 0.327 & \num{2.494e-1} & 1.773 \\
+G05 & \num{-1.551e-6} & 0.325 & \num{2.453e-1} & 1.202 \\
+G06 & \num{-9.476e-7} & 0.326 & \num{2.447e-1} & 1.137 \\
+G07 & \num{-7.236e-7} & 0.326 & \num{2.443e-1} & 1.342 \\
+G08 & \num{1.987e-8}  & 0.329 & \num{2.564e-1} & 0.931 \\
+G09 & \num{-4.024e-6} & 0.327 & \num{2.478e-1} & 2.659 \\
 \bottomrule
 \end{tabular}
 \end{minipage}
@@ -2722,12 +2805,12 @@ G09 & \num{-4.119e-6} & 1.172 & \num{2.061e-2} & 2.659 \\
 
 The complete SHA-256 hashes of the ten frozen reduced archives are stored in
 the machine-readable campaign summary. Their leading 12 hexadecimal digits,
-in G00--G09 order, are \texttt{c53eb4351bfd},
-\texttt{91afacafe996}, \texttt{74bfb58173ca},
-\texttt{fcb82f858205}, \texttt{71cd2b10b054},
-\texttt{bd91459634c4}, \texttt{19c889b4232c},
-\texttt{51f93b55513b}, \texttt{c7eb0cbf216e}, and
-\texttt{5d23d69a6366}. Each was recorded before generation of the final
+in G00--G09 order, are \texttt{34bba0fda120},
+\texttt{7b041717b342}, \texttt{8ea56ecc77a1},
+\texttt{e20cc62c5fe7}, \texttt{10b3e91bf80b},
+\texttt{05fef6ca0e2c}, \texttt{3e0f82dd07b6},
+\texttt{24b95a52696a}, \texttt{fedc62bbd8c6}, and
+\texttt{175ca36bd904}. Each was recorded before generation of the final
 validation pool.
 
 \section*{Declaration of competing interest}

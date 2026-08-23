@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 3: run the fixed Sobol + full-rank POD campaign."""
+"""Step 3: run the fixed Sobol + full-span Ritz campaign."""
 
 from __future__ import annotations
 
@@ -278,6 +278,36 @@ def command_for_geometry(
         bool(pipe.get("energy_pod_baseline", True)),
         "--energy-pod-baseline",
         "--no-energy-pod-baseline",
+    )
+    append_bool(
+        command,
+        bool(pipe.get("overlap_cpu_gram_gpu", False)),
+        "--overlap-cpu-gram-gpu",
+        "--no-overlap-cpu-gram-gpu",
+    )
+    append_bool(
+        command,
+        bool(pipe.get("reference_energy_qr", True)),
+        "--reference-energy-qr",
+        "--no-reference-energy-qr",
+    )
+    append_bool(
+        command,
+        bool(pipe.get("factorized_ritz", True)),
+        "--factorized-ritz",
+        "--no-factorized-ritz",
+    )
+    append_bool(
+        command,
+        bool(pipe.get("async_ritz", True)),
+        "--async-ritz",
+        "--no-async-ritz",
+    )
+    append_bool(
+        command,
+        bool(pipe.get("gathered_factor_ritz", True)),
+        "--gathered-factor-ritz",
+        "--no-gathered-factor-ritz",
     )
     command.extend(
         [
@@ -558,7 +588,7 @@ def write_campaign_plot(curve: pd.DataFrame, path: Path, target_error: float) ->
                 zorder=3,
                 label="first accepted pass" if marker_index == 0 else None,
             )
-        ax.set_xlabel("Sobol training materials used for POD")
+        ax.set_xlabel("Sobol training materials used for Ritz compilation")
         ax.set_ylabel("Maximum relative Frobenius error on FFT monitor set (%)")
         ax.set_title("One-pass stopping at the first tolerance crossing")
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}%"))
