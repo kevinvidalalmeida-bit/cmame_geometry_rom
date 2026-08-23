@@ -298,6 +298,8 @@ def append_sobol_batch(
     ritz_gram_rank_rtol: float = 1.0e-6,
     overlap_cpu_gram_gpu: bool = False,
     preserve_raw_coordinates: bool = False,
+    experimental_factorized_ritz: bool = False,
+    experimental_async_ritz: bool = False,
 ) -> tuple[
     list[dict[str, Any]], dict[str, np.ndarray] | None, np.ndarray | None
 ]:
@@ -392,6 +394,11 @@ def append_sobol_batch(
     gpu_affine_chunks = 0
     cpu_affine_chunks = 0
     gpu_affine_fallback = ""
+    factorized_upload_wall_s = 0.0
+    factorized_host_prepare_wall_s = 0.0
+    factorized_kernel_enqueue_wall_s = 0.0
+    async_pinned_double_buffer = False
+    async_pinned_bytes = 0
     contraction_modes: set[str] = set()
     if compile_operators and len(new_fields):
         operators, assembly = common._update_reduced_operators(
@@ -409,6 +416,8 @@ def append_sobol_batch(
             gram_backend=str(ritz_gram_backend),
             overlap_cpu_gram_gpu=bool(overlap_cpu_gram_gpu),
             preserve_raw_coordinates=bool(preserve_raw_coordinates),
+            experimental_factorized_ritz=bool(experimental_factorized_ritz),
+            experimental_async_ritz=bool(experimental_async_ritz),
         )
         for name in assembly_totals:
             source_name = (
@@ -443,6 +452,19 @@ def append_sobol_batch(
         gpu_affine_chunks = int(assembly.get("gpu_affine_chunks", 0))
         cpu_affine_chunks = int(assembly.get("cpu_affine_chunks", 0))
         gpu_affine_fallback = str(assembly.get("gpu_affine_fallback", ""))
+        factorized_upload_wall_s = float(
+            assembly.get("factorized_upload_wall_s", 0.0)
+        )
+        factorized_host_prepare_wall_s = float(
+            assembly.get("factorized_host_prepare_wall_s", 0.0)
+        )
+        factorized_kernel_enqueue_wall_s = float(
+            assembly.get("factorized_kernel_enqueue_wall_s", 0.0)
+        )
+        async_pinned_double_buffer = bool(
+            assembly.get("async_pinned_double_buffer", False)
+        )
+        async_pinned_bytes = int(assembly.get("async_pinned_bytes", 0))
         contraction_modes.add(str(assembly.get("contraction_mode", "unknown")))
         gram_product_wall_s = float(assembly.get("gram_product_wall_s", 0.0))
         gram_overlap_wait_wall_s = float(
@@ -528,6 +550,14 @@ def append_sobol_batch(
                 "gpu_affine_chunks": gpu_affine_chunks,
                 "cpu_affine_chunks": cpu_affine_chunks,
                 "gpu_affine_fallback": gpu_affine_fallback,
+                "factorized_upload_wall_s": factorized_upload_wall_s
+                / material_count,
+                "factorized_host_prepare_wall_s": factorized_host_prepare_wall_s
+                / material_count,
+                "factorized_kernel_enqueue_wall_s": factorized_kernel_enqueue_wall_s
+                / material_count,
+                "async_pinned_double_buffer": async_pinned_double_buffer,
+                "async_pinned_bytes": async_pinned_bytes,
                 "affine_q_block_size": int(affine_q_block_size),
                 "pod_batch_materials": material_count,
             }
@@ -1456,6 +1486,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--experimental-factorized-ritz",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use exact constitutive-rank Ritz contractions with GPU-resident "
+            "reduced accumulation. Requires --experimental-energy-qr."
+        ),
+    )
+    parser.add_argument(
+        "--experimental-async-ritz",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Overlap pinned host-to-device snapshot transfers with the exact "
+            "factorized GPU contractions using two CUDA buffers."
+        ),
+    )
+    parser.add_argument(
         "--pod-batch-max-gib",
         type=float,
         default=float(pipeline.get("pod_batch_max_gib", 8.0)),
@@ -1580,6 +1628,18 @@ def main() -> int:
                     "Energy-POD and tau sensitivity require the snapshot Gram; "
                     "disable them for experimental_energy_qr."
                 )
+        if bool(args.experimental_factorized_ritz) and not bool(
+            args.experimental_energy_qr
+        ):
+            raise ValueError(
+                "experimental_factorized_ritz requires experimental_energy_qr."
+            )
+        if bool(args.experimental_async_ritz) and not bool(
+            args.experimental_factorized_ritz
+        ):
+            raise ValueError(
+                "experimental_async_ritz requires experimental_factorized_ritz."
+            )
         if int(args.candidate_seed) == int(args.final_validation_seed):
             raise ValueError(
                 "candidate_seed and final_validation_seed must be distinct."
@@ -1789,6 +1849,10 @@ def main() -> int:
                     args.experimental_qr_block_max_gib
                 ),
                 "experimental_energy_qr": bool(args.experimental_energy_qr),
+                "experimental_factorized_ritz": bool(
+                    args.experimental_factorized_ritz
+                ),
+                "experimental_async_ritz": bool(args.experimental_async_ritz),
                 "experimental_energy_qr_reference_policy": "candidate_affine_mean",
                 "experimental_energy_qr_reference_coefficients": (
                     experimental_energy_qr_reference
@@ -1819,7 +1883,15 @@ def main() -> int:
                 "basis_voxel_order": "matrix_then_fiber_by_orientation",
                 "basis_component_layout": "mandel_component_then_voxel",
                 "affine_orientation_kernel": "grouped_blocks_with_voxelwise_fallback",
-                "ritz_contraction_kernel": "exact_phase_supported_component_batched",
+                "ritz_contraction_kernel": (
+                    "experimental_exact_factorized_gpu_async"
+                    if bool(args.experimental_async_ritz)
+                    else (
+                        "experimental_exact_factorized_gpu"
+                        if bool(args.experimental_factorized_ritz)
+                        else "exact_phase_supported_component_batched"
+                    )
+                ),
                 "blas_thread_policy": str(args.blas_threads),
                 "blas_threads": blas_threads,
                 "generator_core_policy": str(args.generator_cores),
@@ -1934,6 +2006,10 @@ def main() -> int:
                 ritz_gram_rank_rtol=float(args.ritz_gram_rank_rtol),
                 overlap_cpu_gram_gpu=bool(args.overlap_cpu_gram_gpu),
                 preserve_raw_coordinates=bool(args.experimental_energy_qr),
+                experimental_factorized_ritz=bool(
+                    args.experimental_factorized_ritz
+                ),
+                experimental_async_ritz=bool(args.experimental_async_ritz),
             )
             snapshot_rows.extend(records)
             for record in records:
@@ -2312,6 +2388,10 @@ def main() -> int:
                 "ritz_gram_rank_rtol": float(args.ritz_gram_rank_rtol),
                 "overlap_cpu_gram_gpu": bool(args.overlap_cpu_gram_gpu),
                 "experimental_energy_qr": bool(args.experimental_energy_qr),
+                "experimental_factorized_ritz": bool(
+                    args.experimental_factorized_ritz
+                ),
+                "experimental_async_ritz": bool(args.experimental_async_ritz),
                 "experimental_energy_qr_metadata": (
                     experimental_energy_qr_metadata
                 ),
@@ -2846,6 +2926,10 @@ def main() -> int:
             "ritz_gram_rank_rtol": float(args.ritz_gram_rank_rtol),
             "overlap_cpu_gram_gpu": bool(args.overlap_cpu_gram_gpu),
             "experimental_energy_qr_enabled": bool(args.experimental_energy_qr),
+            "experimental_factorized_ritz_enabled": bool(
+                args.experimental_factorized_ritz
+            ),
+            "experimental_async_ritz_enabled": bool(args.experimental_async_ritz),
             "experimental_energy_qr_reference_policy": "candidate_affine_mean",
             "experimental_energy_qr_reference_coefficients": (
                 experimental_energy_qr_reference

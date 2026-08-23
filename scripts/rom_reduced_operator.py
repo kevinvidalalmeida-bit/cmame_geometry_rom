@@ -255,6 +255,72 @@ def _contiguous_selector(indices: np.ndarray) -> slice | np.ndarray:
     return indices
 
 
+def _exact_spectral_factorization(
+    bases_by_group: np.ndarray,
+) -> dict[str, Any]:
+    """Pack exact symmetric basis factorizations by constitutive coefficient.
+
+    Each local affine basis is represented as ``U diag(weights) U.T``. The
+    zero eigendirections are arithmetic zeros of the 6x6 constitutive basis,
+    not a reduced-order truncation. Rotations preserve the nonzero spectra,
+    which lets all orientation groups share one packed coefficient layout.
+    """
+    bases = np.asarray(bases_by_group, dtype=np.float64)
+    if bases.ndim != 4 or bases.shape[-2:] != (6, 6):
+        raise ValueError("factorized affine bases must have shape (g, q, 6, 6)")
+    group_count, q_count = bases.shape[:2]
+    if group_count < 1:
+        return {
+            "factors": np.empty((0, 6, 0), dtype=np.float64),
+            "weights": np.empty(0, dtype=np.float64),
+            "coefficient_slices": tuple(),
+            "ranks": tuple(),
+        }
+
+    factors_by_q: list[np.ndarray] = []
+    weights_by_q: list[np.ndarray] = []
+    ranks: list[int] = []
+    for q in range(q_count):
+        group_factors: list[np.ndarray] = []
+        reference_weights: np.ndarray | None = None
+        for group in range(group_count):
+            symmetric = 0.5 * (bases[group, q] + bases[group, q].T)
+            eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
+            scale = max(float(np.max(np.abs(eigenvalues))), 1.0)
+            keep = np.abs(eigenvalues) > 256.0 * np.finfo(np.float64).eps * scale
+            selected_weights = np.asarray(eigenvalues[keep], dtype=np.float64)
+            selected_factors = np.asarray(eigenvectors[:, keep], dtype=np.float64)
+            if reference_weights is None:
+                reference_weights = selected_weights
+            elif not np.allclose(
+                selected_weights,
+                reference_weights,
+                rtol=2.0e-12,
+                atol=2.0e-12,
+            ):
+                raise RuntimeError("rotated affine basis changed its exact spectrum")
+            group_factors.append(selected_factors)
+        assert reference_weights is not None
+        factors_by_q.append(np.stack(group_factors, axis=0))
+        weights_by_q.append(reference_weights)
+        ranks.append(int(reference_weights.size))
+
+    offsets = np.concatenate(([0], np.cumsum(ranks, dtype=np.int64)))
+    packed = np.empty((group_count, 6, int(offsets[-1])), dtype=np.float64)
+    coefficient_slices: list[tuple[int, int]] = []
+    for q, factors in enumerate(factors_by_q):
+        start = int(offsets[q])
+        stop = int(offsets[q + 1])
+        packed[:, :, start:stop] = factors
+        coefficient_slices.append((start, stop))
+    return {
+        "factors": packed,
+        "weights": np.concatenate(weights_by_q),
+        "coefficient_slices": tuple(coefficient_slices),
+        "ranks": tuple(ranks),
+    }
+
+
 def _affine_tensor_batch_factory(
     phase: np.ndarray,
     ori: np.ndarray,
@@ -310,6 +376,21 @@ def _affine_tensor_batch_factory(
     fiber_bases_by_dtype = {
         np.dtype(np.float32): np.asarray(fiber_bases_by_group, dtype=np.float32),
         np.dtype(np.float64): np.asarray(fiber_bases_by_group, dtype=np.float64),
+    }
+    exact_factorizations = {
+        "matrix": _exact_spectral_factorization(
+            np.asarray(matrix_bases, dtype=np.float64)[None, ...]
+        ),
+        "fiber": (
+            _exact_spectral_factorization(fiber_bases_by_group)
+            if len(fiber_bases_by_group)
+            else {
+                "factors": np.empty((0, 6, 0), dtype=np.float64),
+                "weights": np.empty(0, dtype=np.float64),
+                "coefficient_slices": tuple(),
+                "ranks": tuple(),
+            }
+        ),
     }
     stiffness_matrix_fast_path = tuple(coefficient_names) == tuple(COEFF_NAMES)
     fiber_group_runs: tuple[tuple[int, int, int], ...] = ()
@@ -706,6 +787,8 @@ def _affine_tensor_batch_factory(
     apply.unique_fiber_orientations = int(len(fiber_bases_by_group))
     apply.orientation_kernel = "grouped" if fiber_group_runs else "voxelwise"
     apply.coefficient_names = tuple(coefficient_names)
+    apply.exact_factorizations = exact_factorizations
+    apply.fiber_group_ids = fiber_group_ids
     apply.apply_indices = apply_indices
     apply.apply_all = apply_all
     apply.apply_supported_chunk = apply_supported_chunk
@@ -1103,6 +1186,42 @@ def _basis_chunk(
     return out
 
 
+def _basis_chunk_into(
+    fields: np.ndarray | list[np.ndarray],
+    out: np.ndarray,
+    *,
+    nvox: int,
+    start: int,
+    end: int,
+) -> None:
+    """Fill a preallocated component-major chunk, zero-padding its tail."""
+    if out.ndim != 3 or out.shape[1] != 6:
+        raise ValueError("preallocated basis chunk must have shape (r, 6, n)")
+    count = int(end) - int(start)
+    if count < 0 or start < 0 or end > nvox or count > out.shape[2]:
+        raise ValueError("invalid preallocated basis chunk bounds")
+    rank = _basis_rank_nvox(fields, nvox)
+    if rank != out.shape[0]:
+        raise ValueError("preallocated basis chunk has the wrong rank")
+    if isinstance(fields, np.ndarray):
+        values = np.asarray(fields)
+        if values.ndim == 3 and values.shape[1:] == (6, nvox):
+            np.copyto(out[:, :, :count], values[:, :, start:end])
+        elif values.ndim == 3 and values.shape[1:] == (nvox, 6):
+            np.copyto(out[:, :, :count], np.moveaxis(values[:, start:end], -1, 1))
+        else:
+            np.copyto(
+                out[:, :, :count], values.reshape(rank, 6, nvox)[:, :, start:end]
+            )
+    else:
+        for index, field in enumerate(fields):
+            out[index, :, :count] = _field_component_voxel_view(field, nvox)[
+                :, start:end
+            ]
+    if count < out.shape[2]:
+        out[:, :, count:].fill(0)
+
+
 def _reduced_field_values(
     fields: np.ndarray | list[np.ndarray],
     *,
@@ -1323,6 +1442,461 @@ def _contract_gpu_batch(left_gpu: Any, right_gpu: Any) -> np.ndarray:
         raise ValueError("resident contraction operands have incompatible dimensions")
     products = cp.einsum("am,qbm->qab", left, right_flat, optimize=True)
     return np.asarray(cp.asnumpy(products), dtype=np.float64)
+
+
+def _experimental_factorized_chunk_gpu(
+    *,
+    affine: Any,
+    support: str,
+    support_offset: int,
+    left_gpu: Any | None,
+    right_gpu: Any,
+) -> tuple[Any | None, Any, Any, int]:
+    """Return exact affine Ritz contributions using constitutive-rank factors."""
+    import cupy as cp
+
+    factorizations = getattr(affine, "exact_factorizations", None)
+    if not isinstance(factorizations, dict) or support not in factorizations:
+        raise NotImplementedError("affine map does not expose exact factorizations")
+    factorization = factorizations[support]
+    right_values = cp.asarray(right_gpu)
+    if right_values.ndim == 2 and right_values.shape[1] % 6 == 0:
+        right = right_values.reshape(
+            right_values.shape[0], 6, right_values.shape[1] // 6
+        )
+    elif right_values.ndim == 3 and right_values.shape[1] == 6:
+        right = right_values
+    else:
+        raise ValueError("factorized Ritz expects component-major fields")
+    left = None
+    if left_gpu is not None:
+        left_values = cp.asarray(left_gpu)
+        if left_values.ndim == 2 and left_values.shape[1] == 6 * right.shape[2]:
+            left = left_values.reshape(left_values.shape[0], 6, right.shape[2])
+        elif (
+            left_values.ndim == 3
+            and left_values.shape[1] == 6
+            and left_values.shape[2] == right.shape[2]
+        ):
+            left = left_values
+        else:
+            raise ValueError("factorized Ritz left/right chunks are incompatible")
+
+    factors_cpu = np.asarray(factorization["factors"], dtype=np.float64)
+    weights_cpu = np.asarray(factorization["weights"], dtype=np.float64)
+    coefficient_slices = tuple(factorization["coefficient_slices"])
+    if not coefficient_slices:
+        raise ValueError(f"support {support!r} has no factorized coefficients")
+    dtype_name = "float32" if right.dtype == cp.float32 else "float64"
+    cache = factorization.setdefault("_gpu_cache", {})
+    if dtype_name not in cache:
+        compute_dtype = cp.float32 if dtype_name == "float32" else cp.float64
+        cache[dtype_name] = (
+            cp.asarray(factors_cpu, dtype=compute_dtype),
+            cp.asarray(weights_cpu, dtype=compute_dtype),
+            cp.asarray(factors_cpu, dtype=cp.float64),
+            cp.asarray(weights_cpu, dtype=cp.float64),
+        )
+    factors, weights, factors64, weights64 = cache[dtype_name]
+
+    n_chunk = int(right.shape[2])
+    if support == "matrix":
+        group_ids = np.zeros(n_chunk, dtype=np.int32)
+    elif support == "fiber":
+        all_group_ids = np.asarray(getattr(affine, "fiber_group_ids"), dtype=np.int32)
+        offset = int(support_offset)
+        group_ids = all_group_ids[offset : offset + n_chunk]
+        if len(group_ids) != n_chunk:
+            raise ValueError("factorized fiber chunk exceeds orientation groups")
+    else:
+        raise ValueError("support must be 'matrix' or 'fiber'")
+
+    total_factor_rank = int(weights.shape[0])
+    right_features = cp.empty(
+        (right.shape[0], total_factor_rank, n_chunk), dtype=right.dtype
+    )
+    left_features = (
+        cp.empty((left.shape[0], total_factor_rank, n_chunk), dtype=left.dtype)
+        if left is not None
+        else None
+    )
+    starts = np.concatenate(
+        (np.array([0], dtype=np.int64), np.flatnonzero(np.diff(group_ids)) + 1)
+    )
+    ends = np.concatenate((starts[1:], np.array([n_chunk], dtype=np.int64)))
+    sums = cp.zeros(
+        (len(coefficient_slices), right.shape[0], 6), dtype=cp.float64
+    )
+    for start_value, end_value in zip(starts, ends, strict=True):
+        start = int(start_value)
+        end = int(end_value)
+        group = int(group_ids[start])
+        group_factors = factors[group]
+        right_features[:, :, start:end] = cp.einsum(
+            "ak,ran->rkn",
+            group_factors,
+            right[:, :, start:end],
+            optimize=True,
+        )
+        if left_features is not None and left is not None:
+            left_features[:, :, start:end] = cp.einsum(
+                "ak,ran->rkn",
+                group_factors,
+                left[:, :, start:end],
+                optimize=True,
+            )
+        for local_q, (factor_start, factor_stop) in enumerate(coefficient_slices):
+            feature_sum = cp.sum(
+                right_features[:, factor_start:factor_stop, start:end],
+                axis=2,
+                dtype=cp.float64,
+            )
+            sums[local_q] += cp.einsum(
+                "ak,k,rk->ra",
+                factors64[group, :, factor_start:factor_stop],
+                weights64[factor_start:factor_stop],
+                feature_sum,
+                optimize=True,
+            )
+
+    diagonal = cp.empty(
+        (len(coefficient_slices), right.shape[0], right.shape[0]),
+        dtype=cp.float64,
+    )
+    cross = (
+        cp.empty(
+            (len(coefficient_slices), left.shape[0], right.shape[0]),
+            dtype=cp.float64,
+        )
+        if left is not None
+        else None
+    )
+    weighted_peak_bytes = 0
+    for local_q, (factor_start, factor_stop) in enumerate(coefficient_slices):
+        right_q = right_features[:, factor_start:factor_stop]
+        weighted = right_q * weights[factor_start:factor_stop][None, :, None]
+        weighted_peak_bytes = max(weighted_peak_bytes, int(weighted.nbytes))
+        weighted_flat = weighted.reshape(weighted.shape[0], -1)
+        diagonal[local_q] = (
+            right_q.reshape(right_q.shape[0], -1) @ weighted_flat.T
+        ).astype(cp.float64)
+        if cross is not None and left_features is not None:
+            left_q = left_features[:, factor_start:factor_stop]
+            cross[local_q] = (
+                left_q.reshape(left_q.shape[0], -1) @ weighted_flat.T
+            ).astype(cp.float64)
+        del weighted, weighted_flat
+
+    workspace_bytes = int(right_features.nbytes) + weighted_peak_bytes
+    if left_features is not None:
+        workspace_bytes += int(left_features.nbytes)
+    return cross, diagonal, sums, workspace_bytes
+
+
+def _experimental_factorized_raw_gpu(
+    *,
+    affine: Any,
+    old_basis: np.ndarray | list[np.ndarray] | None,
+    new_basis: np.ndarray | list[np.ndarray],
+    nvox: int,
+    compute_dtype: str | np.dtype,
+    async_transfers: bool = False,
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Stream exact factorized contributions with GPU-resident accumulators."""
+    import cupy as cp
+
+    requested_dtype = _ritz_compute_dtype(compute_dtype)
+    old_rank = 0 if old_basis is None else _basis_rank_nvox(old_basis, nvox)
+    new_rank = _basis_rank_nvox(new_basis, nvox)
+    coefficient_names = tuple(getattr(affine, "coefficient_names", COEFF_NAMES))
+    q_count = len(coefficient_names)
+    support_blocks = getattr(affine, "support_blocks", None)
+    if support_blocks is None or getattr(affine, "exact_factorizations", None) is None:
+        raise NotImplementedError("factorized Ritz requires ordered supported blocks")
+
+    first = new_basis[0] if isinstance(new_basis, list) else new_basis[0]
+    storage_dtype = _field_component_voxel_view(first, nvox).dtype
+    storage_itemsize = int(storage_dtype.itemsize)
+    free_bytes, _ = cp.cuda.runtime.memGetInfo()
+    live_rank = max(old_rank + new_rank, 1)
+    compute_itemsize = int(requested_dtype.itemsize)
+    # Snapshots plus packed constitutive features (11 fiber channels) and the
+    # largest temporary weighted coefficient block (six channels).
+    gpu_bytes_per_voxel = compute_itemsize * (
+        6 * live_rank + 11 * live_rank + 6 * max(new_rank, 1)
+    )
+    gpu_target = max(256 * 1024**2, int(0.22 * free_bytes))
+    gpu_limit = max(4096, int(gpu_target // max(gpu_bytes_per_voxel, 1)))
+    cpu_bytes_per_voxel = storage_itemsize * 6 * live_rank
+    cpu_limit = max(4096, int((1.0 * 1024**3) // max(cpu_bytes_per_voxel, 1)))
+    chunk_voxels = max(4096, min(int(nvox), 1_000_000, gpu_limit, cpu_limit))
+    if bool(async_transfers):
+        if storage_dtype != requested_dtype:
+            raise ValueError(
+                "experimental async Ritz requires matching storage and compute dtypes"
+            )
+        pinned_limit = max(
+            4096,
+            int((1.0 * 1024**3) // max(2 * cpu_bytes_per_voxel, 1)),
+        )
+        chunk_voxels = max(4096, min(chunk_voxels, pinned_limit))
+
+    cross_accumulator = (
+        cp.zeros((q_count, old_rank, new_rank), dtype=cp.float64)
+        if old_rank
+        else None
+    )
+    diagonal_accumulator = cp.zeros(
+        (q_count, new_rank, new_rank), dtype=cp.float64
+    )
+    b_accumulator = cp.zeros((q_count, new_rank, 6), dtype=cp.float64)
+    upload_wall_s = 0.0
+    kernel_enqueue_wall_s = 0.0
+    workspace_peak_bytes = 0
+    basis_gpu_uploads = 0
+    chunks = 0
+    pinned_bytes = 0
+    host_prepare_wall_s = 0.0
+    asynchronous_overlap = False
+    started = time.perf_counter()
+    tasks: list[tuple[str, slice, int, int, int]] = []
+    for support, support_indices, selector in support_blocks:
+        support_start = int(selector.start or 0)
+        support_stop = int(selector.stop or nvox)
+        q_indices = np.asarray(support_indices, dtype=np.intp)
+        q_slice = slice(int(q_indices[0]), int(q_indices[-1]) + 1)
+        for global_start in range(support_start, support_stop, chunk_voxels):
+            tasks.append(
+                (
+                    support,
+                    q_slice,
+                    support_start,
+                    global_start,
+                    min(global_start + chunk_voxels, support_stop),
+                )
+            )
+
+    if bool(async_transfers) and tasks:
+        cp_dtype = cp.float32 if requested_dtype == np.dtype(np.float32) else cp.float64
+        transfer_stream = cp.cuda.Stream(non_blocking=True)
+        compute_stream = cp.cuda.Stream(non_blocking=True)
+        cp.cuda.get_current_stream().synchronize()
+        slots: list[dict[str, Any]] = []
+        for _ in range(2):
+            new_memory = cp.cuda.alloc_pinned_memory(
+                new_rank * 6 * chunk_voxels * storage_itemsize
+            )
+            new_host = np.ndarray(
+                (new_rank, 6, chunk_voxels),
+                dtype=storage_dtype,
+                buffer=new_memory,
+            )
+            old_memory = None
+            old_host = None
+            old_gpu = None
+            if old_rank:
+                old_memory = cp.cuda.alloc_pinned_memory(
+                    old_rank * 6 * chunk_voxels * storage_itemsize
+                )
+                old_host = np.ndarray(
+                    (old_rank, 6, chunk_voxels),
+                    dtype=storage_dtype,
+                    buffer=old_memory,
+                )
+                old_gpu = cp.empty(
+                    (old_rank, 6, chunk_voxels), dtype=cp_dtype
+                )
+            slots.append(
+                {
+                    "new_memory": new_memory,
+                    "new_host": new_host,
+                    "new_gpu": cp.empty(
+                        (new_rank, 6, chunk_voxels), dtype=cp_dtype
+                    ),
+                    "old_memory": old_memory,
+                    "old_host": old_host,
+                    "old_gpu": old_gpu,
+                    "ready": cp.cuda.Event(disable_timing=True),
+                    "done": cp.cuda.Event(disable_timing=True),
+                }
+            )
+        pinned_bytes = int(
+            2 * (old_rank + new_rank) * 6 * chunk_voxels * storage_itemsize
+        )
+
+        def prepare_slot(slot: dict[str, Any], task: tuple[str, slice, int, int, int]) -> None:
+            nonlocal host_prepare_wall_s
+            _, _, _, start, end = task
+            prepare_started = time.perf_counter()
+            if old_basis is not None and slot["old_host"] is not None:
+                _basis_chunk_into(
+                    old_basis,
+                    slot["old_host"],
+                    nvox=nvox,
+                    start=start,
+                    end=end,
+                )
+            _basis_chunk_into(
+                new_basis,
+                slot["new_host"],
+                nvox=nvox,
+                start=start,
+                end=end,
+            )
+            host_prepare_wall_s += float(time.perf_counter() - prepare_started)
+
+        def enqueue_transfer(
+            slot: dict[str, Any], *, wait_for_compute: bool
+        ) -> None:
+            nonlocal upload_wall_s, basis_gpu_uploads
+            upload_started = time.perf_counter()
+            with transfer_stream:
+                if wait_for_compute:
+                    transfer_stream.wait_event(slot["done"])
+                if slot["old_gpu"] is not None:
+                    slot["old_gpu"].set(slot["old_host"], stream=transfer_stream)
+                slot["new_gpu"].set(slot["new_host"], stream=transfer_stream)
+                slot["ready"].record(transfer_stream)
+            upload_wall_s += float(time.perf_counter() - upload_started)
+            basis_gpu_uploads += 1 + int(slot["old_gpu"] is not None)
+
+        prepare_slot(slots[0], tasks[0])
+        enqueue_transfer(slots[0], wait_for_compute=False)
+        for task_index, task in enumerate(tasks):
+            support, q_slice, support_start, global_start, global_end = task
+            slot = slots[task_index % 2]
+            count = int(global_end - global_start)
+            enqueue_started = time.perf_counter()
+            with compute_stream:
+                compute_stream.wait_event(slot["ready"])
+                cross, diagonal, b_block, workspace_bytes = (
+                    _experimental_factorized_chunk_gpu(
+                        affine=affine,
+                        support=support,
+                        support_offset=global_start - support_start,
+                        left_gpu=(
+                            None
+                            if slot["old_gpu"] is None
+                            else slot["old_gpu"][:, :, :count]
+                        ),
+                        right_gpu=slot["new_gpu"][:, :, :count],
+                    )
+                )
+                diagonal_accumulator[q_slice] += diagonal
+                b_accumulator[q_slice] += b_block
+                if cross_accumulator is not None and cross is not None:
+                    cross_accumulator[q_slice] += cross
+                slot["done"].record(compute_stream)
+            kernel_enqueue_wall_s += float(time.perf_counter() - enqueue_started)
+            workspace_peak_bytes = max(workspace_peak_bytes, int(workspace_bytes))
+            chunks += 1
+            del diagonal, b_block
+            if cross is not None:
+                del cross
+
+            next_index = task_index + 1
+            if next_index < len(tasks):
+                next_slot = slots[next_index % 2]
+                if next_index >= 2:
+                    next_slot["ready"].synchronize()
+                prepare_slot(next_slot, tasks[next_index])
+                enqueue_transfer(next_slot, wait_for_compute=next_index >= 2)
+        compute_stream.synchronize()
+        asynchronous_overlap = len(tasks) > 1
+    else:
+        for support, q_slice, support_start, global_start, global_end in tasks:
+            old_values = (
+                None
+                if old_basis is None
+                else _basis_chunk(
+                    old_basis, nvox=nvox, start=global_start, end=global_end
+                )
+            )
+            new_values = _basis_chunk(
+                new_basis, nvox=nvox, start=global_start, end=global_end
+            )
+            upload_started = time.perf_counter()
+            old_gpu = (
+                None
+                if old_values is None
+                else _gpu_flat_compute(old_values, compute_dtype=requested_dtype)
+            )
+            new_gpu = _gpu_flat_compute(new_values, compute_dtype=requested_dtype)
+            if new_gpu is None or (old_values is not None and old_gpu is None):
+                raise RuntimeError("experimental factorized Ritz requires CUDA/CuPy")
+            upload_wall_s += float(time.perf_counter() - upload_started)
+            basis_gpu_uploads += 1 + int(old_gpu is not None)
+
+            enqueue_started = time.perf_counter()
+            cross, diagonal, b_block, workspace_bytes = (
+                _experimental_factorized_chunk_gpu(
+                    affine=affine,
+                    support=support,
+                    support_offset=global_start - support_start,
+                    left_gpu=old_gpu,
+                    right_gpu=new_gpu,
+                )
+            )
+            diagonal_accumulator[q_slice] += diagonal
+            b_accumulator[q_slice] += b_block
+            if cross_accumulator is not None and cross is not None:
+                cross_accumulator[q_slice] += cross
+            kernel_enqueue_wall_s += float(time.perf_counter() - enqueue_started)
+            workspace_peak_bytes = max(workspace_peak_bytes, int(workspace_bytes))
+            chunks += 1
+            del diagonal, b_block, new_gpu, new_values
+            if cross is not None:
+                del cross
+            if old_gpu is not None:
+                del old_gpu
+            if old_values is not None:
+                del old_values
+
+        cp.cuda.get_current_stream().synchronize()
+    cross_host = (
+        None
+        if cross_accumulator is None
+        else np.asarray(cp.asnumpy(cross_accumulator), dtype=np.float64) / float(nvox)
+    )
+    diagonal_host = (
+        np.asarray(cp.asnumpy(diagonal_accumulator), dtype=np.float64) / float(nvox)
+    )
+    b_host = np.asarray(cp.asnumpy(b_accumulator), dtype=np.float64) / float(nvox)
+    factorization_ranks = {
+        support: list(getattr(affine, "exact_factorizations")[support]["ranks"])
+        for support in ("matrix", "fiber")
+    }
+    snapshot_buffer_copies = 2 if bool(async_transfers) else 1
+    gpu_snapshot_buffer_bytes = int(
+        snapshot_buffer_copies
+        * (old_rank + new_rank)
+        * 6
+        * chunk_voxels
+        * compute_itemsize
+    )
+    accumulator_bytes = int(diagonal_accumulator.nbytes + b_accumulator.nbytes)
+    if cross_accumulator is not None:
+        accumulator_bytes += int(cross_accumulator.nbytes)
+    return cross_host, diagonal_host, b_host, {
+        "factorized_gpu_wall_s": float(time.perf_counter() - started),
+        "factorized_upload_wall_s": float(upload_wall_s),
+        "factorized_kernel_enqueue_wall_s": float(kernel_enqueue_wall_s),
+        "factorized_host_prepare_wall_s": float(host_prepare_wall_s),
+        "factorized_chunk_count": int(chunks),
+        "factorized_constitutive_ranks": factorization_ranks,
+        "chunk_voxels": int(chunk_voxels),
+        "basis_gpu_uploads": int(basis_gpu_uploads),
+        "stress_workspace_peak_bytes": int(workspace_peak_bytes),
+        "gpu_resident_reduced_accumulation": True,
+        "async_pinned_double_buffer": bool(asynchronous_overlap),
+        "async_pinned_bytes": int(pinned_bytes),
+        "gpu_snapshot_buffer_bytes": gpu_snapshot_buffer_bytes,
+        "gpu_reduced_accumulator_bytes": accumulator_bytes,
+        "estimated_gpu_peak_bytes": int(
+            workspace_peak_bytes + gpu_snapshot_buffer_bytes + accumulator_bytes
+        ),
+        "reduced_d2h_transfers": 3 if cross_accumulator is not None else 2,
+    }
 
 
 def _contract_component_major(A: np.ndarray, B: np.ndarray) -> np.ndarray:
@@ -2050,6 +2624,8 @@ def _assemble_reduced_operators(
     gram_backend: str = "auto",
     overlap_cpu_gram_gpu: bool = False,
     preserve_raw_coordinates: bool = False,
+    experimental_factorized_ritz: bool = False,
+    experimental_async_ritz: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Stream an exact reduced Ritz assembly without stacking the global basis.
 
@@ -2098,6 +2674,73 @@ def _assemble_reduced_operators(
     first_dtype = _field_component_voxel_view(
         basis[0] if isinstance(basis, list) else basis[0], nvox
     ).dtype
+    if bool(experimental_factorized_ritz):
+        if not bool(preserve_raw_coordinates):
+            raise ValueError(
+                "experimental_factorized_ritz currently requires raw Ritz coordinates"
+            )
+        _, raw_Kq, raw_Bq, factorized_meta = _experimental_factorized_raw_gpu(
+            affine=affine,
+            old_basis=None,
+            new_basis=basis,
+            nvox=nvox,
+            compute_dtype=compute_dtype,
+            async_transfers=bool(experimental_async_ritz),
+        )
+        averaged = getattr(affine, "averaged_stiffness", None)
+        Dq = np.asarray(averaged, dtype=np.float64).copy()
+        for q in range(q_count):
+            raw_Kq[q] = 0.5 * (raw_Kq[q] + raw_Kq[q].T)
+            Dq[q] = 0.5 * (Dq[q] + Dq[q].T)
+        invR = np.eye(r, dtype=np.float64)
+        metadata = {
+            "assembly_wall_s": float(time.perf_counter() - t0),
+            "assembly_mode": "experimental_factorized_gpu",
+            "contraction_mode": "exact_constitutive_rank_factorization",
+            "contraction_dtype": str(first_dtype),
+            "gram_product_dtype": "not_computed",
+            "gram_product_backend": "none",
+            "gram_overlap_requested": False,
+            "gram_overlap_enabled": False,
+            "gram_overlap_used_chunks": 0,
+            "gram_product_wall_s": 0.0,
+            "gram_overlap_wait_wall_s": 0.0,
+            "gram_overlap_hidden_wall_s": 0.0,
+            "contraction_compute_dtype": str(compute_dtype),
+            "reduced_accumulation_dtype": "float64_gpu_resident",
+            "affine_stress_wall_s": 0.0,
+            "contraction_wall_s": float(factorized_meta["factorized_gpu_wall_s"]),
+            "full_volume_equivalent_passes": float(
+                sum(
+                    len(indices)
+                    * (int(selector.stop or nvox) - int(selector.start or 0))
+                    / float(nvox)
+                    for _, indices, selector in support_blocks
+                )
+            ),
+            "q_block_size": int(q_block_size),
+            "batched_contraction": True,
+            "avoided_duplicate_basis_gpu_uploads": int(
+                factorized_meta["basis_gpu_uploads"]
+            ),
+            "affine_stress_backend": "gpu_factorized_exact",
+            "gpu_affine_chunks": int(factorized_meta["factorized_chunk_count"]),
+            "cpu_affine_chunks": 0,
+            "gpu_affine_fallback": "",
+            "raw_Kq": raw_Kq,
+            "raw_Bq": raw_Bq,
+            "invR": invR,
+            "gram_lambda_min": 0.0,
+            "gram_lambda_max": 0.0,
+            "gram_condition": 1.0,
+            "gram_relative_min": 1.0,
+            "effective_rank": int(r),
+            "discarded_rank": 0,
+            "gram_transform_mode": "raw_coordinates_no_gram",
+            "experimental_factorized_ritz": True,
+            **factorized_meta,
+        }
+        return raw_Kq.copy(), raw_Bq.copy(), Dq, metadata
     chunk_voxels = _stream_chunk_voxels(
         ranks=(r,), q_block_size=q_block_size, nvox=nvox,
         storage_itemsize=max(
@@ -2361,6 +3004,8 @@ def _extend_reduced_operators(
     gram_backend: str = "auto",
     overlap_cpu_gram_gpu: bool = False,
     preserve_raw_coordinates: bool = False,
+    experimental_factorized_ritz: bool = False,
+    experimental_async_ritz: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Exact streaming extension of raw Ritz blocks, followed by re-whitening."""
     t0 = time.perf_counter()
@@ -2403,6 +3048,8 @@ def _extend_reduced_operators(
             gram_backend=selected_gram_backend,
             overlap_cpu_gram_gpu=bool(overlap_cpu_gram_gpu),
             preserve_raw_coordinates=bool(preserve_raw_coordinates),
+            experimental_factorized_ritz=bool(experimental_factorized_ritz),
+            experimental_async_ritz=bool(experimental_async_ritz),
         )
         metadata.update({
             "assembly_mode": "incremental",
@@ -2449,6 +3096,83 @@ def _extend_reduced_operators(
     first_dtype = _field_component_voxel_view(
         new_basis[0] if isinstance(new_basis, list) else new_basis[0], nvox
     ).dtype
+    if bool(experimental_factorized_ritz):
+        if not bool(preserve_raw_coordinates):
+            raise ValueError(
+                "experimental_factorized_ritz currently requires raw Ritz coordinates"
+            )
+        cross, diagonal, appended_Bq, factorized_meta = (
+            _experimental_factorized_raw_gpu(
+                affine=affine_stress_batch,
+                old_basis=old_basis,
+                new_basis=new_basis,
+                nvox=nvox,
+                compute_dtype=compute_dtype,
+                async_transfers=bool(experimental_async_ritz),
+            )
+        )
+        assert cross is not None
+        raw_Kq = np.zeros((q_count, new_rank, new_rank), dtype=np.float64)
+        raw_Bq = np.zeros((q_count, new_rank, 6), dtype=np.float64)
+        raw_Kq[:, :old_rank, :old_rank] = raw_K_old
+        raw_Kq[:, :old_rank, old_rank:] = cross
+        raw_Kq[:, old_rank:, :old_rank] = np.swapaxes(cross, 1, 2)
+        raw_Kq[:, old_rank:, old_rank:] = diagonal
+        raw_Bq[:, :old_rank] = raw_B_old
+        raw_Bq[:, old_rank:] = appended_Bq
+        for q in range(q_count):
+            raw_Kq[q] = 0.5 * (raw_Kq[q] + raw_Kq[q].T)
+            Dq[q] = 0.5 * (Dq[q] + Dq[q].T)
+        invR = np.eye(new_rank, dtype=np.float64)
+        metadata = {
+            "assembly_wall_s": float(time.perf_counter() - t0),
+            "assembly_mode": "incremental_experimental_factorized_gpu",
+            "incremental_mode": "raw_block_extension_factorized_gpu",
+            "contraction_mode": "exact_constitutive_rank_factorization",
+            "contraction_dtype": str(first_dtype),
+            "gram_product_dtype": "not_computed",
+            "gram_product_backend": "none",
+            "gram_overlap_requested": False,
+            "gram_overlap_enabled": False,
+            "gram_overlap_used_chunks": 0,
+            "gram_product_wall_s": 0.0,
+            "gram_overlap_wait_wall_s": 0.0,
+            "gram_overlap_hidden_wall_s": 0.0,
+            "contraction_compute_dtype": str(compute_dtype),
+            "reduced_accumulation_dtype": "float64_gpu_resident",
+            "affine_stress_wall_s": 0.0,
+            "contraction_wall_s": float(factorized_meta["factorized_gpu_wall_s"]),
+            "full_volume_equivalent_passes": float(
+                sum(
+                    len(indices)
+                    * (int(selector.stop or nvox) - int(selector.start or 0))
+                    / float(nvox)
+                    for _, indices, selector in support_blocks
+                )
+            ),
+            "q_block_size": int(q_block_size),
+            "batched_contraction": True,
+            "avoided_duplicate_basis_gpu_uploads": int(
+                factorized_meta["basis_gpu_uploads"]
+            ),
+            "affine_stress_backend": "gpu_factorized_exact",
+            "gpu_affine_chunks": int(factorized_meta["factorized_chunk_count"]),
+            "cpu_affine_chunks": 0,
+            "gpu_affine_fallback": "",
+            "raw_Kq": raw_Kq,
+            "raw_Bq": raw_Bq,
+            "invR": invR,
+            "gram_lambda_min": 0.0,
+            "gram_lambda_max": 0.0,
+            "gram_condition": 1.0,
+            "gram_relative_min": 1.0,
+            "effective_rank": int(new_rank),
+            "discarded_rank": 0,
+            "gram_transform_mode": "raw_coordinates_no_gram",
+            "experimental_factorized_ritz": True,
+            **factorized_meta,
+        }
+        return raw_Kq.copy(), raw_Bq.copy(), Dq, metadata
     chunk_voxels = _stream_chunk_voxels(
         ranks=(old_rank, count), q_block_size=q_block_size, nvox=nvox,
         storage_itemsize=max(

@@ -1107,6 +1107,8 @@ def update_reduced_operators(
     gram_backend: str = "auto",
     overlap_cpu_gram_gpu: bool = False,
     preserve_raw_coordinates: bool = False,
+    experimental_factorized_ritz: bool = False,
+    experimental_async_ritz: bool = False,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     import rom_reduced_operator as reduced
 
@@ -1124,6 +1126,8 @@ def update_reduced_operators(
             gram_backend=str(gram_backend),
             overlap_cpu_gram_gpu=bool(overlap_cpu_gram_gpu),
             preserve_raw_coordinates=bool(preserve_raw_coordinates),
+            experimental_factorized_ritz=bool(experimental_factorized_ritz),
+            experimental_async_ritz=bool(experimental_async_ritz),
         )
     else:
         old_basis = basis[: -len(new_fields)]
@@ -1140,6 +1144,8 @@ def update_reduced_operators(
             gram_backend=str(gram_backend),
             overlap_cpu_gram_gpu=bool(overlap_cpu_gram_gpu),
             preserve_raw_coordinates=bool(preserve_raw_coordinates),
+            experimental_factorized_ritz=bool(experimental_factorized_ritz),
+            experimental_async_ritz=bool(experimental_async_ritz),
         )
         
     ops = {"Kq": Kq, "Bq": Bq, "Dq": Dq}

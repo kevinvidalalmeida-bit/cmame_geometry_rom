@@ -1059,6 +1059,100 @@ def test_phase_supported_incremental_ritz_is_exact_and_memory_bounded():
     assert metadata["stress_workspace_peak_bytes"] < dense_workspace
 
 
+def test_experimental_factorized_gpu_ritz_preserves_raw_affine_blocks():
+    try:
+        import cupy as cp
+
+        cp.cuda.Device().compute_capability
+    except Exception:
+        pytest.skip("CUDA/CuPy is unavailable")
+    rng = np.random.default_rng(20260918)
+    shape = (6, 5, 4)
+    phase = np.zeros(shape, dtype=np.uint8)
+    phase.reshape(-1)[::4] = 1
+    ori = np.zeros(shape + (3,), dtype=np.float32)
+    fiber = np.flatnonzero(phase.reshape(-1))
+    ori.reshape(-1, 3)[fiber, np.arange(len(fiber)) % 3] = 1.0
+    basis = rng.standard_normal((9, 6, int(np.prod(shape)))).astype(np.float32)
+    order = reduced.phase_orientation_voxel_order(phase, ori)
+    ordered_phase = phase.reshape(-1)[order]
+    ordered_ori = ori.reshape(-1, 3)[order]
+    ordered_basis = np.take(basis, order, axis=2)
+    affine = reduced.affine_stress_batch_factory(ordered_phase, ordered_ori)
+
+    expected = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=ordered_basis,
+        affine_stress_batch=affine,
+        contraction_compute_dtype="float32",
+        preserve_raw_coordinates=True,
+    )
+    actual = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=ordered_basis,
+        affine_stress_batch=affine,
+        contraction_compute_dtype="float32",
+        preserve_raw_coordinates=True,
+        experimental_factorized_ritz=True,
+    )
+    np.testing.assert_allclose(actual[0], expected[0], rtol=2.0e-6, atol=1.0e-5)
+    np.testing.assert_allclose(actual[1], expected[1], rtol=2.0e-6, atol=2.0e-6)
+    np.testing.assert_allclose(actual[2], expected[2], rtol=3.0e-13, atol=3.0e-13)
+    assert actual[3]["gpu_resident_reduced_accumulation"] is True
+    assert actual[3]["factorized_constitutive_ranks"] == {
+        "matrix": [1, 6],
+        "fiber": [3, 3, 2, 1, 2],
+    }
+    asynchronous = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=ordered_basis,
+        affine_stress_batch=affine,
+        contraction_compute_dtype="float32",
+        preserve_raw_coordinates=True,
+        experimental_factorized_ritz=True,
+        experimental_async_ritz=True,
+    )
+    for async_block, factorized_block in zip(
+        asynchronous[:3], actual[:3], strict=True
+    ):
+        np.testing.assert_array_equal(async_block, factorized_block)
+    assert asynchronous[3]["async_pinned_double_buffer"] is True
+
+    split = 5
+    first = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=ordered_basis[:split],
+        affine_stress_batch=affine,
+        contraction_compute_dtype="float32",
+        preserve_raw_coordinates=True,
+        experimental_factorized_ritz=True,
+        experimental_async_ritz=True,
+    )
+    incremental = reduced._extend_reduced_operators(
+        existing={
+            "Kq": first[0],
+            "Bq": first[1],
+            "Dq": first[2],
+            "raw_Kq": first[3]["raw_Kq"],
+            "raw_Bq": first[3]["raw_Bq"],
+        },
+        old_basis=ordered_basis[:split],
+        new_basis=ordered_basis[split:],
+        affine_stress_batch=affine,
+        contraction_compute_dtype="float32",
+        preserve_raw_coordinates=True,
+        experimental_factorized_ritz=True,
+        experimental_async_ritz=True,
+    )
+    np.testing.assert_allclose(incremental[0], actual[0], rtol=2.0e-6, atol=2.0e-6)
+    np.testing.assert_allclose(incremental[1], actual[1], rtol=2.0e-6, atol=2.0e-6)
+    np.testing.assert_allclose(incremental[2], actual[2], rtol=3.0e-13, atol=3.0e-13)
+
+
 def test_vectorized_material_and_engineering_maps_match_scalar_references():
     rows = [
         {
