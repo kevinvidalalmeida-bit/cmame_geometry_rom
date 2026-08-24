@@ -153,8 +153,10 @@ def write_convergence_figure(table: pd.DataFrame, destination: Path) -> None:
         loc="lower right",
     )
 
-    for suffix in ("pdf", "png"):
-        figure.savefig(destination / f"numerical_voxel_resolution_convergence.{suffix}", dpi=240)
+    figure.savefig(
+        destination / "numerical_voxel_resolution_convergence.png",
+        dpi=240,
+    )
     plt.close(figure)
 
 

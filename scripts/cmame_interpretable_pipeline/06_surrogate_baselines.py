@@ -897,9 +897,8 @@ def main() -> int:
     if args.paper_figure_dir is not None:
         paper_dir = args.paper_figure_dir.resolve()
         paper_dir.mkdir(parents=True, exist_ok=True)
-        for suffix in ("pdf", "png"):
-            target = paper_dir / f"numerical_surrogate_sample_efficiency.{suffix}"
-            target.write_bytes(figure_path.with_suffix(f".{suffix}").read_bytes())
+        target = paper_dir / "numerical_surrogate_sample_efficiency.png"
+        target.write_bytes(figure_path.with_suffix(".png").read_bytes())
 
     print(global_summary.to_string(index=False), flush=True)
     return 0
