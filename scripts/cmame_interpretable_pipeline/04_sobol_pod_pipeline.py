@@ -1356,6 +1356,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-materials", type=int, default=int(pipeline.get("start_materials", 2)))
     parser.add_argument(
+        "--record-fixed-prefixes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "In fixed mode, incrementally assemble and record every prefix "
+            "from --fixed-prefix-start through --training-limit."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-prefix-start",
+        type=int,
+        default=2,
+        help="First fixed Sobol prefix recorded by --record-fixed-prefixes.",
+    )
+    parser.add_argument(
         "--training-limit",
         type=int,
         default=None,
@@ -1632,6 +1647,10 @@ def main() -> int:
     try:
         if int(args.start_materials) < 1:
             raise ValueError("start_materials must be positive.")
+        if int(args.fixed_prefix_start) < 1:
+            raise ValueError("fixed_prefix_start must be positive.")
+        if bool(args.record_fixed_prefixes) and bool(args.adaptive):
+            raise ValueError("record_fixed_prefixes is available only in fixed mode.")
         if int(args.final_validation_count) < 1:
             raise ValueError("final_validation_count must be positive.")
         if int(args.final_validation_pool_count) < int(args.final_validation_count):
@@ -1809,6 +1828,12 @@ def main() -> int:
                 f"memory-safe limit of {safe_material_limit} materials."
             )
         training_limit = requested_limit or safe_material_limit
+        if bool(args.record_fixed_prefixes) and int(args.fixed_prefix_start) > int(
+            training_limit
+        ):
+            raise ValueError(
+                "fixed_prefix_start cannot exceed the fixed training limit."
+            )
         minimum_required = (
             int(training_limit)
             if fixed_training_protocol
@@ -2090,7 +2115,11 @@ def main() -> int:
                 basis_tolerance=float(args.basis_tolerance),
                 cleanup_snapshot_fields=bool(args.cleanup_snapshot_fields),
                 compile_operators=(
-                    training_materials == int(training_limit)
+                    (
+                        training_materials >= int(args.fixed_prefix_start)
+                        if bool(args.record_fixed_prefixes)
+                        else training_materials == int(training_limit)
+                    )
                     if fixed_training_protocol
                     else training_materials >= int(args.start_materials)
                 ),
@@ -2123,7 +2152,14 @@ def main() -> int:
                     f"step={float(record['snapshot_step_wall_s']):.2f}s",
                     flush=True,
                 )
-            if fixed_training_protocol and training_materials < int(training_limit):
+            if (
+                fixed_training_protocol
+                and training_materials < int(training_limit)
+                and not (
+                    bool(args.record_fixed_prefixes)
+                    and training_materials >= int(args.fixed_prefix_start)
+                )
+            ):
                 continue
             if (
                 not fixed_training_protocol
@@ -2134,7 +2170,7 @@ def main() -> int:
                 raise RuntimeError("No reduced operators were assembled.")
 
             if fixed_training_protocol:
-                stop_materials = int(training_materials)
+                final_fixed_prefix = training_materials == int(training_limit)
                 effective_rank = int(operators["Kq"].shape[1])
                 curve_rows.append(
                     {
@@ -2160,17 +2196,20 @@ def main() -> int:
                         "monitor_error_p95": np.nan,
                         "monitor_error_max": np.nan,
                         "passes_target_max": np.nan,
-                        "stop_triggered": True,
+                        "stop_triggered": bool(final_fixed_prefix),
                         "rom_online_mean_s": np.nan,
                         "worst_monitor_id": np.nan,
                     }
                 )
                 print(
-                    f"[SOBOL-POD] fixed training complete | "
+                    f"[SOBOL-POD] fixed prefix | "
                     f"materials={training_materials} | rank={effective_rank}",
                     flush=True,
                 )
-                break
+                if final_fixed_prefix:
+                    stop_materials = int(training_materials)
+                    break
+                continue
 
             monitor_rom_started = time.perf_counter()
             frame = reduced._evaluate_rom(
@@ -3026,7 +3065,10 @@ def main() -> int:
             "nvox": int(geometry.phase.size),
             "voxel_shape": list(geometry.phase.shape),
             "selection_policy": str(args.selection_policy),
+            "candidate_seed": int(args.candidate_seed),
             "training_limit": int(training_limit),
+            "record_fixed_prefixes": bool(args.record_fixed_prefixes),
+            "fixed_prefix_start": int(args.fixed_prefix_start),
             "memory_safe_material_limit": int(safe_material_limit),
             "final_selected_materials": int(stop_materials),
             "basis_rank": final_basis_rank,

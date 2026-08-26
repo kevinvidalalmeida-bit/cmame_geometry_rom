@@ -143,6 +143,58 @@ The second command revoxelizes the unchanged continuous masters for G08, G00,
 and G09 at 3, 4, 5, and 6 voxels per micrometre using the declared Carbon Fiber
 (290 GPa)/Resin Epoxy material and the nominal `snapshot32` profile.
 
+## Fixed-prefix seed robustness without monitors
+
+The monitor-free robustness study is configured in:
+
+```text
+scripts/cmame_interpretable_pipeline/fixed_prefix_robustness_config.json
+```
+
+The default protocol uses eight independently scrambled Sobol training
+sequences, fixed-prefix checkpoints from 2 through 10 and at 12, 14, 16, and
+20 materials, all ten geometries, and one common 100-material affine-maximin
+validation design. Training is strictly sequential and keeps the material
+load batch at one. No FOM monitor or adaptive stopping criterion is used.
+
+Launch the complete study with:
+
+```bash
+python scripts/cmame_interpretable_pipeline/11_fixed_prefix_seed_robustness.py \
+  --stage all
+```
+
+Run a smaller G03/G09 pilot before the full campaign with:
+
+```bash
+python scripts/cmame_interpretable_pipeline/11_fixed_prefix_seed_robustness.py \
+  --stage all \
+  --run-name fixed_prefix_seed_pilot \
+  --geometry-ids 3 9 \
+  --training-seeds 20260821 20261001 20261002 20261003
+```
+
+Completed geometry/seed runs are reused by default. To resume an interrupted
+campaign, execute the same command again: completed runs are reused and only
+the incomplete run is restarted. To inspect every command without starting an
+FFT solve, add `--dry-run --stage run`. Once all runs exist, the analysis alone
+can be regenerated with `--stage analyze`.
+
+For each geometry, only the first training seed computes the 100 validation
+references. All other seed models are trained and frozen independently and
+are evaluated afterward on that common truth table. The summary directory
+contains:
+
+- `fixed_prefix_seed_summary.csv`: error and SPD statistics for every prefix.
+- `fixed_prefix_seed_timing.csv`: measured cumulative FOM, Gram/Ritz,
+  transfer, dense-freeze, evaluation, workspace, and compilation times.
+- `fixed_prefix_seed_validation.csv`: one compact row per held-out prediction.
+- `fixed_prefix_required_materials.csv`: first observed tolerance crossings
+  and explicit censoring at the largest tested prefix.
+- `fixed_prefix_robustness.png`: the four-panel seed/prefix robustness figure.
+- `fixed_prefix_protocol_manifest.json`: frozen seeds, numerical protocol,
+  hashes, sequential execution policy, and `load_batch_size=1` record.
+
 Rebenchmark the frozen ROMs without repeating any FFT solve:
 
 ```bash

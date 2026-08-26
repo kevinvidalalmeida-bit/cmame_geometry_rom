@@ -1,0 +1,24 @@
+{
+  "run_name": "fixed_prefix_seed_robustness_20260826",
+  "geometry_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "training_seeds": [
+    20260821,
+    20261001,
+    20261002,
+    20261003,
+    20261004,
+    20261005,
+    20261006,
+    20261007
+  ],
+  "max_training_materials": 20,
+  "checkpoints": [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20],
+  "candidate_count": 1024,
+  "validation_pool_count": 16384,
+  "validation_count": 100,
+  "validation_seed": 20261101,
+  "non_owner_validation_count": 1,
+  "target_error": 0.0001,
+  "rom_timing_count": 100,
+  "rom_timing_repetitions": 1
+}
