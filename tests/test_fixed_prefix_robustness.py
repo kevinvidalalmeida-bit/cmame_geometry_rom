@@ -37,7 +37,7 @@ def test_default_study_has_no_monitor_and_unique_seed_runs() -> None:
 
     assert len(specs) == 80
     assert study["checkpoints"][:9] == list(range(2, 11))
-    assert study["checkpoints"][-1] == study["max_training_materials"] == 20
+    assert study["checkpoints"][-1] == study["max_training_materials"] == 10
     assert len(study["training_seeds"]) == 8
     assert len({spec["run_name"] for spec in specs}) == len(specs)
     for geometry_id in study["geometry_ids"]:
@@ -71,8 +71,9 @@ def test_commands_are_fixed_incremental_and_share_validation() -> None:
 
     assert "--no-adaptive" in owner_command
     assert "--record-fixed-prefixes" in owner_command
+    assert "--no-warm-start-route" in owner_command
     assert owner_command[owner_command.index("--monitor-count") + 1] == "0"
-    assert owner_command[owner_command.index("--training-limit") + 1] == "20"
+    assert owner_command[owner_command.index("--training-limit") + 1] == "10"
     assert owner_command[owner_command.index("--fixed-prefix-start") + 1] == "2"
     assert owner_command[owner_command.index("--final-validation-count") + 1] == "100"
     assert follower_command[
@@ -80,23 +81,15 @@ def test_commands_are_fixed_incremental_and_share_validation() -> None:
     ] == "1"
 
 
-def test_execution_command_overwrites_only_an_existing_run(tmp_path: Path) -> None:
-    missing = tmp_path / "missing"
+def test_incompatible_run_is_archived_without_deleting_it(tmp_path: Path) -> None:
     existing = tmp_path / "incomplete"
     existing.mkdir()
+    (existing / "partial.csv").write_text("a\n1\n", encoding="utf-8")
 
-    assert robustness.executable_command("python pipeline.py", missing) == [
-        "python",
-        "pipeline.py",
-    ]
-    assert robustness.executable_command("python pipeline.py", existing) == [
-        "python",
-        "pipeline.py",
-        "--overwrite",
-    ]
-    assert robustness.executable_command(
-        "python pipeline.py --overwrite", existing
-    ).count("--overwrite") == 1
+    archived = robustness.archive_incompatible_run(existing, tmp_path / "summary")
+
+    assert not existing.exists()
+    assert (archived / "partial.csv").is_file()
 
 
 def test_prefix_timing_uses_measured_cumulative_rows() -> None:

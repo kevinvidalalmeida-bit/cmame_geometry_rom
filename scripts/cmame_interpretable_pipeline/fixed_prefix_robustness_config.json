@@ -11,8 +11,8 @@
     20261006,
     20261007
   ],
-  "max_training_materials": 20,
-  "checkpoints": [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20],
+  "max_training_materials": 10,
+  "checkpoints": [2, 3, 4, 5, 6, 7, 8, 9, 10],
   "candidate_count": 1024,
   "validation_pool_count": 16384,
   "validation_count": 100,

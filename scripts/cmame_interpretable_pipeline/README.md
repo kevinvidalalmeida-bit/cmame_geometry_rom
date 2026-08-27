@@ -152,10 +152,12 @@ scripts/cmame_interpretable_pipeline/fixed_prefix_robustness_config.json
 ```
 
 The default protocol uses eight independently scrambled Sobol training
-sequences, fixed-prefix checkpoints from 2 through 10 and at 12, 14, 16, and
-20 materials, all ten geometries, and one common 100-material affine-maximin
-validation design. Training is strictly sequential and keeps the material
-load batch at one. No FOM monitor or adaptive stopping criterion is used.
+sequences, fixed-prefix checkpoints from 2 through 10 materials, all ten
+geometries, and one common 100-material affine-maximin validation design.
+Training is strictly sequential and keeps the material load batch at one. No
+FOM monitor or adaptive stopping criterion is used. The training solve order
+is the literal scrambled Sobol order; warm starts use the matching load from
+the preceding Sobol material without reordering the prefix.
 
 Launch the complete study with:
 
@@ -176,9 +178,11 @@ python scripts/cmame_interpretable_pipeline/11_fixed_prefix_seed_robustness.py \
 
 Completed geometry/seed runs are reused by default. To resume an interrupted
 campaign, execute the same command again: completed runs are reused and only
-the incomplete run is restarted. To inspect every command without starting an
-FFT solve, add `--dry-run --stage run`. Once all runs exist, the analysis alone
-can be regenerated with `--stage analyze`.
+the incompatible or incomplete run is archived and restarted. Independent
+validation truth is cached by geometry, so rebuilding a ROM does not repeat a
+completed 100-material reference design. To inspect every command without
+starting an FFT solve, add `--dry-run --stage run`. Once all runs exist, the
+analysis alone can be regenerated with `--stage analyze`.
 
 For each geometry, only the first training seed computes the 100 validation
 references. All other seed models are trained and frozen independently and

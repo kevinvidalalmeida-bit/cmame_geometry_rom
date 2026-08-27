@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -185,8 +186,11 @@ def run_name(study: dict[str, Any], geometry_id: int, seed: int) -> str:
     return f"{study['run_name']}_g{int(geometry_id):02d}_seed{int(seed)}"
 
 
-def run_specs(study: dict[str, Any]) -> list[dict[str, Any]]:
+def run_specs(
+    study: dict[str, Any], cached_validation_geometries: set[int] | None = None
+) -> list[dict[str, Any]]:
     seeds = [int(value) for value in study["training_seeds"]]
+    cached = cached_validation_geometries or set()
     specs: list[dict[str, Any]] = []
     for geometry_id in [int(value) for value in study["geometry_ids"]]:
         for seed_index, seed in enumerate(seeds):
@@ -196,6 +200,7 @@ def run_specs(study: dict[str, Any]) -> list[dict[str, Any]]:
                     "training_seed": seed,
                     "seed_index": seed_index,
                     "validation_owner": seed_index == 0,
+                    "shared_validation_cached": geometry_id in cached,
                     "run_name": run_name(study, geometry_id, seed),
                 }
             )
@@ -219,6 +224,7 @@ def command_for_spec(
     validation_count = (
         int(study["validation_count"])
         if bool(spec["validation_owner"])
+        and not bool(spec.get("shared_validation_cached", False))
         else int(study["non_owner_validation_count"])
     )
     training_profile = (
@@ -311,6 +317,7 @@ def command_for_spec(
         str(min(100, int(study["rom_timing_count"]))),
         "--no-adaptive",
         "--record-fixed-prefixes",
+        "--no-warm-start-route",
         "--no-energy-pod-baseline",
         "--no-structural-audit",
         "--no-tau-sensitivity",
@@ -362,25 +369,93 @@ def command_for_spec(
 
 def completed_run(run_dir: Path, spec: dict[str, Any], study: dict[str, Any]) -> bool:
     summary_path = run_dir / "sobol_pod_summary.json"
-    if not summary_path.is_file():
+    manifest_path = run_dir / "run_manifest.json"
+    if not summary_path.is_file() or not manifest_path.is_file():
         return False
     summary = load_json(summary_path)
+    manifest = load_json(manifest_path)
+    expected_validation = (
+        int(study["validation_count"])
+        if bool(spec["validation_owner"])
+        and not bool(spec.get("shared_validation_cached", False))
+        else int(study["non_owner_validation_count"])
+    )
     return bool(
         summary.get("status") == "complete"
         and not bool(summary.get("adaptive", True))
         and bool(summary.get("record_fixed_prefixes", False))
         and int(summary.get("candidate_seed", -1)) == int(spec["training_seed"])
         and int(summary.get("training_limit", -1))
-        == int(study["max_training_materials"])
+        >= int(study["max_training_materials"])
+        and int(summary.get("final_validation_count", -1)) >= expected_validation
+        and manifest.get("solve_order_policy") == "sobol_prefix_order"
+        and (run_dir / "reduced_operators.npz").is_file()
     )
 
 
-def executable_command(command: str, run_dir: Path) -> list[str]:
-    """Restart an incomplete run directory while preserving completed runs."""
-    tokens = shlex.split(command)
-    if run_dir.exists() and "--overwrite" not in tokens:
-        tokens.append("--overwrite")
-    return tokens
+def shared_validation_paths(summary_dir: Path, geometry_id: int) -> tuple[Path, Path]:
+    prefix = summary_dir / f"g{int(geometry_id):02d}_shared_validation"
+    return (
+        prefix.with_name(prefix.name + "_truth.csv"),
+        prefix.with_name(prefix.name + "_timing.csv"),
+    )
+
+
+def cache_shared_validation(
+    *, study: dict[str, Any], destination: Path, summary_dir: Path
+) -> set[int]:
+    """Preserve geometry-wise validation truth independently of ROM reruns."""
+    cached: set[int] = set()
+    owner_seed = int(study["training_seeds"][0])
+    expected = int(study["validation_count"])
+    for geometry_id in [int(value) for value in study["geometry_ids"]]:
+        cached_truth, cached_timing = shared_validation_paths(
+            summary_dir, geometry_id
+        )
+        if cached_truth.is_file() and cached_timing.is_file():
+            if len(pd.read_csv(cached_truth)) == expected:
+                cached.add(geometry_id)
+                continue
+        owner_dir = destination / "runs" / run_name(
+            study, geometry_id, owner_seed
+        )
+        source_truth = owner_dir / "final_validation_truth_results.csv"
+        source_timing = owner_dir / "fom_timing_results.csv"
+        if not source_truth.is_file() or not source_timing.is_file():
+            continue
+        truth = pd.read_csv(source_truth)
+        timing = pd.read_csv(source_timing)
+        if len(truth) != expected or len(timing) != expected:
+            continue
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_truth, cached_truth)
+        shutil.copy2(source_timing, cached_timing)
+        write_json(
+            summary_dir / f"g{geometry_id:02d}_shared_validation_manifest.json",
+            {
+                "geometry_id": geometry_id,
+                "validation_count": expected,
+                "validation_seed": int(study["validation_seed"]),
+                "source_run": str(owner_dir),
+                "truth_sha256": sha256(cached_truth),
+                "timing_sha256": sha256(cached_timing),
+            },
+        )
+        cached.add(geometry_id)
+    return cached
+
+
+def archive_incompatible_run(run_dir: Path, summary_dir: Path) -> Path:
+    archive_root = summary_dir / "restarted_runs"
+    archive_root.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    destination = archive_root / f"{run_dir.name}_{stamp}"
+    suffix = 1
+    while destination.exists():
+        destination = archive_root / f"{run_dir.name}_{stamp}_{suffix}"
+        suffix += 1
+    run_dir.rename(destination)
+    return destination
 
 
 def write_run_plan(
@@ -464,7 +539,13 @@ def execute_plan(
             )
             print(f"[FIXED-PREFIX] reuse {run_dir}", flush=True)
         else:
-            tokens = executable_command(command, run_dir)
+            if run_dir.exists():
+                archived = archive_incompatible_run(run_dir, summary_dir)
+                print(
+                    f"[FIXED-PREFIX] archived incompatible run at {archived}",
+                    flush=True,
+                )
+            tokens = shlex.split(command)
             print(f"[FIXED-PREFIX] {shlex.join(tokens)}", flush=True)
             started = time.perf_counter()
             subprocess.run(tokens, cwd=str(ROOT), check=True)
@@ -591,15 +672,26 @@ def analyze(
 
     for geometry_id in [int(value) for value in study["geometry_ids"]]:
         owner_dir = destination / "runs" / run_name(study, geometry_id, seeds[0])
-        validation_truth = pd.read_csv(
-            owner_dir / "final_validation_truth_results.csv"
+        cached_truth, cached_timing = shared_validation_paths(
+            summary_dir, geometry_id
         )
+        truth_path = (
+            cached_truth
+            if cached_truth.is_file()
+            else owner_dir / "final_validation_truth_results.csv"
+        )
+        timing_path = (
+            cached_timing
+            if cached_timing.is_file()
+            else owner_dir / "fom_timing_results.csv"
+        )
+        validation_truth = pd.read_csv(truth_path)
         if len(validation_truth) != int(study["validation_count"]):
             raise RuntimeError(
                 f"G{geometry_id:02d} shared validation has "
                 f"{len(validation_truth)} rows; expected {study['validation_count']}."
             )
-        owner_timing = pd.read_csv(owner_dir / "fom_timing_results.csv")
+        owner_timing = pd.read_csv(timing_path)
         shared_timing_wall_s = float(owner_timing["solve_wall_s"].sum())
         shared_reference_wall_s = float(validation_truth["solve_wall_s"].sum())
 
@@ -799,7 +891,10 @@ def main() -> int:
     campaign, study = resolved_settings(args)
     destination = out_root(campaign, args.out_root)
     summary_dir = destination / "runs" / f"{study['run_name']}_summary"
-    specs = run_specs(study)
+    cached_validation = cache_shared_validation(
+        study=study, destination=destination, summary_dir=summary_dir
+    )
+    specs = run_specs(study, cached_validation)
     plan = write_run_plan(
         summary_dir=summary_dir,
         args=args,
@@ -817,6 +912,9 @@ def main() -> int:
             destination=destination,
         )
     if args.stage in {"analyze", "all"} and not args.dry_run:
+        cache_shared_validation(
+            study=study, destination=destination, summary_dir=summary_dir
+        )
         analyze(study=study, destination=destination, summary_dir=summary_dir)
     print(f"[FIXED-PREFIX] summary={summary_dir}", flush=True)
     return 0
