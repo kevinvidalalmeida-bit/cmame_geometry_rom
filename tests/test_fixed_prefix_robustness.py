@@ -92,6 +92,36 @@ def test_incompatible_run_is_archived_without_deleting_it(tmp_path: Path) -> Non
     assert (archived / "partial.csv").is_file()
 
 
+def test_completed_owner_run_accepts_shared_validation_cache(tmp_path: Path) -> None:
+    run_dir = tmp_path / "owner"
+    run_dir.mkdir()
+    (run_dir / "sobol_pod_summary.json").write_text(
+        '{"status":"complete","adaptive":false,'
+        '"record_fixed_prefixes":true,"candidate_seed":10,'
+        '"training_limit":10,"final_validation_count":1}',
+        encoding="utf-8",
+    )
+    (run_dir / "run_manifest.json").write_text(
+        '{"solve_order_policy":"sobol_prefix_order"}', encoding="utf-8"
+    )
+    (run_dir / "reduced_operators.npz").touch()
+    study = {"validation_count": 100, "non_owner_validation_count": 1,
+             "max_training_materials": 10}
+
+    assert robustness.completed_run(
+        run_dir,
+        {"training_seed": 10, "validation_owner": True,
+         "shared_validation_cached": True},
+        study,
+    )
+    assert not robustness.completed_run(
+        run_dir,
+        {"training_seed": 10, "validation_owner": True,
+         "shared_validation_cached": False},
+        study,
+    )
+
+
 def test_prefix_timing_uses_measured_cumulative_rows() -> None:
     frame = pd.DataFrame(
         {

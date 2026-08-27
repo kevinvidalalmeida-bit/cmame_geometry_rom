@@ -41,6 +41,22 @@ def test_affine_maximin_and_warm_route_preserve_fixed_design():
     assert sorted(routed["sobol_set_position"].tolist()) == list(range(10))
 
 
+def test_gpu_transition_cleanup_calls_solver_pool_release() -> None:
+    class FakeSobolGpu:
+        called = False
+
+        def free_gpu_memory_pool(self, *, clear_fft_cache: bool) -> None:
+            assert clear_fft_cache is True
+            self.called = True
+
+    fake = FakeSobolGpu()
+    metadata = pipeline.release_gpu_transition_memory({"sobol_gpu": fake})
+
+    assert fake.called
+    assert metadata["requested"] is True
+    assert metadata["wall_s"] >= 0.0
+
+
 def test_default_protocol_uses_adaptive_training_and_post_freeze_validation():
     config = json.loads(
         (PIPELINE_DIR / "campaign_config.json").read_text(encoding="utf-8")

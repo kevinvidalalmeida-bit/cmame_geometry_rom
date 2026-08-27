@@ -78,6 +78,46 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     )
 
 
+def release_gpu_transition_memory(runtime: dict[str, Any]) -> dict[str, Any]:
+    """Release temporary Ritz allocations before high-precision FFT solves."""
+    started = time.perf_counter()
+    metadata: dict[str, Any] = {
+        "requested": True,
+        "device_free_bytes_before": None,
+        "device_free_bytes_after": None,
+        "pool_total_bytes_before": None,
+        "pool_total_bytes_after": None,
+    }
+    try:
+        import cupy as cp
+
+        cp.cuda.get_current_stream().synchronize()
+        free_before, _ = cp.cuda.runtime.memGetInfo()
+        metadata["device_free_bytes_before"] = int(free_before)
+        metadata["pool_total_bytes_before"] = int(
+            cp.get_default_memory_pool().total_bytes()
+        )
+    except Exception as exc:
+        metadata["snapshot_error_before"] = f"{type(exc).__name__}: {exc}"
+
+    gc.collect()
+    runtime["sobol_gpu"].free_gpu_memory_pool(clear_fft_cache=True)
+    try:
+        import cupy as cp
+
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+        cp.cuda.get_current_stream().synchronize()
+        free_after, _ = cp.cuda.runtime.memGetInfo()
+        metadata["device_free_bytes_after"] = int(free_after)
+        metadata["pool_total_bytes_after"] = int(
+            cp.get_default_memory_pool().total_bytes()
+        )
+    except Exception as exc:
+        metadata["snapshot_error_after"] = f"{type(exc).__name__}: {exc}"
+    metadata["wall_s"] = float(time.perf_counter() - started)
+    return metadata
+
+
 @contextmanager
 def quiet_solver_output(enabled: bool):
     if not enabled:
@@ -2596,6 +2636,10 @@ def main() -> int:
         if not monitor_rom.empty:
             monitor_rom.to_csv(run_dir / "monitor_rom_results.csv", index=False)
 
+        gpu_transition_cleanup = release_gpu_transition_memory(runtime)
+        write_json(
+            run_dir / "gpu_transition_cleanup.json", gpu_transition_cleanup
+        )
         fom_timing_results, final_validation_truth = solve_timing_and_reference_pools(
             run_dir=run_dir,
             geometry=geometry,
@@ -3003,6 +3047,10 @@ def main() -> int:
                     "wall_s": reference_energy_qr_stage_wall_s,
                 },
                 {
+                    "stage": "gpu_transition_cleanup",
+                    "wall_s": float(gpu_transition_cleanup["wall_s"]),
+                },
+                {
                     "stage": "final_independent_fft_validation",
                     "wall_s": validation_stage_wall_s,
                 },
@@ -3215,6 +3263,10 @@ def main() -> int:
             "monitor_fft_stage_wall_s": monitor_fft_stage_wall_s,
             "monitor_rom_total_wall_s": monitor_rom_total_wall_s,
             "training_stage_wall_s": training_stage_wall_s,
+            "gpu_transition_cleanup": gpu_transition_cleanup,
+            "gpu_transition_cleanup_wall_s": float(
+                gpu_transition_cleanup["wall_s"]
+            ),
             "final_validation_fft_total_wall_s": float(
                 final_validation_truth["solve_wall_s"].sum()
             ),

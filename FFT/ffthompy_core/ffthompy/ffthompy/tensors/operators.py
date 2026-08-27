@@ -290,7 +290,11 @@ def _get_cupy_sym21_kernel(kind, batched):
     if kernel is not None:
         return kernel
 
-    if kind == "f32_r32":
+    template_kind = {
+        "f64_r64": "f32_r32",
+        "f64_c128": "f32_c64",
+    }.get(kind, kind)
+    if template_kind == "f32_r32":
         code = r'''
         extern "C" __global__
         void sym21_apply(const float* __restrict__ A,
@@ -344,7 +348,7 @@ def _get_cupy_sym21_kernel(kind, batched):
             Y[5 * stride + base] = a05*x0 + a15*x1 + a25*x2 + a35*x3 + a45*x4 + a55*x5;
         }
         '''
-    elif kind == "f32_c64":
+    elif template_kind == "f32_c64":
         code = r'''
         extern "C" __global__
         void sym21_apply(const float* __restrict__ A,
@@ -421,6 +425,13 @@ def _get_cupy_sym21_kernel(kind, batched):
     else:
         return None
 
+    if kind in {"f64_r64", "f64_c128"}:
+        code = (
+            code.replace("make_float2", "make_double2")
+            .replace("float2", "double2")
+            .replace("float", "double")
+        )
+
     try:
         kernel = cp.RawKernel(code, "sym21_apply")
     except Exception:
@@ -436,14 +447,18 @@ def _sym21_cupy_fused(tval, value):
         return None
     if tval.shape[0] != 21 or value.shape[0] != 6:
         return None
-    if tval.dtype != cp.float32:
-        return None
-    if value.dtype == cp.float32:
+    if tval.dtype == cp.float32 and value.dtype == cp.float32:
         kind = "f32_r32"
         out_dtype = cp.float32
-    elif value.dtype == cp.complex64:
+    elif tval.dtype == cp.float32 and value.dtype == cp.complex64:
         kind = "f32_c64"
         out_dtype = cp.complex64
+    elif tval.dtype == cp.float64 and value.dtype == cp.float64:
+        kind = "f64_r64"
+        out_dtype = cp.float64
+    elif tval.dtype == cp.float64 and value.dtype == cp.complex128:
+        kind = "f64_c128"
+        out_dtype = cp.complex128
     else:
         return None
 

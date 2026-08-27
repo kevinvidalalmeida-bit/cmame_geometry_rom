@@ -58,3 +58,34 @@ def test_second_fixed_grid_solve_reuses_projection(tmp_path: Path):
     assert first_app["projection_cache_hit"] is False
     assert second_app["projection_cache_hit"] is True
     assert second_app["projection_s"] < first_app["projection_s"]
+
+
+def test_float64_sym21_projection_matches_full_projection(tmp_path: Path):
+    clear_elasticity_projection_cache()
+    n = 7
+    phase = np.zeros((n, n, n), dtype=np.uint8)
+    phase[:3] = 1
+    ori = np.zeros((n, n, n, 3), dtype=np.float64)
+    ori[..., 0] = 1.0
+    base = {
+        "input_dir": str(tmp_path),
+        "seed": 1,
+        "phase_array": phase,
+        "ori_array": ori,
+        "Em": 3.0,
+        "nu_m": 0.31,
+        "Ef_L": 17.0,
+        "Ef_T": 9.0,
+        "nu_LT": 0.23,
+        "nu_TT": 0.27,
+        "G_LT": 4.2,
+        "fft_backend": "scipy",
+        "solver_profile": "reference",
+        "solver_maxiter": 500,
+        "projection_backend": "numpy",
+        "cache_projection": False,
+    }
+    full = solve_homogenization({**base, "projection_storage": "full"})
+    packed = solve_homogenization({**base, "projection_storage": "sym21"})
+
+    np.testing.assert_allclose(packed, full, rtol=2.0e-12, atol=2.0e-12)

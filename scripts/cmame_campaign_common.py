@@ -537,7 +537,7 @@ def solve_material(
             "solver_maxiter": int(settings.get("solver_maxiter", 1000)),
             "cfield_storage": "sym21",
             "cfield_indexed": settings["solver_real_dtype"] == "float32",
-            "projection_storage": "direct" if settings["solver_real_dtype"] == "float32" else "full",
+            "projection_storage": "direct" if settings["solver_real_dtype"] == "float32" else "sym21",
             "projection_backend": "numpy" if settings["solver_real_dtype"] == "float32" else "cupy",
             "phase_array": geometry.phase,
             "ori_array": geometry.ori,

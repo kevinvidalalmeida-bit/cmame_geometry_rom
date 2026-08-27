@@ -523,6 +523,7 @@ def execute_plan(
             "geometry_id": int(row["geometry_id"]),
             "training_seed": int(row["training_seed"]),
             "validation_owner": bool(row["validation_owner"]),
+            "shared_validation_cached": bool(row["shared_validation_cached"]),
         }
         reused = bool(args.resume and completed_run(run_dir, spec, study))
         command = str(row["command"])
@@ -608,6 +609,9 @@ def prefix_timing(
             ),
             "affine_setup_wall_s": float(
                 run_summary.get("affine_setup_wall_s", 0.0)
+            ),
+            "gpu_transition_cleanup_wall_s": float(
+                run_summary.get("gpu_transition_cleanup_wall_s", 0.0)
             ),
             "prefix_reference_energy_qr_wall_s": float(recompile_wall_s),
             "prefix_validation_rom_wall_s": float(evaluation_wall_s),
