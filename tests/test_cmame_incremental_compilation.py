@@ -695,6 +695,24 @@ def test_reference_energy_qr_preserves_full_ritz_operator():
     assert metadata["energy_qr_reference_identity_spectral_error"] < 1.0e-12
 
 
+def test_mandel_rotation_matrix_matches_fourth_order_rotation():
+    axis = np.array([0.37, -0.51, 0.78], dtype=np.float64)
+    rotation = reduced.rotation_matrix_from_vector(axis)
+    transform = reduced._mandel_rotation_matrix(rotation)
+    np.testing.assert_allclose(
+        transform.T @ transform,
+        np.eye(6),
+        rtol=2.0e-14,
+        atol=2.0e-14,
+    )
+    rng = np.random.default_rng(20260922)
+    factor = rng.standard_normal((6, 6))
+    local_stiffness = factor.T @ factor + np.eye(6)
+    expected = reduced.rotate_C_mandel(local_stiffness, rotation)
+    actual = transform @ local_stiffness @ transform.T
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-14, atol=2.0e-14)
+
+
 def test_contiguous_basis_blocked_projection_preserves_subspace():
     rng = np.random.default_rng(20260904)
     shape = (6, 5, 4, 3)
@@ -1120,6 +1138,52 @@ def test_factorized_gpu_ritz_preserves_raw_affine_blocks():
     ):
         np.testing.assert_array_equal(async_block, factorized_block)
     assert asynchronous[3]["async_pinned_double_buffer"] is True
+
+    local_basis = ordered_basis.copy()
+    local_affine = reduced.affine_stress_batch_factory(
+        ordered_phase,
+        ordered_ori,
+        local_frame_snapshots=True,
+    )
+    local_transform = reduced._localize_snapshot_fields_inplace(
+        local_basis,
+        local_affine,
+    )
+    local = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=local_basis,
+        affine_stress_batch=local_affine,
+        contraction_compute_dtype="float32",
+        preserve_raw_coordinates=True,
+        factorized_ritz=True,
+        async_ritz=True,
+    )
+    np.testing.assert_allclose(local[0], actual[0], rtol=3.0e-6, atol=2.0e-5)
+    np.testing.assert_allclose(local[1], actual[1], rtol=3.0e-6, atol=3.0e-6)
+    np.testing.assert_allclose(local[2], actual[2], rtol=3.0e-13, atol=3.0e-13)
+    assert local_transform["local_frame_backend"] == "gpu_raw_kernel"
+    assert local[3]["local_frame_snapshots"] is True
+
+    gathered_affine = reduced.affine_stress_batch_factory(
+        ordered_phase,
+        ordered_ori,
+        gathered_factor_ritz=True,
+    )
+    gathered = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=ordered_basis,
+        affine_stress_batch=gathered_affine,
+        contraction_compute_dtype="float32",
+        preserve_raw_coordinates=True,
+        factorized_ritz=True,
+        async_ritz=True,
+    )
+    np.testing.assert_allclose(gathered[0], actual[0], rtol=3.0e-6, atol=2.0e-5)
+    np.testing.assert_allclose(gathered[1], actual[1], rtol=3.0e-6, atol=3.0e-6)
+    np.testing.assert_allclose(gathered[2], actual[2], rtol=3.0e-13, atol=3.0e-13)
+    assert gathered[3]["gathered_factor_ritz"] is True
 
     split = 5
     first = reduced._assemble_reduced_operators(

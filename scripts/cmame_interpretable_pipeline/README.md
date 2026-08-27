@@ -109,17 +109,27 @@ Scaling with `D = 6*Nvox`, raw snapshot count `p`, and reduced rank `r`:
 The adaptive pipeline consumes a fixed Sobol prefix, compiles the complete
 snapshot span, bounds affine-coefficient and online-query workspaces, and
 retains only the final reduced operators. Intermediate voxel solutions and
-the POD basis are not written to disk. Lower asymptotic growth would require
-truncated POD; that defines a different model and is not enabled.
+the Ritz basis are not written to disk. Lower asymptotic growth would require
+truncating or otherwise approximating the snapshot space; that defines a
+different model and is not enabled.
 
 The principal route is enabled by `reference_energy_qr`, `factorized_ritz`,
-and `async_ritz` in `campaign_config.json`. To audit the historical
-CPU-Gram/component-action compiler, disable the three dependent switches:
+`async_ritz`, and `gathered_factor_ritz` in `campaign_config.json`. For each
+voxel chunk, the implementation uploads the raw snapshots once, gathers the
+orientation-dependent exact constitutive factors once, and reuses both while
+assembling all seven affine blocks. Pinned double buffering overlaps packing
+and host-to-device transfer of the next chunk with the current GPU
+contractions. Materials are still solved and appended one at a time, so this
+route does not increase the material batch size or its VRAM footprint.
+
+To audit the historical CPU-Gram/component-action compiler, disable the four
+dependent switches:
 
 ```bash
 python scripts/cmame_interpretable_pipeline/04_sobol_pod_pipeline.py \
   --geometry-id 9 --adaptive \
-  --no-async-ritz --no-factorized-ritz --no-reference-energy-qr
+  --no-gathered-factor-ritz --no-async-ritz \
+  --no-factorized-ritz --no-reference-energy-qr
 ```
 
 Additional reproducible checks are available as:
@@ -133,11 +143,67 @@ The second command revoxelizes the unchanged continuous masters for G08, G00,
 and G09 at 3, 4, 5, and 6 voxels per micrometre using the declared Carbon Fiber
 (290 GPa)/Resin Epoxy material and the nominal `snapshot32` profile.
 
+## Fixed-prefix seed robustness without monitors
+
+The monitor-free robustness study is configured in:
+
+```text
+scripts/cmame_interpretable_pipeline/fixed_prefix_robustness_config.json
+```
+
+The default protocol uses eight independently scrambled Sobol training
+sequences, fixed-prefix checkpoints from 2 through 10 materials, all ten
+geometries, and one common 100-material affine-maximin validation design.
+Training is strictly sequential and keeps the material load batch at one. No
+FOM monitor or adaptive stopping criterion is used. The training solve order
+is the literal scrambled Sobol order; warm starts use the matching load from
+the preceding Sobol material without reordering the prefix.
+
+Launch the complete study with:
+
+```bash
+python scripts/cmame_interpretable_pipeline/11_fixed_prefix_seed_robustness.py \
+  --stage all
+```
+
+Run a smaller G03/G09 pilot before the full campaign with:
+
+```bash
+python scripts/cmame_interpretable_pipeline/11_fixed_prefix_seed_robustness.py \
+  --stage all \
+  --run-name fixed_prefix_seed_pilot \
+  --geometry-ids 3 9 \
+  --training-seeds 20260821 20261001 20261002 20261003
+```
+
+Completed geometry/seed runs are reused by default. To resume an interrupted
+campaign, execute the same command again: completed runs are reused and only
+the incompatible or incomplete run is archived and restarted. Independent
+validation truth is cached by geometry, so rebuilding a ROM does not repeat a
+completed 100-material reference design. To inspect every command without
+starting an FFT solve, add `--dry-run --stage run`. Once all runs exist, the
+analysis alone can be regenerated with `--stage analyze`.
+
+For each geometry, only the first training seed computes the 100 validation
+references. All other seed models are trained and frozen independently and
+are evaluated afterward on that common truth table. The summary directory
+contains:
+
+- `fixed_prefix_seed_summary.csv`: error and SPD statistics for every prefix.
+- `fixed_prefix_seed_timing.csv`: measured cumulative FOM, Gram/Ritz,
+  transfer, dense-freeze, evaluation, workspace, and compilation times.
+- `fixed_prefix_seed_validation.csv`: one compact row per held-out prediction.
+- `fixed_prefix_required_materials.csv`: first observed tolerance crossings
+  and explicit censoring at the largest tested prefix.
+- `fixed_prefix_robustness.png`: the four-panel seed/prefix robustness figure.
+- `fixed_prefix_protocol_manifest.json`: frozen seeds, numerical protocol,
+  hashes, sequential execution policy, and `load_batch_size=1` record.
+
 Rebenchmark the frozen ROMs without repeating any FFT solve:
 
 ```bash
 python scripts/cmame_interpretable_pipeline/09_rom_backend_benchmark.py \
-  --summary-dir results/cmame_method/interpretable_vf05_25_ar5_20/runs/full_rank_f32f64_20260821_summary
+  --summary-dir results/cmame_method/interpretable_vf05_25_ar5_20/runs/full_span_gathered_20260823_summary
 ```
 
 This writes CPU isolated-query and CuPy/CUDA batch measurements to
@@ -153,9 +219,8 @@ solve:
 ```bash
 python scripts/cmame_interpretable_pipeline/06_surrogate_baselines.py \
   --runs-root results/cmame_method/interpretable_vf05_25_ar5_20/runs \
-  --base-run-name full_rank_f32f64_20260821 \
-  --output-dir results/cmame_method/interpretable_vf05_25_ar5_20/runs/full_rank_f32f64_20260821_summary \
-  --tau-G 1e-15 \
+  --base-run-name full_span_gathered_20260823 \
+  --output-dir results/cmame_method/interpretable_vf05_25_ar5_20/runs/full_span_gathered_20260823_summary \
   --paper-figure-dir paper/figures \
   --jobs 4
 ```

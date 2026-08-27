@@ -86,11 +86,10 @@ def _adaptive_validation(summary_dir: Path, figure_dir: Path) -> None:
         va="bottom",
     )
 
-    for suffix in ("pdf", "png"):
-        fig.savefig(
-            figure_dir / f"numerical_adaptive_validation.{suffix}",
-            dpi=300,
-        )
+    fig.savefig(
+        figure_dir / "numerical_adaptive_validation.png",
+        dpi=300,
+    )
     plt.close(fig)
 
 
@@ -139,11 +138,10 @@ def _performance_scaling(summary_dir: Path, figure_dir: Path) -> None:
     axes[1].grid(True, linewidth=0.35, alpha=0.45)
     axes[1].text(0.02, 0.96, "(b)", transform=axes[1].transAxes, va="top")
 
-    for suffix in ("pdf", "png"):
-        fig.savefig(
-            figure_dir / f"numerical_performance_scaling.{suffix}",
-            dpi=300,
-        )
+    fig.savefig(
+        figure_dir / "numerical_performance_scaling.png",
+        dpi=300,
+    )
     plt.close(fig)
 
 

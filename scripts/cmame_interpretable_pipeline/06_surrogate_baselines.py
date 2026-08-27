@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the frozen Sobol--POD ROM with data-only surrogate baselines."""
+"""Compare the frozen Sobol--Ritz ROM with data-only surrogate baselines."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ import rom_reduced_operator as reduced
 
 TRIANGLE = np.triu_indices(6)
 METHOD_LABELS = {
-    "sobol_pod": "Sobol--POD Ritz",
+    "sobol_pod": "Sobol--Ritz",
     "rbf_cv": "RBF (LOOCV)",
     "kriging_selected": "Kriging (LML)",
 }
@@ -497,13 +497,29 @@ def prefix_rom_prediction(
 ) -> tuple[np.ndarray, int, float]:
     raw_columns = 6 * int(training_materials)
     started = time.perf_counter()
-    Kq, Bq, _, _ = reduced._transform_raw_operators_with_rank_policy(
-        np.asarray(operators["raw_Kq"][:, :raw_columns, :raw_columns]),
-        np.asarray(operators["raw_Bq"][:, :raw_columns]),
-        np.asarray(operators["G"][:raw_columns, :raw_columns]),
-        allow_rank_reveal=True,
-        rank_rtol=float(tau_g),
+    raw_Kq = np.asarray(
+        operators["raw_Kq"][:, :raw_columns, :raw_columns]
     )
+    raw_Bq = np.asarray(operators["raw_Bq"][:, :raw_columns])
+    if "energy_qr_reference_coefficients" in operators:
+        energy_operators, _ = reduced._reference_energy_qr_recompile(
+            raw_Kq=raw_Kq,
+            raw_Bq=raw_Bq,
+            Dq=np.asarray(operators["Dq"]),
+            reference_coefficients=np.asarray(
+                operators["energy_qr_reference_coefficients"]
+            ),
+        )
+        Kq = energy_operators["Kq"]
+        Bq = energy_operators["Bq"]
+    else:
+        Kq, Bq, _, _ = reduced._transform_raw_operators_with_rank_policy(
+            raw_Kq,
+            raw_Bq,
+            np.asarray(operators["G"][:raw_columns, :raw_columns]),
+            allow_rank_reveal=True,
+            rank_rtol=float(tau_g),
+        )
     frame = reduced._evaluate_rom(
         results_df=validation,
         Kq=Kq,
@@ -840,7 +856,11 @@ def main() -> int:
         "geometry_ids": [int(value) for value in args.geometry_ids],
         "geometry_parallel_jobs": int(jobs),
         "minimum_prefix": int(args.minimum_prefix),
-        "tau_G": float(args.tau_G),
+        "legacy_tau_G": float(args.tau_G),
+        "rom_prefix_coordinates": (
+            "reference_energy_cholesky_qr when present; legacy Euclidean "
+            "Gram rank policy otherwise"
+        ),
         "input_coordinates": "seven affine coefficients normalized by candidate-pool coordinate ranges",
         "outputs": "21 independent upper-triangular Mandel stiffness entries standardized on each training prefix",
         "rbf": {
@@ -877,9 +897,8 @@ def main() -> int:
     if args.paper_figure_dir is not None:
         paper_dir = args.paper_figure_dir.resolve()
         paper_dir.mkdir(parents=True, exist_ok=True)
-        for suffix in ("pdf", "png"):
-            target = paper_dir / f"numerical_surrogate_sample_efficiency.{suffix}"
-            target.write_bytes(figure_path.with_suffix(f".{suffix}").read_bytes())
+        target = paper_dir / "numerical_surrogate_sample_efficiency.png"
+        target.write_bytes(figure_path.with_suffix(".png").read_bytes())
 
     print(global_summary.to_string(index=False), flush=True)
     return 0
