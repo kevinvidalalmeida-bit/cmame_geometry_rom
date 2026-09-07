@@ -3,6 +3,7 @@ This module contains operators working with Tensor from ffthompy.tensors.objects
 """
 
 import itertools
+import time
 import numpy as np
 import numpy.matlib as npmatlib
 from ffthompy.trigpol import Grid, fft_form_default
@@ -19,6 +20,7 @@ from copy import copy
 
 _CUPY_FUSED_MATVEC = True
 _CUPY_UNSCALED_FFT_PAIR = True
+_CUPY_REUSE_INVERSE_INPUT = False
 _CUPY_MATVEC21_KERNELS = {}
 _CUPY_MATVEC21_BATCH_KERNELS = {}
 _CUPY_SYM21_KERNELS = {}
@@ -32,6 +34,11 @@ def set_cupy_fused_matvec(enabled):
 def set_cupy_unscaled_fft_pair(enabled):
     global _CUPY_UNSCALED_FFT_PAIR
     _CUPY_UNSCALED_FFT_PAIR = bool(enabled)
+
+
+def set_cupy_reuse_inverse_input(enabled):
+    global _CUPY_REUSE_INVERSE_INPUT
+    _CUPY_REUSE_INVERSE_INPUT = bool(enabled)
 
 
 def _unwrap_timed(op):
@@ -290,7 +297,11 @@ def _get_cupy_sym21_kernel(kind, batched):
     if kernel is not None:
         return kernel
 
-    if kind == "f32_r32":
+    template_kind = {
+        "f64_r64": "f32_r32",
+        "f64_c128": "f32_c64",
+    }.get(kind, kind)
+    if template_kind == "f32_r32":
         code = r'''
         extern "C" __global__
         void sym21_apply(const float* __restrict__ A,
@@ -344,7 +355,7 @@ def _get_cupy_sym21_kernel(kind, batched):
             Y[5 * stride + base] = a05*x0 + a15*x1 + a25*x2 + a35*x3 + a45*x4 + a55*x5;
         }
         '''
-    elif kind == "f32_c64":
+    elif template_kind == "f32_c64":
         code = r'''
         extern "C" __global__
         void sym21_apply(const float* __restrict__ A,
@@ -421,6 +432,13 @@ def _get_cupy_sym21_kernel(kind, batched):
     else:
         return None
 
+    if kind in {"f64_r64", "f64_c128"}:
+        code = (
+            code.replace("make_float2", "make_double2")
+            .replace("float2", "double2")
+            .replace("float", "double")
+        )
+
     try:
         kernel = cp.RawKernel(code, "sym21_apply")
     except Exception:
@@ -436,14 +454,18 @@ def _sym21_cupy_fused(tval, value):
         return None
     if tval.shape[0] != 21 or value.shape[0] != 6:
         return None
-    if tval.dtype != cp.float32:
-        return None
-    if value.dtype == cp.float32:
+    if tval.dtype == cp.float32 and value.dtype == cp.float32:
         kind = "f32_r32"
         out_dtype = cp.float32
-    elif value.dtype == cp.complex64:
+    elif tval.dtype == cp.float32 and value.dtype == cp.complex64:
         kind = "f32_c64"
         out_dtype = cp.complex64
+    elif tval.dtype == cp.float64 and value.dtype == cp.float64:
+        kind = "f64_r64"
+        out_dtype = cp.float64
+    elif tval.dtype == cp.float64 and value.dtype == cp.complex128:
+        kind = "f64_c128"
+        out_dtype = cp.complex128
     else:
         return None
 
@@ -554,13 +576,13 @@ def _tensor_apply_cupy(tensor, value):
     raise NotImplementedError(f"multype '{multype}' no soportado en backend CuPy.")
 
 
-def _apply_dft_raw(dft, value):
+def _apply_dft_raw(dft, value, overwrite_x=False):
     if dft.inverse:
         if dft.fft_form == 'c':
             return icfftn_cached(value, dft._N_tuple, dft._prodN, dft._axes)
         elif dft.fft_form == 0:
             return ifftn_cached(value, dft._N_tuple, dft._prodN, dft._axes)
-        return irfftn_cached(value, dft._N_tuple, dft._axes)
+        return irfftn_cached(value, dft._N_tuple, dft._axes, overwrite_x=overwrite_x)
 
     if dft.fft_form == 'c':
         return fftnc_cached(value, dft._N_tuple, dft._prodN, dft._axes)
@@ -767,6 +789,10 @@ class Operator():
         if not (isinstance(FNraw, DFT) and isinstance(hGraw, Tensor) and isinstance(FiNraw, DFT)):
             return None
 
+        stats = getattr(self, '_component_profile', None)
+        if stats is not None:
+            return self._profile_cupy_sequence(x, Araw, FNraw, hGraw, FiNraw, stats)
+
         x_val = to_backend_array(x.val, prefer_backend='cupy')
         Ax = _tensor_apply_cupy(Araw, x_val)
         use_unscaled_pair = (
@@ -784,7 +810,34 @@ class Operator():
         if use_unscaled_pair:
             out = ifftn_unscaled_real_cached(Gx, FiNraw._N_tuple, FiNraw._axes)
         else:
-            out = _apply_dft_raw(FiNraw, Gx)
+            # Gx is a fresh operator result, never an input or stored snapshot.
+            out = _apply_dft_raw(FiNraw, Gx, overwrite_x=_CUPY_REUSE_INVERSE_INPUT)
+        return x.copy(val=out)
+
+    @staticmethod
+    def _profile_cupy_sequence(x, Araw, FNraw, hGraw, FiNraw, stats):
+        def measure(label, function, *args):
+            cupy_synchronize()
+            started = time.perf_counter()
+            result = function(*args)
+            cupy_synchronize(result)
+            stats[label]['seconds'] += time.perf_counter()-started
+            stats[label]['calls'] += 1
+            return result
+
+        value = to_backend_array(x.val, prefer_backend='cupy')
+        ax = measure('A', _tensor_apply_cupy, Araw, value)
+        unscaled = (_CUPY_UNSCALED_FFT_PAIR and FNraw.fft_form == 0
+                    and FiNraw.fft_form == 0 and not FNraw.inverse and FiNraw.inverse)
+        if unscaled:
+            fx = measure('FN', fftn_unscaled_cached, ax, FNraw._N_tuple, FNraw._axes)
+        else:
+            fx = measure('FN', _apply_dft_raw, FNraw, ax)
+        gx = measure('hG', _tensor_apply_cupy, hGraw, fx)
+        if unscaled:
+            out = measure('FiN', ifftn_unscaled_real_cached, gx, FiNraw._N_tuple, FiNraw._axes)
+        else:
+            out = measure('FiN', _apply_dft_raw, FiNraw, gx, _CUPY_REUSE_INVERSE_INPUT)
         return x.copy(val=out)
 
     def __repr__(self):

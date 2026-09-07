@@ -1,0 +1,26 @@
+% Fresh run01 data. Review before replacing the manuscript table and figures.
+\begin{table}[t]
+\centering
+\caption{Adaptive Sobol--Ritz construction and independent held-out validation in the fresh G00--G09 run. Relative errors are reported in percent. Construction time includes training FOM, five monitor FOM, assembly, and freezing; it excludes held-out validation and ROM timing.}
+\label{tab:adaptive_accuracy_run01}
+\small
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}lrrrrrrrr@{}}
+\toprule
+& \multicolumn{3}{c}{Adaptive construction} & \multicolumn{2}{c}{Held-out accuracy} & \multicolumn{2}{c}{Stability} & Time \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}
+Microstructure & \(N_s\) & \(r\) & \(e_M^{(N_s)}\) [\%] & Mean [\%] & Max. [\%] & \(\min\lambda_{\min}(K_r)\) & \(\min\lambda_{\min}(C_r)\) & Offline [s] \\
+\midrule
+G00 & 11 & 66 & 0.00962 & 0.02373 & 0.09871 & 0.326 & 1.656 & 30.103 \\
+G01 & 6 & 36 & 0.00906 & 0.01829 & 0.05248 & 0.332 & 1.048 & 18.064 \\
+G02 & 15 & 90 & 0.00952 & 0.02437 & 0.10317 & 0.327 & 2.335 & 40.555 \\
+G03 & 11 & 66 & 0.00808 & 0.01648 & 0.06047 & 0.325 & 1.323 & 3.872 \\
+G04 & 12 & 72 & 0.00909 & 0.02095 & 0.07929 & 0.327 & 1.773 & 119.326 \\
+G05 & 11 & 66 & 0.00977 & 0.02434 & 0.10458 & 0.325 & 1.202 & 29.965 \\
+G06 & 11 & 66 & 0.00921 & 0.02597 & 0.10833 & 0.326 & 1.137 & 30.033 \\
+G07 & 12 & 72 & 0.00801 & 0.01873 & 0.07006 & 0.326 & 1.342 & 32.692 \\
+G08 & 6 & 36 & 0.00921 & 0.01786 & 0.07948 & 0.329 & 0.931 & 2.076 \\
+G09 & 16 & 96 & 0.00975 & 0.02615 & 0.13216 & 0.327 & 2.659 & 159.137 \\
+\bottomrule
+\end{tabular}
+\end{table}

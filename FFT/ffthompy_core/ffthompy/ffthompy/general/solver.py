@@ -614,6 +614,23 @@ def CG(Afun, B, x0, par=None, callback=None):
     cupy_fused_cg_updates = bool(par.get('cupy_fused_cg_updates', False))
     cupy_fused_xr_rr = bool(par.get('cupy_fused_xr_rr', False))
     cupy_fused_dot = bool(par.get('cupy_fused_dot', False))
+    reduction = None
+    if 'cupy_reference_eta' in par:
+        from ffthompy.general.cupy_reference_metric import ReferenceMetricReduction
+        if 'scal' in par:
+            raise ValueError('Reference energy metric cannot replace a custom scalar product.')
+        reduction = ReferenceMetricReduction(B, float(par['cupy_reference_eta']))
+        scal = reduction.dot
+        cupy_fused_dot = False
+        cupy_fused_xr_rr = False
+    elif bool(par.get('cupy_stable_reductions', False)):
+        from ffthompy.general.cupy_cg_reduction import CupyCGReduction
+        if CupyCGReduction.supports(B, par):
+            reduction = CupyCGReduction(B)
+            scal = reduction.dot
+            # The tree reductions replace the legacy atomic reductions.
+            cupy_fused_dot = False
+            cupy_fused_xr_rr = False
     direct_tensor_updates = (
         use_lazy_scalars or
         (cupy_fused_cg_updates and isinstance(B, Tensor) and is_cupy_array(B.val))
@@ -679,7 +696,7 @@ def CG(Afun, B, x0, par=None, callback=None):
         if cg_profile is not None:
             cupy_synchronize()
             profile_t0 = time.perf_counter()
-        rrnext_fused = _try_cupy_update_xr_rr(
+        rrnext_fused = reduction.update_xr_rr(xCG, alp, P, R, AP) if reduction else _try_cupy_update_xr_rr(
             xCG,
             alp,
             P,
@@ -741,6 +758,14 @@ def CG(Afun, B, x0, par=None, callback=None):
     res['norm_res'] = _sqrt_scalar_to_float(rr)
     res['norm_res_log'] = [float(value) for value in norm_res_log]
     _finalize_cg_info(res, rhs_norm, threshold, par['maxiter'])
+    if bool(par.get('check_true_residual', False)):
+        # Diagnostic audit: independently apply the operator to the final x.
+        # Do not conflate recursive convergence with this extra measurement.
+        true_residual = B - Afun(xCG)
+        true_norm = _sqrt_scalar_to_float(scal(true_residual, true_residual))
+        res['true_norm_res'] = float(true_norm)
+        res['true_norm_res_rel'] = float(true_norm / max(rhs_norm, np.finfo(float).tiny))
+        res['true_residual_converged'] = bool(np.isfinite(true_norm) and true_norm <= threshold)
     if cg_profile is not None:
         res['cg_profile'] = cg_profile
     return xCG, res

@@ -15,6 +15,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--summary-dir", type=Path, required=True)
     parser.add_argument("--paper-figure-dir", type=Path, required=True)
+    parser.add_argument(
+        "--adaptive-validation-only",
+        action="store_true",
+        help="Generate only the validation figure from the frozen campaign summary.",
+    )
     return parser
 
 
@@ -86,11 +91,10 @@ def _adaptive_validation(summary_dir: Path, figure_dir: Path) -> None:
         va="bottom",
     )
 
-    for suffix in ("pdf", "png"):
-        fig.savefig(
-            figure_dir / f"numerical_adaptive_validation.{suffix}",
-            dpi=300,
-        )
+    fig.savefig(
+        figure_dir / "numerical_adaptive_validation.png",
+        dpi=300,
+    )
     plt.close(fig)
 
 
@@ -139,11 +143,10 @@ def _performance_scaling(summary_dir: Path, figure_dir: Path) -> None:
     axes[1].grid(True, linewidth=0.35, alpha=0.45)
     axes[1].text(0.02, 0.96, "(b)", transform=axes[1].transAxes, va="top")
 
-    for suffix in ("pdf", "png"):
-        fig.savefig(
-            figure_dir / f"numerical_performance_scaling.{suffix}",
-            dpi=300,
-        )
+    fig.savefig(
+        figure_dir / "numerical_performance_scaling.png",
+        dpi=300,
+    )
     plt.close(fig)
 
 
@@ -154,7 +157,8 @@ def main() -> None:
     figure_dir.mkdir(parents=True, exist_ok=True)
 
     _adaptive_validation(summary_dir, figure_dir)
-    _performance_scaling(summary_dir, figure_dir)
+    if not args.adaptive_validation_only:
+        _performance_scaling(summary_dir, figure_dir)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run fixed or explicitly adaptive Sobol + full-rank POD validation."""
+"""Run fixed or explicitly adaptive Sobol + full-span Ritz validation."""
 
 from __future__ import annotations
 
@@ -46,6 +46,9 @@ if str(SCRIPTS) not in sys.path:
 import cmame_campaign_common as common
 import rom_reduced_operator as reduced
 import rom_validation_utils as validate
+from constitutive_neighbors import nearest_constitutive_snapshot
+from constitutive_sampling import constitutive_maximin_indices
+from pod_baseline import select_all_ranks
 
 
 DEFAULT_OUT_ROOT = ROOT / "results" / "cmame_method" / "interpretable_vf05_25_ar5_20"
@@ -76,6 +79,46 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
         json.dumps(jsonable(payload), indent=2, sort_keys=True),
         encoding="utf-8",
     )
+
+
+def release_gpu_transition_memory(runtime: dict[str, Any]) -> dict[str, Any]:
+    """Release temporary Ritz allocations before high-precision FFT solves."""
+    started = time.perf_counter()
+    metadata: dict[str, Any] = {
+        "requested": True,
+        "device_free_bytes_before": None,
+        "device_free_bytes_after": None,
+        "pool_total_bytes_before": None,
+        "pool_total_bytes_after": None,
+    }
+    try:
+        import cupy as cp
+
+        cp.cuda.get_current_stream().synchronize()
+        free_before, _ = cp.cuda.runtime.memGetInfo()
+        metadata["device_free_bytes_before"] = int(free_before)
+        metadata["pool_total_bytes_before"] = int(
+            cp.get_default_memory_pool().total_bytes()
+        )
+    except Exception as exc:
+        metadata["snapshot_error_before"] = f"{type(exc).__name__}: {exc}"
+
+    gc.collect()
+    runtime["sobol_gpu"].free_gpu_memory_pool(clear_fft_cache=True)
+    try:
+        import cupy as cp
+
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+        cp.cuda.get_current_stream().synchronize()
+        free_after, _ = cp.cuda.runtime.memGetInfo()
+        metadata["device_free_bytes_after"] = int(free_after)
+        metadata["pool_total_bytes_after"] = int(
+            cp.get_default_memory_pool().total_bytes()
+        )
+    except Exception as exc:
+        metadata["snapshot_error_after"] = f"{type(exc).__name__}: {exc}"
+    metadata["wall_s"] = float(time.perf_counter() - started)
+    return metadata
 
 
 @contextmanager
@@ -248,6 +291,19 @@ def affine_maximin_sequence(candidates: pd.DataFrame, count: int) -> pd.DataFram
     return result
 
 
+def constitutive_maximin_sequence(candidates: pd.DataFrame, count: int) -> pd.DataFrame:
+    gamma = np.stack([reduced._material_coefficients(row) for row in candidates.to_dict(orient='records')])
+    phases = np.stack([
+        np.einsum('nq,qij->nij', gamma[:,:2], reduced._isotropic_bases()),
+        np.einsum('nq,qij->nij', gamma[:,2:], reduced._fiber_local_bases_axis0()),
+    ], axis=1)
+    selected, radii = constitutive_maximin_indices(phases, count)
+    result = candidates.iloc[selected].copy().reset_index(drop=True)
+    result.insert(0, 'design_pool_position', selected)
+    result['constitutive_cover_radius'] = radii
+    return result
+
+
 def maximin_validation_pool(
     *, pool_count: int, count: int, seed: int
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -300,11 +356,15 @@ def append_sobol_batch(
     preserve_raw_coordinates: bool = False,
     factorized_ritz: bool = False,
     async_ritz: bool = False,
+    inverse_voxel_order: np.ndarray | None = None,
+    nearest_warm_start: bool = False,
 ) -> tuple[
     list[dict[str, Any]], dict[str, np.ndarray] | None, np.ndarray | None
 ]:
     if not candidate_ids:
         return [], operators, initial_solution_fields
+    if nearest_warm_start and len(candidate_ids) != 1:
+        raise ValueError('Nearest snapshot initialization appends one material at a time.')
     started = time.perf_counter()
     nvox = int(voxel_order.size)
     ordered_fields = np.empty(
@@ -315,6 +375,27 @@ def append_sobol_batch(
     next_initial_fields = np.empty((6, 6, nvox), dtype=basis.dtype)
     for material_index, candidate_id in enumerate(candidate_ids):
         offset = 6 * material_index
+        warm_metadata: dict[str, Any] = {}
+        nearest_started = time.perf_counter()
+        if nearest_warm_start:
+            material = candidates.loc[candidates['candidate_id'] == candidate_id].iloc[0]
+            coefficients = reduced._material_coefficients(material.to_dict())
+            current_phases = (
+                np.einsum('q,qij->ij', coefficients[:2], reduced._isotropic_bases()),
+                np.einsum('q,qij->ij', coefficients[2:], reduced._fiber_local_bases_axis0()),
+            )
+            history = runtime.setdefault('snapshot_constitutive_history', [])
+            source, distance = nearest_constitutive_snapshot(current_phases, history)
+            if source is not None and source != len(history)-1:
+                if inverse_voxel_order is None:
+                    raise ValueError('Nearest snapshot warm starts require the inverse voxel permutation.')
+                np.take(basis.active_fields[6 * source:6 * source + 6], inverse_voxel_order,
+                        axis=2, out=next_initial_fields, mode='clip')
+                initial_solution_fields = next_initial_fields
+            warm_metadata.update(nearest_warm_start_source=source,
+                                 nearest_warm_start_spectral_distance=distance)
+            history.append(current_phases)
+        warm_metadata['nearest_warm_start_wall_s'] = time.perf_counter()-nearest_started
 
         def consume_field(load_id: int, field: np.ndarray) -> None:
             field_view = np.asarray(field).reshape(6, nvox)
@@ -324,6 +405,7 @@ def append_sobol_batch(
                 voxel_order,
                 axis=1,
                 out=ordered_fields[offset + int(load_id)],
+                mode='clip',  # voxel_order is an internally constructed permutation.
             )
 
         with quiet_solver_output(bool(quiet_solver)):
@@ -339,11 +421,14 @@ def append_sobol_batch(
                 solution_field_dtype=basis.dtype,
                 solution_field_consumer=consume_field,
                 initial_solution_fields=initial_solution_fields,
+                project_initial_solution_fields=False,
             )
+        record.update(warm_metadata)
         initial_solution_fields = next_initial_fields
         if cleanup_snapshot_fields:
             shutil.rmtree(common.snapshot_dir(run_dir, candidate_id), ignore_errors=True)
         records.append(record)
+
 
     rank_before = len(basis)
     basis_started = time.perf_counter()
@@ -1055,8 +1140,27 @@ def select_energy_pod_baseline(
     operators: dict[str, np.ndarray],
     retentions: list[float],
     target_error: float,
+    all_ranks: bool = False,
+    metric: str = "l2",
+    rank_rtol: float = 1.0e-15,
 ) -> tuple[pd.DataFrame, dict[str, np.ndarray] | None]:
     """Select conventional POD rank using only the independent monitor set."""
+    if all_ranks:
+        if metric == "reference-energy":
+            gram = np.einsum('q,qij->ij',
+                             operators['energy_qr_reference_coefficients'],
+                             operators['raw_Kq'])
+        elif metric == "l2":
+            gram = operators['G']
+        else:
+            raise ValueError(f"Unknown POD metric: {metric}")
+        rows, selected, metadata = select_all_ranks(
+            raw_k=operators['raw_Kq'], raw_b=operators['raw_Bq'],
+            dq=operators['Dq'], gram=gram, monitors=monitor_truth,
+            target_error=target_error, rank_rtol=rank_rtol,
+        )
+        rows.attrs['pod_metadata'] = {**metadata, 'metric': metric}
+        return rows, selected
     required = {"raw_Kq", "raw_Bq", "G", "Dq"}
     missing = sorted(required.difference(operators))
     if missing:
@@ -1297,7 +1401,7 @@ def write_plot(curve: pd.DataFrame, path: Path, target_error: float) -> None:
             linewidth=1.0,
             label=f"{percent_scale * target_error:g}% target",
         )
-        ax.set_xlabel("Sobol training materials used for full-rank POD")
+        ax.set_xlabel("Sobol training materials used for full-span Ritz")
         ax.set_ylabel("Relative Frobenius error on FFT monitor set (%)")
         ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}%"))
         ax.grid(True, which="both", alpha=0.25)
@@ -1330,6 +1434,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-materials", type=int, default=int(pipeline.get("start_materials", 2)))
     parser.add_argument(
+        "--record-fixed-prefixes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "In fixed mode, incrementally assemble and record every prefix "
+            "from --fixed-prefix-start through --training-limit."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-prefix-start",
+        type=int,
+        default=2,
+        help="First fixed Sobol prefix recorded by --record-fixed-prefixes.",
+    )
+    parser.add_argument(
         "--training-limit",
         type=int,
         default=None,
@@ -1354,7 +1473,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-seed", type=int, default=int(pipeline.get("candidate_seed", 20260821)))
     parser.add_argument(
         "--selection-policy",
-        choices=("sobol-prefix", "affine-maximin"),
+        choices=("sobol-prefix", "affine-maximin", "constitutive-maximin"),
         default="sobol-prefix",
         help="Choose a Sobol prefix or a maximin subset in affine operator space.",
     )
@@ -1369,6 +1488,32 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rom-chunk-size", type=int, default=int(pipeline.get("rom_chunk_size", 10000)))
     parser.add_argument("--training-profile", choices=tuple(common.SOLVER_PROFILES), default=str(pipeline.get("training_profile", "snapshot")))
+    parser.add_argument(
+        "--fft-reuse-inverse-input", action=argparse.BooleanOptionalAction,
+        default=bool(pipeline.get("fft_reuse_inverse_input", False)),
+        help="Allow C2R to overwrite its disposable projected Fourier buffer.",
+    )
+    parser.add_argument(
+        "--fft-matrix-reference", action=argparse.BooleanOptionalAction,
+        default=bool(pipeline.get("fft_matrix_reference", False)),
+        help="Use the matrix-phase isotropic reference energy in GPU CG, with an original residual audit.",
+    )
+    parser.add_argument(
+        "--nearest-warm-start", action=argparse.BooleanOptionalAction,
+        default=bool(pipeline.get("nearest_warm_start", False)),
+        help="Initialize FFT from the previous snapshot with the closest phasewise spectral metric.",
+    )
+    parser.add_argument(
+        "--fft-compile-geometry", action=argparse.BooleanOptionalAction,
+        default=bool(pipeline.get("fft_compile_geometry", False)),
+        help="Compile immutable constitutive orientation groups once per geometry.",
+    )
+    parser.add_argument(
+        "--fft-stable-reductions",
+        action=argparse.BooleanOptionalAction,
+        default=bool(pipeline.get("fft_stable_reductions", False)),
+        help="Fuse real-space float32 GPU CG updates and use fixed-tree float64 reductions.",
+    )
     parser.add_argument("--monitor-profile", choices=tuple(common.SOLVER_PROFILES), default=str(pipeline.get("monitor_profile", "snapshot")))
     parser.add_argument("--validation-profile", choices=tuple(common.SOLVER_PROFILES), default=str(pipeline.get("validation_profile", "reference")))
     parser.add_argument("--timing-profile", choices=tuple(common.SOLVER_PROFILES), default=str(pipeline.get("timing_profile", "timing")))
@@ -1418,6 +1563,10 @@ def parse_args() -> argparse.Namespace:
             )
         ],
     )
+    parser.add_argument("--energy-pod-all-ranks", action="store_true",
+                        help="Evaluate every numerical POD rank, diagonalizing only once.")
+    parser.add_argument("--energy-pod-metric", choices=("l2", "reference-energy"),
+                        default="l2", help="Fixed snapshot inner product for the POD baseline.")
     parser.add_argument("--target-error", type=float, default=float(pipeline.get("target_error", 1.0e-4)))
     parser.add_argument("--basis-tolerance", type=float, default=float(pipeline.get("basis_tolerance", 1.0e-12)))
     parser.add_argument(
@@ -1436,6 +1585,17 @@ def parse_args() -> argparse.Namespace:
         choices=("float32", "float64"),
         default=str(pipeline.get("ritz_contraction_dtype", "float32")),
         help="CUDA compute precision for affine Ritz contractions.",
+    )
+    parser.add_argument(
+        "--final-ritz-recompute-dtype",
+        choices=("none", "float64"),
+        default=str(pipeline.get("final_ritz_recompute_dtype", "none")),
+        help=(
+            "Optionally reassemble the frozen raw Ritz blocks once at higher "
+            "precision before reference-energy QR. It performs no FOM solve "
+            "and uses synchronous contractions to keep storage and compute "
+            "precisions consistent."
+        ),
     )
     parser.add_argument(
         "--ritz-gram-compute-dtype",
@@ -1462,21 +1622,6 @@ def parse_args() -> argparse.Namespace:
         help="Overlap CPU Gram products with GPU affine Ritz contractions.",
     )
     parser.add_argument(
-        "--experimental-qr-audit",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Recompile the frozen full snapshot span with blocked Householder "
-            "TSQR for an experimental POD/raw-Ritz comparison."
-        ),
-    )
-    parser.add_argument(
-        "--experimental-qr-block-max-gib",
-        type=float,
-        default=2.0,
-        help="Host temporary-memory cap for each experimental TSQR block.",
-    )
-    parser.add_argument(
         "--reference-energy-qr",
         action=argparse.BooleanOptionalAction,
         default=bool(pipeline.get("reference_energy_qr", True)),
@@ -1501,6 +1646,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Overlap pinned host-to-device snapshot transfers with exact "
             "factorized GPU contractions using two CUDA buffers."
+        ),
+    )
+    parser.add_argument(
+        "--gathered-factor-ritz",
+        action=argparse.BooleanOptionalAction,
+        default=bool(pipeline.get("gathered_factor_ritz", True)),
+        help=(
+            "Gather orientation-dependent spectral factors per voxel and use "
+            "large CUDA contractions without changing snapshot coordinates."
         ),
     )
     parser.add_argument(
@@ -1581,6 +1735,10 @@ def main() -> int:
     try:
         if int(args.start_materials) < 1:
             raise ValueError("start_materials must be positive.")
+        if int(args.fixed_prefix_start) < 1:
+            raise ValueError("fixed_prefix_start must be positive.")
+        if bool(args.record_fixed_prefixes) and bool(args.adaptive):
+            raise ValueError("record_fixed_prefixes is available only in fixed mode.")
         if int(args.final_validation_count) < 1:
             raise ValueError("final_validation_count must be positive.")
         if int(args.final_validation_pool_count) < int(args.final_validation_count):
@@ -1607,38 +1765,53 @@ def main() -> int:
             or float(args.ritz_gram_rank_rtol) <= 0.0
         ):
             raise ValueError("ritz_gram_rank_rtol must be finite and positive.")
-        if (
-            not np.isfinite(float(args.experimental_qr_block_max_gib))
-            or float(args.experimental_qr_block_max_gib) <= 0.0
-        ):
-            raise ValueError(
-                "experimental_qr_block_max_gib must be finite and positive."
-            )
         if bool(args.reference_energy_qr):
             if str(args.full_rank_basis_mode) != "raw-ritz":
                 raise ValueError(
                     "reference_energy_qr requires full_rank_basis_mode=raw-ritz."
                 )
-            if bool(args.experimental_qr_audit):
+            if bool(args.overlap_cpu_gram_gpu):
                 raise ValueError(
-                    "Householder TSQR and reference-energy QR are separate experiments."
+                    "reference_energy_qr does not form a CPU snapshot Gram; "
+                    "disable overlap_cpu_gram_gpu and use async_ritz for "
+                    "CPU/GPU chunk overlap."
                 )
-            if bool(args.energy_pod_baseline) or bool(args.tau_sensitivity):
+            if (bool(args.energy_pod_baseline) and args.energy_pod_metric == "l2") or bool(args.tau_sensitivity):
                 raise ValueError(
                     "Energy-POD and tau sensitivity require the snapshot Gram; "
                     "disable them for reference_energy_qr."
                 )
+        if args.energy_pod_metric == "reference-energy" and bool(args.energy_pod_baseline):
+            if not bool(args.reference_energy_qr) or not bool(args.energy_pod_all_ranks):
+                raise ValueError("Reference-energy POD requires reference_energy_qr and energy_pod_all_ranks.")
+        if bool(args.nearest_warm_start) and (
+            str(args.full_rank_basis_mode) != 'raw-ritz'
+        ):
+            raise ValueError('Snapshot warm starts require raw snapshots in the global frame.')
         if bool(args.factorized_ritz) and not bool(
             args.reference_energy_qr
         ):
             raise ValueError(
                 "factorized_ritz requires reference_energy_qr."
             )
+        if str(args.final_ritz_recompute_dtype) != "none" and not (
+            bool(args.reference_energy_qr) and bool(args.factorized_ritz)
+        ):
+            raise ValueError(
+                "final_ritz_recompute_dtype requires the reference-energy, "
+                "factorized Ritz route."
+            )
         if bool(args.async_ritz) and not bool(
             args.factorized_ritz
         ):
             raise ValueError(
                 "async_ritz requires factorized_ritz."
+            )
+        if bool(args.gathered_factor_ritz) and not bool(
+            args.factorized_ritz
+        ):
+            raise ValueError(
+                "gathered_factor_ritz requires factorized_ritz."
             )
         if int(args.candidate_seed) == int(args.final_validation_seed):
             raise ValueError(
@@ -1707,7 +1880,14 @@ def main() -> int:
             reduced._material_coefficients_batch(candidate_parameters), axis=0
         )
 
+        auxiliary_geometry_bytes = 0
+        if bool(args.nearest_warm_start):
+            auxiliary_geometry_bytes += geometry.phase.size * np.dtype(np.intp).itemsize
+        if bool(args.fft_compile_geometry) and str(args.fft_backend) == 'gpu':
+            # Conservative bound: every fiber voxel could have its own rotation.
+            auxiliary_geometry_bytes += int(np.count_nonzero(geometry.phase == 1)) * (3*4 + 8 + 9*8)
         provisional_plan = common.full_rank_memory_plan(
+            extra_geometry_bytes=auxiliary_geometry_bytes,
             nvox=int(geometry.phase.size),
             max_rank=6 * len(candidates),
             basis_dtype=str(args.basis_dtype),
@@ -1730,6 +1910,12 @@ def main() -> int:
                 f"memory-safe limit of {safe_material_limit} materials."
             )
         training_limit = requested_limit or safe_material_limit
+        if bool(args.record_fixed_prefixes) and int(args.fixed_prefix_start) > int(
+            training_limit
+        ):
+            raise ValueError(
+                "fixed_prefix_start cannot exceed the fixed training limit."
+            )
         minimum_required = (
             int(training_limit)
             if fixed_training_protocol
@@ -1741,6 +1927,7 @@ def main() -> int:
                 "are required to evaluate the stopping rule."
             )
         memory_plan = common.full_rank_memory_plan(
+            extra_geometry_bytes=auxiliary_geometry_bytes,
             nvox=int(geometry.phase.size),
             max_rank=6 * training_limit,
             basis_dtype=str(args.basis_dtype),
@@ -1756,10 +1943,14 @@ def main() -> int:
         if not pool_hash:
             pool_hash = sha256(run_dir / "candidate_pool_used.csv")
 
-        if str(args.selection_policy) == "affine-maximin":
+        selection_started = time.perf_counter()
+        if str(args.selection_policy) == "constitutive-maximin":
+            sequence = constitutive_maximin_sequence(candidates, training_limit)
+        elif str(args.selection_policy) == "affine-maximin":
             sequence = affine_maximin_sequence(candidates, training_limit)
         else:
             sequence = material_sequence(candidates, training_limit)
+        selection_wall_s = float(time.perf_counter()-selection_started)
         fixed_training_set = fixed_training_protocol or (
             int(args.start_materials) == int(training_limit)
         )
@@ -1790,6 +1981,9 @@ def main() -> int:
             fft_backend=str(args.fft_backend),
             load_batch_size=1,
         )
+        runtime["config"]["fft_stable_reductions"] = bool(args.fft_stable_reductions)
+        runtime['config']['fft_reuse_inverse_input'] = bool(args.fft_reuse_inverse_input)
+        runtime['config']['fft_matrix_reference'] = bool(args.fft_matrix_reference)
         write_json(
             run_dir / "run_manifest.json",
             {
@@ -1830,6 +2024,11 @@ def main() -> int:
                 "rom_timing_count": int(args.rom_timing_count),
                 "rom_timing_repetitions": int(args.rom_timing_repetitions),
                 "training_profile": str(args.training_profile),
+                "fft_stable_reductions": bool(args.fft_stable_reductions),
+                "fft_reuse_inverse_input": bool(args.fft_reuse_inverse_input),
+                "fft_matrix_reference": bool(args.fft_matrix_reference),
+                "nearest_warm_start": bool(args.nearest_warm_start),
+                "fft_compile_geometry": bool(args.fft_compile_geometry),
                 "monitor_profile": str(args.monitor_profile),
                 "validation_profile": str(args.validation_profile),
                 "timing_profile": str(args.timing_profile),
@@ -1840,19 +2039,21 @@ def main() -> int:
                 "basis_dtype": str(args.basis_dtype),
                 "full_rank_basis_mode": str(args.full_rank_basis_mode),
                 "ritz_contraction_dtype": str(args.ritz_contraction_dtype),
+                "final_ritz_recompute_dtype": str(
+                    args.final_ritz_recompute_dtype
+                ),
                 "ritz_gram_compute_dtype": str(args.ritz_gram_compute_dtype),
                 "ritz_gram_backend": str(args.ritz_gram_backend),
                 "ritz_gram_rank_rtol": float(args.ritz_gram_rank_rtol),
                 "overlap_cpu_gram_gpu": bool(args.overlap_cpu_gram_gpu),
-                "experimental_qr_audit": bool(args.experimental_qr_audit),
-                "experimental_qr_block_max_gib": float(
-                    args.experimental_qr_block_max_gib
-                ),
                 "reference_energy_qr": bool(args.reference_energy_qr),
                 "factorized_ritz": bool(
                     args.factorized_ritz
                 ),
                 "async_ritz": bool(args.async_ritz),
+                "gathered_factor_ritz": bool(
+                    args.gathered_factor_ritz
+                ),
                 "reference_energy_qr_reference_policy": "candidate_affine_mean",
                 "reference_energy_qr_reference_coefficients": (
                     reference_energy_qr_reference
@@ -1884,12 +2085,16 @@ def main() -> int:
                 "basis_component_layout": "mandel_component_then_voxel",
                 "affine_orientation_kernel": "grouped_blocks_with_voxelwise_fallback",
                 "ritz_contraction_kernel": (
-                    "exact_factorized_gpu_async"
-                    if bool(args.async_ritz)
+                    "exact_gathered_factorized_gpu_async"
+                    if bool(args.gathered_factor_ritz)
                     else (
-                        "exact_factorized_gpu"
-                        if bool(args.factorized_ritz)
-                        else "exact_phase_supported_component_batched"
+                        "exact_factorized_gpu_async"
+                        if bool(args.async_ritz)
+                        else (
+                            "exact_factorized_gpu"
+                            if bool(args.factorized_ritz)
+                            else "exact_phase_supported_component_batched"
+                        )
                     )
                 ),
                 "blas_thread_policy": str(args.blas_threads),
@@ -1902,6 +2107,10 @@ def main() -> int:
         )
 
         voxel_order = reduced.phase_orientation_voxel_order(geometry.phase, geometry.ori)
+        inverse_voxel_order = None
+        if bool(args.nearest_warm_start):
+            inverse_voxel_order = np.empty_like(voxel_order)
+            inverse_voxel_order[voxel_order] = np.arange(len(voxel_order))
         operator_phase = geometry.phase.reshape(-1)[voxel_order]
         operator_ori = geometry.ori.reshape(-1, 3)[voxel_order]
         basis = common.ContiguousBasis(
@@ -1915,9 +2124,15 @@ def main() -> int:
         operators: dict[str, np.ndarray] | None = None
         warm_start_fields: np.ndarray | None = None
         affine_started = time.perf_counter()
+        if bool(args.fft_compile_geometry) and str(args.fft_backend) == 'gpu':
+            from pipeline.fft_solver import compile_cfield_geometry
+            geometry.phase.setflags(write=False)
+            geometry.ori.setflags(write=False)
+            runtime['compiled_cfield_geometry'] = compile_cfield_geometry(geometry.phase, geometry.ori)
         affine = reduced.affine_stress_batch_factory(
             operator_phase,
             operator_ori,
+            gathered_factor_ritz=bool(args.gathered_factor_ritz),
         )
         affine_setup_wall_s = float(time.perf_counter() - affine_started)
         reconstruction_check = reduced.affine_constitutive_reconstruction_error(
@@ -1994,7 +2209,11 @@ def main() -> int:
                 basis_tolerance=float(args.basis_tolerance),
                 cleanup_snapshot_fields=bool(args.cleanup_snapshot_fields),
                 compile_operators=(
-                    training_materials == int(training_limit)
+                    (
+                        training_materials >= int(args.fixed_prefix_start)
+                        if bool(args.record_fixed_prefixes)
+                        else training_materials == int(training_limit)
+                    )
                     if fixed_training_protocol
                     else training_materials >= int(args.start_materials)
                 ),
@@ -2010,6 +2229,8 @@ def main() -> int:
                     args.factorized_ritz
                 ),
                 async_ritz=bool(args.async_ritz),
+                inverse_voxel_order=inverse_voxel_order,
+                nearest_warm_start=bool(args.nearest_warm_start),
             )
             snapshot_rows.extend(records)
             for record in records:
@@ -2024,7 +2245,14 @@ def main() -> int:
                     f"step={float(record['snapshot_step_wall_s']):.2f}s",
                     flush=True,
                 )
-            if fixed_training_protocol and training_materials < int(training_limit):
+            if (
+                fixed_training_protocol
+                and training_materials < int(training_limit)
+                and not (
+                    bool(args.record_fixed_prefixes)
+                    and training_materials >= int(args.fixed_prefix_start)
+                )
+            ):
                 continue
             if (
                 not fixed_training_protocol
@@ -2035,7 +2263,7 @@ def main() -> int:
                 raise RuntimeError("No reduced operators were assembled.")
 
             if fixed_training_protocol:
-                stop_materials = int(training_materials)
+                final_fixed_prefix = training_materials == int(training_limit)
                 effective_rank = int(operators["Kq"].shape[1])
                 curve_rows.append(
                     {
@@ -2058,17 +2286,20 @@ def main() -> int:
                         "monitor_error_p95": np.nan,
                         "monitor_error_max": np.nan,
                         "passes_target_max": np.nan,
-                        "stop_triggered": True,
+                        "stop_triggered": bool(final_fixed_prefix),
                         "rom_online_mean_s": np.nan,
                         "worst_monitor_id": np.nan,
                     }
                 )
                 print(
-                    f"[SOBOL-POD] fixed training complete | "
+                    f"[SOBOL-POD] fixed prefix | "
                     f"materials={training_materials} | rank={effective_rank}",
                     flush=True,
                 )
-                break
+                if final_fixed_prefix:
+                    stop_materials = int(training_materials)
+                    break
+                continue
 
             monitor_rom_started = time.perf_counter()
             frame = reduced._evaluate_rom(
@@ -2157,6 +2388,84 @@ def main() -> int:
         if operators is None:
             raise RuntimeError("Cannot freeze an empty reduced model.")
 
+        final_ritz_recompute_metadata: dict[str, Any] = {
+            "requested_dtype": str(args.final_ritz_recompute_dtype),
+            "executed": False,
+            "wall_s": 0.0,
+            "additional_fom_solves": 0,
+            "additional_full_order_fft_solves": 0,
+            "additional_voxelwise_reassembly": 0,
+        }
+        if str(args.final_ritz_recompute_dtype) != "none":
+            # The monitor route remains incremental and fast.  At freeze, the
+            # complete snapshot span is still resident, so a single exact
+            # higher-precision raw reassembly can replace the accumulated
+            # float32 blocks without another FOM solve or FFT iteration.
+            recompute_started = time.perf_counter()
+            fiber_fraction = float(np.count_nonzero(operator_phase)) / float(
+                len(operator_phase)
+            )
+            q_block_size = common.runtime_affine_q_block_size(
+                appended_fields_bytes=int(np.asarray(basis.active_fields).nbytes),
+                coefficient_count=len(reduced.COEFF_NAMES),
+                memory_max_gib=float(args.affine_stress_max_gib),
+                memory_safety_fraction=float(args.memory_safety_fraction),
+                coefficient_supports=((2, 1.0 - fiber_fraction), (5, fiber_fraction)),
+            )
+            operators, final_assembly = common._update_reduced_operators(
+                phase=operator_phase,
+                ori=operator_ori,
+                basis=basis.active_fields,
+                existing=None,
+                new_fields=basis.active_fields,
+                affine_stress_batch=affine,
+                affine_q_block_size=int(q_block_size),
+                gram_rank_reveal=True,
+                gram_rank_rtol=float(args.ritz_gram_rank_rtol),
+                contraction_compute_dtype=str(args.final_ritz_recompute_dtype),
+                gram_compute_dtype=str(args.ritz_gram_compute_dtype),
+                gram_backend=str(args.ritz_gram_backend),
+                overlap_cpu_gram_gpu=False,
+                preserve_raw_coordinates=True,
+                factorized_ritz=True,
+                async_ritz=False,
+            )
+            final_ritz_recompute_metadata.update(
+                {
+                    "executed": True,
+                    "wall_s": float(time.perf_counter() - recompute_started),
+                    "rank": int(operators["Kq"].shape[1]),
+                    "additional_voxelwise_reassembly": 1,
+                    "affine_q_block_size": int(q_block_size),
+                    "assembly": {
+                        key: final_assembly.get(key)
+                        for key in (
+                            "assembly_wall_s",
+                            "contraction_wall_s",
+                            "affine_stress_wall_s",
+                            "stress_workspace_peak_bytes",
+                            "contraction_workspace_peak_bytes",
+                            "full_volume_equivalent_passes",
+                            "gpu_affine_chunks",
+                            "cpu_affine_chunks",
+                            "gpu_affine_fallback",
+                        )
+                    },
+                }
+            )
+            write_json(
+                run_dir / "final_ritz_recompute_manifest.json",
+                final_ritz_recompute_metadata,
+            )
+            print(
+                "[SOBOL-POD] final high-precision Ritz recompile | "
+                f"dtype={args.final_ritz_recompute_dtype} | "
+                f"rank={operators['Kq'].shape[1]} | "
+                f"stage={final_ritz_recompute_metadata['wall_s']:.3f}s | "
+                "FOM=0",
+                flush=True,
+            )
+
         reference_energy_qr_metadata: dict[str, Any] = {}
         reference_energy_qr_stage_wall_s = 0.0
         reference_energy_qr_monitor_difference: dict[str, Any] | None = None
@@ -2239,118 +2548,6 @@ def main() -> int:
                 flush=True,
             )
 
-        experimental_qr_operators: dict[str, np.ndarray] | None = None
-        experimental_qr_metadata: dict[str, Any] = {}
-        experimental_qr_monitor = pd.DataFrame()
-        experimental_qr_monitor_stats: dict[str, Any] | None = None
-        experimental_qr_monitor_difference: dict[str, Any] | None = None
-        experimental_qr_model_hash: str | None = None
-        experimental_qr_stage_wall_s = 0.0
-        if bool(args.experimental_qr_audit):
-            required_raw = {"raw_Kq", "raw_Bq", "G"}
-            missing_raw = sorted(required_raw.difference(operators))
-            if missing_raw:
-                raise RuntimeError(
-                    "Experimental TSQR requires frozen raw Ritz blocks: "
-                    + ", ".join(missing_raw)
-                )
-            print(
-                f"[SOBOL-POD] experimental TSQR audit | rank={len(basis)} | "
-                f"block_cap={float(args.experimental_qr_block_max_gib):.2f} GiB",
-                flush=True,
-            )
-            qr_started = time.perf_counter()
-            rss_before_kib = int(
-                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            )
-            experimental_qr_operators, experimental_qr_metadata = (
-                reduced._experimental_tsqr_recompile(
-                    basis=basis.active_fields,
-                    raw_Kq=operators["raw_Kq"],
-                    raw_Bq=operators["raw_Bq"],
-                    Dq=operators["Dq"],
-                    G=operators["G"],
-                    nvox=int(geometry.phase.size),
-                    block_max_gib=float(args.experimental_qr_block_max_gib),
-                )
-            )
-            rss_after_kib = int(
-                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            )
-            experimental_qr_metadata.update(
-                {
-                    "experimental": True,
-                    "official_model_modified": False,
-                    "qr_peak_rss_before_kib": rss_before_kib,
-                    "qr_peak_rss_after_kib": rss_after_kib,
-                    "qr_peak_rss_increment_kib": max(
-                        0, rss_after_kib - rss_before_kib
-                    ),
-                }
-            )
-            if not monitor_truth.empty:
-                nominal_monitor = reduced._evaluate_rom(
-                    results_df=monitor_truth,
-                    Kq=operators["Kq"],
-                    Bq=operators["Bq"],
-                    Dq=operators["Dq"],
-                )
-                experimental_qr_monitor = reduced._evaluate_rom(
-                    results_df=monitor_truth,
-                    Kq=experimental_qr_operators["Kq"],
-                    Bq=experimental_qr_operators["Bq"],
-                    Dq=experimental_qr_operators["Dq"],
-                )
-                experimental_qr_monitor.insert(
-                    0, "monitor_id", monitor["monitor_id"].to_numpy(dtype=int)
-                )
-                experimental_qr_monitor.to_csv(
-                    run_dir / "experimental_qr_monitor_results.csv", index=False
-                )
-                experimental_qr_monitor_stats = error_stats(
-                    experimental_qr_monitor,
-                    id_column="monitor_id",
-                    threshold=float(args.target_error),
-                )
-                experimental_qr_monitor_difference = rom_tensor_difference_stats(
-                    nominal_monitor,
-                    experimental_qr_monitor,
-                )
-            qr_model_path = run_dir / "experimental_qr_operators.npz"
-            np.savez_compressed(
-                qr_model_path,
-                Kq=experimental_qr_operators["Kq"],
-                Bq=experimental_qr_operators["Bq"],
-                Dq=experimental_qr_operators["Dq"],
-                R=experimental_qr_operators["R"],
-                coefficient_names=np.asarray(reduced.COEFF_NAMES),
-                candidate_ids=selected["candidate_id"].to_numpy(dtype=np.int64),
-            )
-            experimental_qr_model_hash = sha256(qr_model_path)
-            experimental_qr_stage_wall_s = float(time.perf_counter() - qr_started)
-            experimental_qr_metadata["qr_audit_stage_wall_s"] = (
-                experimental_qr_stage_wall_s
-            )
-            write_json(
-                run_dir / "experimental_qr_manifest.json",
-                {
-                    "status": "experimental_audit_frozen_before_validation_design",
-                    "operators_path": str(qr_model_path),
-                    "operators_sha256": experimental_qr_model_hash,
-                    "training_materials": int(stop_materials),
-                    "rank": int(experimental_qr_operators["Kq"].shape[1]),
-                    "metadata": experimental_qr_metadata,
-                    "monitor_summary": experimental_qr_monitor_stats,
-                    "nominal_monitor_difference": experimental_qr_monitor_difference,
-                },
-            )
-            print(
-                "[SOBOL-POD] experimental TSQR complete | "
-                f"factor={float(experimental_qr_metadata['qr_factor_wall_s']):.2f}s | "
-                f"peak_tmp={int(experimental_qr_metadata['qr_estimated_peak_temporary_bytes']) / 1024**3:.2f} GiB",
-                flush=True,
-            )
-
         frozen_payload: dict[str, np.ndarray] = {
             "Kq": operators["Kq"],
             "Bq": operators["Bq"],
@@ -2383,6 +2580,7 @@ def main() -> int:
                 "training_materials": int(stop_materials),
                 "pod_rank": int(final_basis_rank),
                 "ritz_contraction_dtype": str(args.ritz_contraction_dtype),
+                "final_ritz_recompute": final_ritz_recompute_metadata,
                 "ritz_gram_compute_dtype": str(args.ritz_gram_compute_dtype),
                 "ritz_gram_backend": str(args.ritz_gram_backend),
                 "ritz_gram_rank_rtol": float(args.ritz_gram_rank_rtol),
@@ -2392,22 +2590,33 @@ def main() -> int:
                     args.factorized_ritz
                 ),
                 "async_ritz": bool(args.async_ritz),
+                "gathered_factor_ritz": bool(
+                    args.gathered_factor_ritz
+                ),
                 "reference_energy_qr_metadata": (
                     reference_energy_qr_metadata
                 ),
             },
         )
 
+        full_span_offline_ready_wall_s = time.perf_counter() - pipeline_started
+        energy_pod_stage_wall_s = 0.0
         energy_pod_summary = pd.DataFrame()
         energy_pod_operators: dict[str, np.ndarray] | None = None
         energy_pod_model_hash: str | None = None
         if bool(args.energy_pod_baseline) and not monitor_truth.empty:
+            energy_pod_started = time.perf_counter()
             energy_pod_summary, energy_pod_operators = select_energy_pod_baseline(
                 monitor_truth=monitor_truth,
                 operators=operators,
                 retentions=[float(value) for value in args.energy_pod_retentions],
                 target_error=float(args.target_error),
+                all_ranks=bool(args.energy_pod_all_ranks),
+                metric=str(args.energy_pod_metric),
+                rank_rtol=float(args.ritz_gram_rank_rtol),
             )
+            write_json(run_dir / "energy_pod_metadata.json",
+                       energy_pod_summary.attrs.get('pod_metadata', {}))
             energy_pod_summary.to_csv(
                 run_dir / "energy_pod_monitor_selection.csv", index=False
             )
@@ -2425,6 +2634,17 @@ def main() -> int:
                         ].iloc[0].to_dict(),
                     },
                 )
+            energy_pod_stage_wall_s = time.perf_counter() - energy_pod_started
+
+        offline_ready_wall_s = time.perf_counter() - pipeline_started
+        offline_peak_rss_kib = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        write_json(run_dir / "offline_ready.json", {
+            "full_span_offline_ready_wall_s": full_span_offline_ready_wall_s,
+            "pod_selection_and_export_wall_s": energy_pod_stage_wall_s,
+            "offline_ready_wall_s": offline_ready_wall_s,
+            "offline_peak_rss_kib": offline_peak_rss_kib,
+            "status": "all_models_frozen_before_final_validation_design",
+        })
 
         validation_candidates, final_validation = maximin_validation_pool(
             pool_count=int(args.final_validation_pool_count),
@@ -2446,6 +2666,10 @@ def main() -> int:
         if not monitor_rom.empty:
             monitor_rom.to_csv(run_dir / "monitor_rom_results.csv", index=False)
 
+        gpu_transition_cleanup = release_gpu_transition_memory(runtime)
+        write_json(
+            run_dir / "gpu_transition_cleanup.json", gpu_transition_cleanup
+        )
         fom_timing_results, final_validation_truth = solve_timing_and_reference_pools(
             run_dir=run_dir,
             geometry=geometry,
@@ -2492,43 +2716,6 @@ def main() -> int:
             id_column="final_validation_id",
             threshold=float(args.target_error),
         )
-        experimental_qr_validation = pd.DataFrame()
-        experimental_qr_validation_stats: dict[str, Any] | None = None
-        experimental_qr_validation_difference: dict[str, Any] | None = None
-        if experimental_qr_operators is not None:
-            experimental_qr_validation = reduced._evaluate_rom(
-                results_df=final_validation_truth,
-                Kq=experimental_qr_operators["Kq"],
-                Bq=experimental_qr_operators["Bq"],
-                Dq=experimental_qr_operators["Dq"],
-            )
-            experimental_qr_validation.insert(
-                0,
-                "final_validation_id",
-                final_validation["final_validation_id"].to_numpy(dtype=int),
-            )
-            experimental_qr_validation.to_csv(
-                run_dir / "experimental_qr_final_validation.csv", index=False
-            )
-            experimental_qr_validation_stats = error_stats(
-                experimental_qr_validation,
-                id_column="final_validation_id",
-                threshold=float(args.target_error),
-            )
-            experimental_qr_validation_difference = rom_tensor_difference_stats(
-                final_validation_rom,
-                experimental_qr_validation,
-            )
-            write_json(
-                run_dir / "experimental_qr_validation_summary.json",
-                {
-                    "experimental_qr_summary": experimental_qr_validation_stats,
-                    "nominal_raw_ritz_summary": final_stats,
-                    "nominal_prediction_difference": (
-                        experimental_qr_validation_difference
-                    ),
-                },
-            )
         energy_pod_validation = pd.DataFrame()
         energy_pod_validation_stats: dict[str, Any] | None = None
         if energy_pod_operators is not None:
@@ -2804,10 +2991,12 @@ def main() -> int:
         ]
         compilation_wall_s = float(
             geometry_load_wall_s
+            + selection_wall_s
             + affine_setup_wall_s
             + monitor_fft_stage_wall_s
             + training_stage_wall_s
             + reference_energy_qr_stage_wall_s
+            + energy_pod_stage_wall_s
         )
         fom_material_median_s = float(fom_timing_results["solve_wall_s"].median())
         rom_material_median_s = float(rom_timing["warm_single_query_median_s"])
@@ -2827,6 +3016,7 @@ def main() -> int:
         )
         stage_rows = [
             {"stage": "geometry_load", "wall_s": geometry_load_wall_s},
+            {"stage": "material_selection", "wall_s": selection_wall_s},
             {"stage": "affine_setup", "wall_s": affine_setup_wall_s},
         ]
         if not fixed_training_protocol:
@@ -2844,12 +3034,13 @@ def main() -> int:
                     "wall_s": training_stage_wall_s,
                 },
                 {
-                    "stage": "experimental_full_span_tsqr_audit",
-                    "wall_s": experimental_qr_stage_wall_s,
-                },
-                {
                     "stage": "reference_energy_qr_freeze",
                     "wall_s": reference_energy_qr_stage_wall_s,
+                },
+                {"stage": "pod_monitor_selection_export", "wall_s": energy_pod_stage_wall_s},
+                {
+                    "stage": "gpu_transition_cleanup",
+                    "wall_s": float(gpu_transition_cleanup["wall_s"]),
                 },
                 {
                     "stage": "final_independent_fft_validation",
@@ -2883,12 +3074,6 @@ def main() -> int:
             excel_sheets["energy_POD_selection"] = energy_pod_summary
         if not energy_pod_validation.empty:
             excel_sheets["energy_POD_validation"] = energy_pod_validation
-        if not experimental_qr_monitor.empty:
-            excel_sheets["experimental_QR_monitor"] = experimental_qr_monitor
-        if not experimental_qr_validation.empty:
-            excel_sheets["experimental_QR_validation"] = (
-                experimental_qr_validation
-            )
         write_excel(run_dir / "sobol_pod_paper_tables.xlsx", excel_sheets)
 
         summary = {
@@ -2914,7 +3099,11 @@ def main() -> int:
             "nvox": int(geometry.phase.size),
             "voxel_shape": list(geometry.phase.shape),
             "selection_policy": str(args.selection_policy),
+            "selection_wall_s": selection_wall_s,
+            "candidate_seed": int(args.candidate_seed),
             "training_limit": int(training_limit),
+            "record_fixed_prefixes": bool(args.record_fixed_prefixes),
+            "fixed_prefix_start": int(args.fixed_prefix_start),
             "memory_safe_material_limit": int(safe_material_limit),
             "final_selected_materials": int(stop_materials),
             "basis_rank": final_basis_rank,
@@ -2930,6 +3119,9 @@ def main() -> int:
                 args.factorized_ritz
             ),
             "async_ritz_enabled": bool(args.async_ritz),
+            "gathered_factor_ritz_enabled": bool(
+                args.gathered_factor_ritz
+            ),
             "reference_energy_qr_reference_policy": "candidate_affine_mean",
             "reference_energy_qr_reference_coefficients": (
                 reference_energy_qr_reference
@@ -2943,23 +3135,6 @@ def main() -> int:
             "reference_energy_qr_stage_wall_s": (
                 reference_energy_qr_stage_wall_s
             ),
-            "experimental_qr_audit_enabled": bool(args.experimental_qr_audit),
-            "experimental_qr_block_max_gib": float(
-                args.experimental_qr_block_max_gib
-            ),
-            "experimental_qr_model_sha256": experimental_qr_model_hash,
-            "experimental_qr_metadata": experimental_qr_metadata,
-            "experimental_qr_monitor_summary": experimental_qr_monitor_stats,
-            "experimental_qr_monitor_nominal_difference": (
-                experimental_qr_monitor_difference
-            ),
-            "experimental_qr_validation_summary": (
-                experimental_qr_validation_stats
-            ),
-            "experimental_qr_validation_nominal_difference": (
-                experimental_qr_validation_difference
-            ),
-            "experimental_qr_stage_wall_s": experimental_qr_stage_wall_s,
             "frozen_model_sha256": frozen_model_hash,
             "snapshot_field_transport": f"in_memory_{np.dtype(args.basis_dtype).name}",
             "pod_batch_max_gib": float(args.pod_batch_max_gib),
@@ -3000,6 +3175,9 @@ def main() -> int:
                 final_stats["coverage_1e3_percent"]
             ),
             "energy_pod_baseline_enabled": bool(args.energy_pod_baseline),
+            "energy_pod_metric": str(args.energy_pod_metric),
+            "energy_pod_all_ranks": bool(args.energy_pod_all_ranks),
+            "energy_pod_stage_wall_s": energy_pod_stage_wall_s,
             "energy_pod_model_sha256": energy_pod_model_hash,
             "energy_pod_monitor_selection": (
                 None
@@ -3009,11 +3187,22 @@ def main() -> int:
             "energy_pod_final_validation_summary": energy_pod_validation_stats,
             "target_error": float(args.target_error),
             "training_profile": str(args.training_profile),
+            "fft_stable_reductions": bool(args.fft_stable_reductions),
+            "fft_reuse_inverse_input": bool(args.fft_reuse_inverse_input),
+            "fft_matrix_reference": bool(args.fft_matrix_reference),
+            "nearest_warm_start": bool(args.nearest_warm_start),
+            "fft_compile_geometry": bool(args.fft_compile_geometry),
+            "final_ritz_recompute_dtype": str(args.final_ritz_recompute_dtype),
+            "final_ritz_recompute": final_ritz_recompute_metadata,
+            "nearest_warm_start_total_wall_s": float(snapshot_timing.get('nearest_warm_start_wall_s', pd.Series(dtype=float)).sum()),
             "monitor_profile": str(args.monitor_profile),
             "validation_profile": str(args.validation_profile),
             "timing_profile": str(args.timing_profile),
             "audit_profile": str(args.audit_profile),
             "compilation_wall_s": compilation_wall_s,
+            "full_span_offline_ready_wall_s": full_span_offline_ready_wall_s,
+            "offline_ready_wall_s": offline_ready_wall_s,
+            "offline_peak_rss_kib": offline_peak_rss_kib,
             "fom_material_median_s": fom_material_median_s,
             "rom_material_median_s": rom_material_median_s,
             "hot_single_speedup": hot_single_speedup,
@@ -3055,6 +3244,10 @@ def main() -> int:
             "monitor_fft_stage_wall_s": monitor_fft_stage_wall_s,
             "monitor_rom_total_wall_s": monitor_rom_total_wall_s,
             "training_stage_wall_s": training_stage_wall_s,
+            "gpu_transition_cleanup": gpu_transition_cleanup,
+            "gpu_transition_cleanup_wall_s": float(
+                gpu_transition_cleanup["wall_s"]
+            ),
             "final_validation_fft_total_wall_s": float(
                 final_validation_truth["solve_wall_s"].sum()
             ),
@@ -3099,16 +3292,6 @@ def main() -> int:
             "energy_pod_final_validation_csv": (
                 str(run_dir / "energy_pod_final_validation.csv")
                 if not energy_pod_validation.empty
-                else None
-            ),
-            "experimental_qr_monitor_csv": (
-                str(run_dir / "experimental_qr_monitor_results.csv")
-                if not experimental_qr_monitor.empty
-                else None
-            ),
-            "experimental_qr_final_validation_csv": (
-                str(run_dir / "experimental_qr_final_validation.csv")
-                if not experimental_qr_validation.empty
                 else None
             ),
             "reference_energy_qr_monitor_csv": (

@@ -97,11 +97,11 @@ def write_convergence_figure(table: pd.DataFrame, destination: Path) -> None:
         9: "G09: AR=20, Vf=0.25",
     }
     colors = {8: "#0072B2", 0: "#009E73", 9: "#D55E00"}
-    constants = list(sweep.ENGINEERING_COLUMNS)
-    constant_colors = plt.get_cmap("tab10")(np.linspace(0.0, 0.9, len(constants)))
 
-    figure, axes = plt.subplots(2, 2, figsize=(10.2, 7.0), constrained_layout=True)
-    error_axis = axes[0, 0]
+    figure, error_axis = plt.subplots(
+        figsize=(6.2, 3.8),
+        constrained_layout=True,
+    )
     for geometry_id, group in table.groupby("geometry_id", sort=False):
         ordered = group.sort_values("resolution_vox_per_um")
         error_axis.plot(
@@ -117,44 +117,12 @@ def write_convergence_figure(table: pd.DataFrame, destination: Path) -> None:
     error_axis.set_xticks([3, 4, 5, 6])
     error_axis.grid(True, alpha=0.25)
     error_axis.legend(frameon=False, fontsize=8)
-    error_axis.set_title("(a) Effective-stiffness convergence", loc="left")
+    error_axis.set_title("Effective-stiffness convergence", loc="left")
 
-    detail_axes = [axes[0, 1], axes[1, 0], axes[1, 1]]
-    for axis, geometry_id in zip(detail_axes, (8, 0, 9), strict=True):
-        ordered = table.loc[table["geometry_id"] == geometry_id].sort_values(
-            "resolution_vox_per_um"
-        )
-        reference = ordered.loc[
-            ordered["resolution_vox_per_um"] == 6.0, constants
-        ].iloc[0]
-        for color, name in zip(constant_colors, constants, strict=True):
-            axis.plot(
-                ordered["resolution_vox_per_um"],
-                100.0 * (ordered[name] / float(reference[name]) - 1.0),
-                marker="o",
-                markersize=3.2,
-                linewidth=1.1,
-                color=color,
-                label=name,
-            )
-        axis.axhline(0.0, color="black", linewidth=0.8, alpha=0.65)
-        axis.set_xticks([3, 4, 5, 6])
-        axis.set_xlabel("Voxels per fiber diameter")
-        axis.set_ylabel("Relative change vs. resolution 6 [%]")
-        axis.grid(True, alpha=0.22)
-        panel = {8: "(b)", 0: "(c)", 9: "(d)"}[geometry_id]
-        axis.set_title(f"{panel} {labels[geometry_id]}", loc="left")
-    detail_axes[-1].legend(
-        handles=detail_axes[-1].lines[: len(constants)],
-        labels=constants,
-        frameon=False,
-        fontsize=6.5,
-        ncol=2,
-        loc="lower right",
+    figure.savefig(
+        destination / "numerical_voxel_resolution_convergence.png",
+        dpi=240,
     )
-
-    for suffix in ("pdf", "png"):
-        figure.savefig(destination / f"numerical_voxel_resolution_convergence.{suffix}", dpi=240)
     plt.close(figure)
 
 

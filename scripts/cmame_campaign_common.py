@@ -225,6 +225,7 @@ def full_rank_memory_plan(
     memory_safety_fraction: float,
     max_material_batch: int | None = None,
     available_bytes: int | None = None,
+    extra_geometry_bytes: int = 0,
 ) -> dict[str, int | float]:
     """Plan bounded workspaces and estimate the exact full-rank peak memory."""
     voxel_count = int(nvox)
@@ -248,7 +249,9 @@ def full_rank_memory_plan(
     material_snapshot_bytes = 6 * field_bytes
     stress_coefficient_bytes = 6 * field_bytes
     basis_bytes = rank * field_bytes
-    geometry_bytes = voxel_count * (np.dtype(np.uint8).itemsize + 3 * np.dtype(np.float32).itemsize)
+    if int(extra_geometry_bytes) < 0:
+        raise ValueError('extra_geometry_bytes must be non-negative.')
+    geometry_bytes = voxel_count * (np.dtype(np.uint8).itemsize + 3 * np.dtype(np.float32).itemsize) + int(extra_geometry_bytes)
     available = int(available_bytes or available_memory_bytes())
     safe_bytes = int(available * fraction)
     workspace_budget = max(0, safe_bytes - basis_bytes - geometry_bytes)
@@ -295,6 +298,7 @@ def full_rank_memory_plan(
     )
     return {
         "available_memory_bytes": available,
+        "extra_geometry_bytes": int(extra_geometry_bytes),
         "safe_memory_bytes": safe_bytes,
         "estimated_peak_bytes": estimated_peak,
         "nonbasis_peak_bytes": nonbasis_peak_bytes,
@@ -432,6 +436,9 @@ def _cached_record_is_valid(
     *,
     profile: str,
     require_fields: bool,
+    fft_stable_reductions: bool = False,
+    fft_reuse_inverse_input: bool = False,
+    fft_matrix_reference: bool = False,
 ) -> bool:
     record_path = material_dir / "solve_record.json"
     if not record_path.is_file() or not (material_dir / "Ceff.npy").is_file():
@@ -442,6 +449,12 @@ def _cached_record_is_valid(
     if not bool(record.get("solver_all_converged", False)):
         return False
     if record.get("solver_profile") != profile:
+        return False
+    if bool(record.get("fft_stable_reductions", False)) != fft_stable_reductions:
+        return False
+    if bool(record.get('fft_reuse_inverse_input', False)) != fft_reuse_inverse_input:
+        return False
+    if bool(record.get('fft_matrix_reference', False)) != fft_matrix_reference:
         return False
     settings = SOLVER_PROFILES.get(profile, {})
     if settings:
@@ -492,7 +505,11 @@ def solve_material(
     return_solution_fields: bool = False,
     solution_field_dtype: str | np.dtype | None = None,
     solution_field_consumer: Callable[[int, np.ndarray], None] | None = None,
+    stress_field_consumer: Callable[[int, np.ndarray], None] | None = None,
+    stress_field_dtype: str | np.dtype | None = None,
+    stress_field_equilibrate: bool = True,
     initial_solution_fields: Any = None,
+    project_initial_solution_fields: bool = False,
     return_solution_sensitivities: bool = False,
     solution_sensitivity_dtype: str | np.dtype | None = None,
     solution_sensitivity_consumer: Callable[[int, str, int, np.ndarray], None] | None = None,
@@ -502,6 +519,21 @@ def solve_material(
     """Solve one material or return a validated campaign-owned cache entry."""
     if profile not in SOLVER_PROFILES:
         raise ValueError(f"Perfil desconocido: {profile}")
+    fft_stable_reductions = (
+        bool(runtime["config"].get("fft_stable_reductions", False))
+        and SOLVER_PROFILES[profile]["solver_real_dtype"] == "float32"
+        and runtime["config"].get("fft_backend") == "cupy"
+    )
+    fft_reuse_inverse_input = (
+        bool(runtime['config'].get('fft_reuse_inverse_input', False))
+        and SOLVER_PROFILES[profile]['solver_real_dtype'] == 'float32'
+        and runtime['config'].get('fft_backend') == 'cupy'
+    )
+    fft_matrix_reference = (
+        bool(runtime['config'].get('fft_matrix_reference', False))
+        and SOLVER_PROFILES[profile]['solver_real_dtype'] == 'float32'
+        and runtime['config'].get('fft_backend') == 'cupy'
+    )
     in_memory_fields = return_solution_fields or solution_field_consumer is not None
     in_memory_sensitivities = (
         return_solution_sensitivities
@@ -511,8 +543,16 @@ def solve_material(
         raise ValueError("In-memory solution fields require save_solution_fields=True.")
     material_dir = Path(material_dir)
     material_dir.mkdir(parents=True, exist_ok=True)
-    if not in_memory_fields and not in_memory_sensitivities and _cached_record_is_valid(
-        material_dir, profile=profile, require_fields=save_solution_fields
+    if (
+        not in_memory_fields
+        and not in_memory_sensitivities
+        and stress_field_consumer is None
+        and _cached_record_is_valid(
+            material_dir, profile=profile, require_fields=save_solution_fields,
+            fft_stable_reductions=fft_stable_reductions,
+            fft_reuse_inverse_input=fft_reuse_inverse_input,
+            fft_matrix_reference=fft_matrix_reference,
+        )
     ):
         return json.loads((material_dir / "solve_record.json").read_text(encoding="utf-8"))
 
@@ -537,13 +577,18 @@ def solve_material(
             "solver_maxiter": int(settings.get("solver_maxiter", 1000)),
             "cfield_storage": "sym21",
             "cfield_indexed": settings["solver_real_dtype"] == "float32",
-            "projection_storage": "direct" if settings["solver_real_dtype"] == "float32" else "full",
+            "projection_storage": "direct" if settings["solver_real_dtype"] == "float32" else "sym21",
             "projection_backend": "numpy" if settings["solver_real_dtype"] == "float32" else "cupy",
             "phase_array": geometry.phase,
             "ori_array": geometry.ori,
             "preloaded_geometry": True,
             "cache_projection": bool(persistent_gpu_cache),
             "free_gpu_memory_after_solve": not bool(persistent_gpu_cache),
+            "cupy_stable_reductions": fft_stable_reductions,
+            "cupy_reuse_inverse_input": fft_reuse_inverse_input,
+            "cupy_matrix_reference": fft_matrix_reference,
+            "compiled_cfield_geometry": runtime.get('compiled_cfield_geometry')
+            if settings['solver_real_dtype'] == 'float32' else None,
         }
     )
     if return_solution_fields:
@@ -552,6 +597,11 @@ def solve_material(
     if solution_field_consumer is not None:
         params.pop("solution_field_out_path", None)
         params["solution_field_consumer"] = solution_field_consumer
+    if stress_field_consumer is not None:
+        params["stress_field_consumer"] = stress_field_consumer
+        params["stress_field_equilibrate"] = bool(stress_field_equilibrate)
+    if stress_field_dtype is not None:
+        params["stress_field_dtype"] = str(np.dtype(stress_field_dtype))
     if solution_field_dtype is not None:
         params["solution_field_dtype"] = str(np.dtype(solution_field_dtype))
     if return_solution_sensitivities:
@@ -566,6 +616,7 @@ def solve_material(
         params["solution_sensitivity_progress"] = solution_sensitivity_progress
     if initial_solution_fields is not None:
         params["initial_solution_fields"] = initial_solution_fields
+        params["project_initial_solution_fields"] = bool(project_initial_solution_fields)
     started = time.perf_counter()
     try:
         ceff = np.asarray(sobol_gpu.solve_homogenization(params), dtype=np.float64)
@@ -578,9 +629,11 @@ def solve_material(
     solve_wall_s = float(time.perf_counter() - started)
     solution_fields = params.pop("_solution_fields_result", None)
     consumed_fields = params.pop("_solution_fields_consumed", None)
+    consumed_stresses = params.pop("_stress_fields_consumed", None)
     solution_sensitivities = params.pop("_solution_sensitivities_result", None)
     consumed_sensitivities = params.pop("_solution_sensitivities_consumed", None)
     params.pop("solution_field_consumer", None)
+    params.pop("stress_field_consumer", None)
     params.pop("solution_sensitivity_consumer", None)
     np.save(material_dir / "Ceff.npy", ceff)
 
@@ -615,6 +668,10 @@ def solve_material(
                 )
         elif not _snapshot_fields_available(material_dir):
             raise RuntimeError(f"Faltan campos snapshot en {material_dir}.")
+    if stress_field_consumer is not None and consumed_stresses != tuple(range(6)):
+        raise RuntimeError(
+            f"El consumidor no recibio las seis tensiones en {material_dir}."
+        )
     if in_memory_sensitivities:
         if solution_sensitivity_consumer is not None:
             expected = {(q, load_id) for q in range(7) for load_id in range(6)}
@@ -652,14 +709,19 @@ def solve_material(
         else "",
         "solution_field_transport": solution_field_transport,
         "solution_sensitivity_transport": solution_sensitivity_transport,
+        "stress_field_transport": "memory" if stress_field_consumer is not None else "none",
         "solver_timing_path": str(timing_path),
         "solver_profile": profile,
+        "fft_stable_reductions": fft_stable_reductions,
+        "fft_reuse_inverse_input": fft_reuse_inverse_input,
+        "fft_matrix_reference": fft_matrix_reference,
         "solver_real_dtype": settings["solver_real_dtype"],
         "solver_rtol": float(settings["solver_rtol"]),
         "solver_atol": float(settings["solver_atol"]),
         "solver_maxiter": int(settings.get("solver_maxiter", 1000)),
         "persistent_gpu_cache": bool(persistent_gpu_cache),
         "warm_start_used": bool(initial_solution_fields is not None),
+        "project_initial_solution_fields": bool(project_initial_solution_fields),
         "solver_all_converged": all_converged,
         "solver_max_relative_residual": max_residual,
         "solver_max_iterations": int(load_summary.get("cg_iterations_max", -1)),
@@ -935,6 +997,7 @@ def ensure_snapshot(
     solution_field_dtype: str | np.dtype | None = None,
     solution_field_consumer: Callable[[int, np.ndarray], None] | None = None,
     initial_solution_fields: Any = None,
+    project_initial_solution_fields: bool = False,
 ) -> dict[str, Any]:
     selected = candidates.loc[candidates["candidate_id"] == int(candidate_id)]
     if len(selected) != 1:
@@ -955,6 +1018,7 @@ def ensure_snapshot(
         solution_field_dtype=solution_field_dtype,
         solution_field_consumer=solution_field_consumer,
         initial_solution_fields=initial_solution_fields,
+        project_initial_solution_fields=project_initial_solution_fields,
     )
 
 

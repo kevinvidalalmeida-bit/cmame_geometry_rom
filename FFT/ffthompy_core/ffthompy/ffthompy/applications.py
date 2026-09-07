@@ -12,6 +12,7 @@ from ffthompy.tensors.fft import (
     cp,
     cupy_synchronize,
     get_array_module,
+    get_fft_backend,
     to_backend_array,
     to_host_array,
 )
@@ -240,6 +241,12 @@ def _solver_real_dtype(pb):
 def _instrument_afun_for_profile(Afun, GN, A, stats):
     if len(getattr(GN, "mat_rev", [])) != 1 or len(GN.mat_rev[0]) != 3:
         return Afun
+    if str(get_fft_backend()) == 'cupy':
+        # Wrapping individual tensors disables Operator's native GPU fast path.
+        # Instrument the same raw operations inside that fast path instead.
+        instrumented = Operator(name=Afun.name, mat_rev=Afun.mat_rev)
+        instrumented._component_profile = stats
+        return instrumented
 
     timed_FN = TimedCallable(GN.mat_rev[0][0], "FN", stats)
     timed_hG = TimedCallable(GN.mat_rev[0][1], "hG", stats)
@@ -268,6 +275,8 @@ def _build_load_timing_payload(iL, load_wall_s, rhs_build_s, info, stats):
         "rhs_norm": float(info.get("rhs_norm", np.nan)),
         "converged": bool(info.get("converged", False)),
         "cg_profile": info.get("cg_profile", {}),
+        "true_norm_res_rel": info.get('true_norm_res_rel'),
+        "true_residual_converged": info.get('true_residual_converged'),
         "components": {
             label: {
                 "seconds": float(stats[label]["seconds"]),
@@ -305,6 +314,13 @@ def _solver_info_payload(info, load_ids):
     }
     if norm_per_rhs is not None:
         payload["final_norm_res_per_rhs"] = norm_per_rhs
+    if 'true_norm_res_rel' in info:
+        payload['true_norm_res_rel'] = info['true_norm_res_rel']
+        payload['true_residual_converged'] = info['true_residual_converged']
+    for key in ('reference_eta', 'reference_iterations', 'correction_iterations', 'reference_hit_maxiter',
+                'reference_norm_res_rel', 'reference_audit_wall_s'):
+        if key in info:
+            payload[key] = info[key]
     if rel_per_rhs is not None:
         payload["final_norm_res_rel_per_rhs"] = rel_per_rhs
     if rhs_norm_per_rhs is not None:
@@ -452,6 +468,12 @@ def solve_load_scalar(iL, dim, Nbar, Afun, pb, GN, A, add_macro2minimizer, linea
 
 
 def solve_load_elasticity(iL, D, Nbar, Afun, pb, GN, A, add_macro2minimizer, linear_solver, CallBack, CallBack_GA, fft_form='c'):
+    original_Afun = Afun
+    solver_parameters = pb.solver
+    if 'cupy_reference_eta' in pb.solver:
+        from ffthompy.general.reference_elasticity import reference_operator, reference_parameters
+        Afun = reference_operator(GN, A, float(pb.solver['cupy_reference_eta']))
+        solver_parameters = reference_parameters(pb.solver)
     real_dtype = _solver_real_dtype(pb)
     E = np.zeros(D, dtype=real_dtype)
     E[iL] = 1
@@ -474,6 +496,8 @@ def solve_load_elasticity(iL, D, Nbar, Afun, pb, GN, A, add_macro2minimizer, lin
             x0.val = cp.asarray(val)
         else:
             x0.val = val
+        if pb.solve.get('project_initial_solution_fields', False):
+            x0 = GN(x0)
     else:
         x0 = EN.zeros_like(name='x0')
     profile_enabled = _profile_enabled(pb)
@@ -492,7 +516,11 @@ def solve_load_elasticity(iL, D, Nbar, Afun, pb, GN, A, add_macro2minimizer, lin
         A_Ga=A,
     )
     load_t0 = time.perf_counter()
-    X, info = linear_solver(solver=pb.solver['kind'], Afun=Afun_local, B=B, x0=x0, par=pb.solver, callback=cb)
+    X, info = linear_solver(solver=pb.solver['kind'], Afun=Afun_local, B=B, x0=x0, par=solver_parameters, callback=cb)
+    if 'cupy_reference_eta' in pb.solver:
+        from ffthompy.general.reference_elasticity import audit_reference_solution
+        audit_Afun = _instrument_afun_for_profile(original_Afun, GN, A, timing_stats) if profile_enabled else original_Afun
+        X, info = audit_reference_solution(X, info, EN, audit_Afun, pb.solver, linear_solver)
     load_wall_s = time.perf_counter() - load_t0
     result = {'cb': cb, 'info': info}
     if profile_enabled:
@@ -842,6 +870,62 @@ def stream_primal_solution_fields_before_sensitivity(D, Nbar, pb, solutions, loa
     }
 
 
+def stream_primal_equilibrated_stresses(D, Nbar, pb, solutions, A, GN, load_ids):
+    """Emit statically admissible stresses without retaining the FOM fields.
+
+    ``GN`` is the same zero-mean compatible-strain projector used by the
+    primal Galerkin solve.  Thus ``(I-GN)sigma`` preserves the average stress
+    and is orthogonal to every compatible fluctuation in this discrete
+    formulation.  The operation is deliberately opt-in: it is intended for
+    experimental complementary reduced spaces and does not affect the primal
+    homogenized tensor.
+    """
+    consumer = pb.solve.get('stress_field_consumer', None)
+    if not callable(consumer):
+        return
+    field_dtype = np.dtype(pb.solve.get('stress_field_dtype', _solver_real_dtype(pb)))
+    if field_dtype not in {np.dtype(np.float32), np.dtype(np.float64)}:
+        raise ValueError("stress_field_dtype debe ser float32 o float64.")
+    equilibrate = bool(pb.solve.get('stress_field_equilibrate', True))
+    field_shape = tuple(int(v) for v in np.asarray(Nbar, dtype=int).tolist())
+    consumed, defects = [], []
+    for load_id in load_ids:
+        load_id = int(load_id)
+        if not hasattr(solutions[load_id], 'val'):
+            raise RuntimeError("No hay solucion primal para emitir tensiones.")
+        stress = A(solutions[load_id])
+        compatible = GN(stress)
+        stress_val = stress.val
+        compatible_val = compatible.val
+        xp = get_array_module(stress_val, compatible_val)
+        stress_norm = xp.linalg.norm(stress_val.reshape(-1))
+        compatible_norm = xp.linalg.norm(compatible_val.reshape(-1))
+        # Scalars must cross to the host for the manifest even on CUDA.
+        stress_norm_host = float(to_host_array(stress_norm))
+        compatible_norm_host = float(to_host_array(compatible_norm))
+        defects.append(
+            compatible_norm_host / max(stress_norm_host, np.finfo(float).tiny)
+        )
+        if equilibrate:
+            field = stress - compatible
+            del stress
+        else:
+            field = stress
+        host_value = to_host_array(field.val).astype(field_dtype, copy=False)
+        consumer(load_id, host_value)
+        consumed.append(load_id)
+        del field, compatible
+    pb.output['stress_fields_primal'] = {
+        'load_ids': consumed,
+        'field_shape': [int(D)] + [int(value) for value in field_shape],
+        'dtype': str(field_dtype),
+        'field': 'total Mandel stress; zero-mean compatible projection removed',
+        'equilibrated': equilibrate,
+        'compatible_projection_relative_norms': defects,
+        'streamed': True,
+    }
+
+
 def _is_free_threaded_python():
     checker = getattr(sys, '_is_gil_enabled', None)
     if checker is not None:
@@ -1183,6 +1267,11 @@ def elasticity(problem):
         ):
             stream_primal_solution_fields_before_sensitivity(
                 D, Nbar, pb, solutions, load_ids_to_solve
+            )
+
+        if primaldual == 'primal' and callable(pb.solve.get('stress_field_consumer', None)):
+            stream_primal_equilibrated_stresses(
+                D, Nbar, pb, solutions, A, GN, load_ids_to_solve
             )
 
         affine_sensitivity_summary = {}

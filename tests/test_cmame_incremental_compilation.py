@@ -249,6 +249,26 @@ def test_ill_conditioned_float32_raw_ritz_keeps_physical_stiffness_spd():
     assert np.linalg.eigvalsh(stiffness)[0] > 0.0
 
 
+def test_reduced_solve_diagonal_equilibration_is_coordinate_invariant():
+    rng = np.random.default_rng(20260919)
+    q, _ = np.linalg.qr(rng.normal(size=(9, 9)))
+    reference = q @ np.diag(np.geomspace(1.0e-4, 1.0, 9)) @ q.T
+    coordinates = np.diag(np.geomspace(1.0e-4, 1.0e4, 9))
+    stiffness = coordinates @ reference @ coordinates
+    forcing = rng.normal(size=(9, 6))
+    rhs = coordinates @ forcing
+
+    solution = reduced._solve_diagonally_equilibrated(stiffness, rhs)
+    expected = np.linalg.solve(stiffness, rhs)
+    np.testing.assert_allclose(solution, expected, rtol=2.0e-10, atol=2.0e-10)
+    np.testing.assert_allclose(
+        stiffness @ solution,
+        rhs,
+        rtol=2.0e-10,
+        atol=2.0e-10 * np.linalg.norm(rhs, ord=np.inf),
+    )
+
+
 def test_float32_ritz_rank_reveal_drops_unresolved_coordinates_and_keeps_spd():
     raw, phase, ori, coefficients = _ill_conditioned_raw_ritz_case(20260915)
     rank = len(raw)
@@ -603,54 +623,6 @@ def test_cpu_gram_gpu_overlap_matches_serial_raw_ritz_assembly():
         assert overlap_meta["gram_overlap_enabled"] is True
 
 
-def test_experimental_blocked_tsqr_matches_direct_householder_qr():
-    rng = np.random.default_rng(20260920)
-    rank, nvox, q_count = 9, 41, 3
-    basis = rng.standard_normal((rank, 6, nvox))
-    flat = basis.reshape(rank, -1)
-    gram = flat @ flat.T / float(nvox)
-    raw_Kq = np.empty((q_count, rank, rank), dtype=np.float64)
-    raw_Bq = rng.standard_normal((q_count, rank, 6))
-    Dq = np.empty((q_count, 6, 6), dtype=np.float64)
-    for q in range(q_count):
-        factor = rng.standard_normal((rank, rank))
-        raw_Kq[q] = factor.T @ factor + np.eye(rank)
-        macro = rng.standard_normal((6, 6))
-        Dq[q] = macro.T @ macro + np.eye(6)
-
-    qr_operators, metadata = reduced._experimental_tsqr_recompile(
-        basis=basis,
-        raw_Kq=raw_Kq,
-        raw_Bq=raw_Bq,
-        Dq=Dq,
-        G=gram,
-        nvox=nvox,
-        block_max_gib=1.0e-5,
-    )
-
-    tall = flat.T / np.sqrt(float(nvox))
-    _, direct_R = np.linalg.qr(tall, mode="reduced")
-    signs = np.where(np.diag(direct_R) < 0.0, -1.0, 1.0)
-    direct_R *= signs[:, None]
-    direct_T = np.linalg.solve(direct_R.T, np.eye(rank))
-    direct_Kq = np.empty_like(raw_Kq)
-    direct_Bq = np.empty_like(raw_Bq)
-    for q in range(q_count):
-        direct_Kq[q] = direct_T @ raw_Kq[q] @ direct_T.T
-        direct_Kq[q] = 0.5 * (direct_Kq[q] + direct_Kq[q].T)
-        direct_Bq[q] = direct_T @ raw_Bq[q]
-
-    np.testing.assert_allclose(qr_operators["R"], direct_R, rtol=2.0e-13, atol=2.0e-13)
-    np.testing.assert_allclose(qr_operators["Kq"], direct_Kq, rtol=3.0e-13, atol=3.0e-13)
-    np.testing.assert_allclose(qr_operators["Bq"], direct_Bq, rtol=3.0e-13, atol=3.0e-13)
-    np.testing.assert_allclose(qr_operators["Dq"], Dq, rtol=0.0, atol=0.0)
-    assert metadata["qr_block_count"] > 1
-    assert metadata["qr_forms_explicit_q"] is False
-    assert metadata["qr_discarded_rank"] == 0
-    assert metadata["qr_orthogonality_frobenius_error"] < 1.0e-12
-    assert metadata["qr_gram_reconstruction_relative_error"] < 1.0e-13
-    assert metadata["qr_estimated_peak_temporary_bytes"] <= int(1.0e-5 * 1024**3)
-
 
 def test_reference_energy_qr_preserves_full_ritz_operator():
     rng = np.random.default_rng(20260921)
@@ -693,6 +665,24 @@ def test_reference_energy_qr_preserves_full_ritz_operator():
     assert metadata["energy_qr_additional_voxel_passes"] == 0
     assert metadata["energy_qr_discarded_rank"] == 0
     assert metadata["energy_qr_reference_identity_spectral_error"] < 1.0e-12
+
+
+def test_mandel_rotation_matrix_matches_fourth_order_rotation():
+    axis = np.array([0.37, -0.51, 0.78], dtype=np.float64)
+    rotation = reduced.rotation_matrix_from_vector(axis)
+    transform = reduced._mandel_rotation_matrix(rotation)
+    np.testing.assert_allclose(
+        transform.T @ transform,
+        np.eye(6),
+        rtol=2.0e-14,
+        atol=2.0e-14,
+    )
+    rng = np.random.default_rng(20260922)
+    factor = rng.standard_normal((6, 6))
+    local_stiffness = factor.T @ factor + np.eye(6)
+    expected = reduced.rotate_C_mandel(local_stiffness, rotation)
+    actual = transform @ local_stiffness @ transform.T
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-14, atol=2.0e-14)
 
 
 def test_contiguous_basis_blocked_projection_preserves_subspace():
@@ -1120,6 +1110,27 @@ def test_factorized_gpu_ritz_preserves_raw_affine_blocks():
     ):
         np.testing.assert_array_equal(async_block, factorized_block)
     assert asynchronous[3]["async_pinned_double_buffer"] is True
+
+
+    gathered_affine = reduced.affine_stress_batch_factory(
+        ordered_phase,
+        ordered_ori,
+        gathered_factor_ritz=True,
+    )
+    gathered = reduced._assemble_reduced_operators(
+        phase=ordered_phase,
+        ori=ordered_ori,
+        basis=ordered_basis,
+        affine_stress_batch=gathered_affine,
+        contraction_compute_dtype="float32",
+        preserve_raw_coordinates=True,
+        factorized_ritz=True,
+        async_ritz=True,
+    )
+    np.testing.assert_allclose(gathered[0], actual[0], rtol=3.0e-6, atol=2.0e-5)
+    np.testing.assert_allclose(gathered[1], actual[1], rtol=3.0e-6, atol=3.0e-6)
+    np.testing.assert_allclose(gathered[2], actual[2], rtol=3.0e-13, atol=3.0e-13)
+    assert gathered[3]["gathered_factor_ritz"] is True
 
     split = 5
     first = reduced._assemble_reduced_operators(

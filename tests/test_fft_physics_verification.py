@@ -5,6 +5,7 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -274,11 +275,119 @@ def _laminate_solve(tmp_path: Path):
     return ceff, phase, fields_path, isotropic_mandel(E0, nu0), isotropic_mandel(E1, nu1)
 
 
+def test_streamed_equilibrated_stresses_preserve_average_and_equilibrium(tmp_path: Path):
+    """The complementary fields use the same discrete projector as the FOM."""
+    n = 9
+    phase = np.zeros((n, n, n), dtype=np.uint8)
+    phase[:4] = 1
+    ori = np.zeros((n, n, n, 3), dtype=np.float64)
+    ori[..., 0] = 1.0
+    stresses = {}
+    ceff = solve_homogenization(
+        {
+            "input_dir": str(tmp_path),
+            "seed": 0,
+            "phase_array": phase,
+            "ori_array": ori,
+            "Em": 3.0,
+            "nu_m": 0.31,
+            "Ef_L": 11.0,
+            "Ef_T": 11.0,
+            "nu_LT": 0.23,
+            "nu_TT": 0.23,
+            "G_LT": 11.0 / (2.0 * 1.23),
+            "fft_backend": "scipy",
+            "solver_profile": "truth",
+            "solver_maxiter": 500,
+            "stress_field_dtype": "float64",
+            "stress_field_consumer": lambda load, field: stresses.__setitem__(
+                load, field.copy()
+            ),
+        }
+    )
+    assert set(stresses) == set(range(6))
+    unit, nonzero = _frequency_unit_vectors(phase.shape)
+    for load, stress in stresses.items():
+        mean_stress = stress.mean(axis=(1, 2, 3))
+        np.testing.assert_allclose(mean_stress, ceff[:, load], rtol=0.0, atol=2e-10)
+        defect = _project_compatible(
+            stress.reshape(6, -1), shape=phase.shape, unit=unit, nonzero=nonzero
+        )
+        assert np.linalg.norm(defect) / np.linalg.norm(stress) < 2e-10
+
+
 def test_laminate_matches_exact_3d_solution(tmp_path: Path):
     ceff, _, _, C0, C1 = _laminate_solve(tmp_path)
     exact = laminate_normal_x1(C0, C1, 0.5)
     relative_error = np.linalg.norm(ceff - exact) / np.linalg.norm(exact)
     assert relative_error < 2.0e-9
+
+
+@pytest.mark.parametrize('reuse_inverse', [False, True])
+@pytest.mark.parametrize('stable_reductions', [False, True])
+@pytest.mark.parametrize('matrix_reference', [False, True])
+@pytest.mark.parametrize('keep_solution_on_device', [False, True])
+def test_gpu_fused_reductions_preserve_rotated_laminate_physics(tmp_path: Path, reuse_inverse, stable_reductions, matrix_reference, keep_solution_on_device):
+    import pytest
+    cp = pytest.importorskip('cupy')
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip('CUDA device unavailable')
+    except cp.cuda.runtime.CUDARuntimeError:
+        pytest.skip('CUDA runtime unavailable')
+    shape = (9, 7, 5)  # Odd grid avoids any Nyquist convention in the CPU audit.
+    phase = np.zeros(shape, dtype=np.uint8)
+    phase[:4] = 1
+    direction = np.array([1.0, 2.0, 3.0]) / np.sqrt(14.0)
+    ori = np.broadcast_to(direction, (*shape, 3)).copy()
+    fields = {}
+    parameters = dict(
+        input_dir=str(tmp_path), seed=0, phase_array=phase, ori_array=ori,
+        Em=3.0, nu_m=0.31, Ef_L=300.0, Ef_T=20.0, G_LT=12.0,
+        nu_LT=0.23, nu_TT=0.30, fft_backend='cupy', solver_profile='snapshot32',
+        cfield_storage='sym21', cfield_indexed=True, projection_storage='direct',
+        projection_backend='numpy', cupy_stable_reductions=stable_reductions,
+        cupy_fused_xr_rr=True, cupy_fused_dot=True,
+        keep_solution_on_device=keep_solution_on_device, postprocess_batch_size=1,
+        cupy_reuse_inverse_input=reuse_inverse,
+        cupy_matrix_reference=matrix_reference,
+        profile_timing=True, profile_cg_timing=True,
+        check_true_residual=True,
+        solver_timing_path=str(tmp_path/'timing.json'),
+        store_solution_fields=True, solution_field_dtype='float32',
+        solution_field_consumer=lambda load, field: fields.__setitem__(load, field.copy()),
+    )
+    ceff = solve_homogenization(parameters)
+    import json
+    timing = json.loads((tmp_path/'timing.json').read_text())['ffthompy_solver_timing']['primal']['aggregate']
+    for component in ('FN', 'FiN', 'hG', 'A'):
+        assert timing[f'{component}_s_sum'] > 0
+        assert timing[f'{component}_calls_sum'] > 0
+    c0 = isotropic_mandel(3.0, 0.31)
+    c1 = rotate_C_mandel(
+        voigt_to_mandel(TI_stiffness_voigt(300.0, 20.0, 0.23, 0.30, 12.0)),
+        rotation_matrix_from_vector(direction),
+    )
+    exact = laminate_normal_x1(c0, c1, 4/9)
+    assert np.linalg.norm(ceff-exact)/np.linalg.norm(exact) < 2e-6
+    unit, nonzero = _frequency_unit_vectors(shape)
+    def project(field):
+        return _project_compatible(field.reshape(6, -1), shape=shape, unit=unit, nonzero=nonzero)
+    matrix = phase == 0
+    for load, field in fields.items():
+        field = field.astype(np.float64)
+        macro = np.zeros_like(field)
+        macro[load] = 1
+        total = field + macro
+        stress = np.empty_like(total)
+        rhs_stress = np.empty_like(total)
+        for mask, stiffness in ((matrix, c0), (~matrix, c1)):
+            stress[:, mask] = stiffness @ total[:, mask]
+            rhs_stress[:, mask] = stiffness @ macro[:, mask]
+        assert np.linalg.norm(project(stress))/np.linalg.norm(project(rhs_stress)) < 3e-5
+        assert np.linalg.norm(field.reshape(6, -1)-project(field))/np.linalg.norm(field) < 3e-5
+        micro_energy = np.mean(np.sum(total*stress, axis=0))
+        assert abs(micro_energy-ceff[load, load])/abs(ceff[load, load]) < 2e-6
 
 
 def test_compatibility_equilibrium_and_hill_mandel(tmp_path: Path):
