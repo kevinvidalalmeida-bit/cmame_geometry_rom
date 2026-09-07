@@ -42,7 +42,6 @@ TIMING_SUM_COLUMNS = (
     "solve_wall_s",
     "snapshot_step_wall_s",
     "basis_update_wall_s",
-    "local_frame_transform_wall_s",
     "operator_assembly_wall_s",
     "affine_stress_wall_s",
     "ritz_contraction_wall_s",
@@ -57,7 +56,6 @@ TIMING_SUM_COLUMNS = (
 TIMING_MAX_COLUMNS = (
     "operator_stress_workspace_peak_bytes",
     "operator_contraction_workspace_peak_bytes",
-    "local_frame_workspace_peak_bytes",
     "async_pinned_bytes",
 )
 
@@ -321,7 +319,6 @@ def command_for_spec(
         "--no-energy-pod-baseline",
         "--no-structural-audit",
         "--no-tau-sensitivity",
-        "--no-experimental-qr-audit",
         "--save-operators",
         "--cleanup-snapshot-fields",
         "--no-write-plot",

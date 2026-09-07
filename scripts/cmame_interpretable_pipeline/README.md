@@ -1,3 +1,20 @@
+## Reproducible ten-geometry Sobol--Ritz campaign
+
+The production route used for the adaptive Sobol--Ritz evidence is launched
+sequentially, so the ten runs do not contend for the same GPU:
+
+```bash
+bash scripts/cmame_interpretable_pipeline/run_sobol_ritz_factorized_all.sh \
+  sobol_ritz_factorized_all_20260906
+```
+
+It uses `campaign_config.json`: 1,024 Sobol candidates, adaptive first
+crossing at `1e-4`, five independent monitors, reference-energy QR, factorized
+Ritz contractions, and the existing ten voxel geometries. It creates one run
+per geometry under `results/cmame_method/interpretable_vf05_25_ar5_20/runs/`
+and a combined campaign summary. Choose a new run name to make a fresh
+campaign; this launcher intentionally does not overwrite an existing run.
+
 # Interpretable 10-Geometry Pipeline
 
 Edit the campaign in one place:
@@ -49,6 +66,17 @@ Default choices:
   measure error. Snapshots and exact constitutive-rank contractions use
   `float32`; reduced accumulation, reference-energy QR, and online dense
   solves use `float64`. No structural audit is part of the nominal campaign.
+- FFT execution: immutable orientation groups are compiled once per geometry.
+  Snapshot transport writes directly into its existing buffers. Each new
+  training material starts from the previously solved material with the
+  smallest phasewise spectral distance `(beta-alpha)/(beta+alpha)`, where
+  `alpha` and `beta` bound the generalized eigenvalues of its two phase
+  stiffness tensors against that previous material. Common stiffness scaling
+  and common fiber rotations do not affect this selection. The Sobol order,
+  six loads, solver tolerance, monitor rule, and complete snapshot retention
+  are unchanged. Auxiliary geometry storage is included in the memory plan.
+  `--no-nearest-warm-start --no-fft-compile-geometry` restores the previous
+  initialization and constitutive assembly policies.
 - Full-span coordinates: enrichment retains raw snapshots and assembles exact
   affine Ritz blocks without a Euclidean snapshot Gram. At freeze, the mean
   candidate coefficient vector defines a coercive reference operator whose
@@ -203,12 +231,20 @@ Rebenchmark the frozen ROMs without repeating any FFT solve:
 
 ```bash
 python scripts/cmame_interpretable_pipeline/09_rom_backend_benchmark.py \
-  --summary-dir results/cmame_method/interpretable_vf05_25_ar5_20/runs/full_span_gathered_20260823_summary
+  --summary-dir results/cmame_method/interpretable_vf05_25_ar5_20/runs/sobol_ritz_factorized_all_run01_summary
 ```
 
 This writes CPU isolated-query and CuPy/CUDA batch measurements to
 `rom_backend_benchmark.csv` and records the full protocol in the companion
 JSON file.
+
+## Controlled POD/RB comparison
+
+The manuscript reports separately controlled, matched Sobol--Ritz and POD/RB
+measurements. The production launcher is limited to the validated Sobol--Ritz
+campaign; retired comparator scripts are not part of the
+reproducible workflow. The active `--energy-pod-baseline` options remain
+available for a POD diagnostic in a campaign run.
 
 ## Data-only surrogate baselines
 
@@ -219,10 +255,10 @@ solve:
 ```bash
 python scripts/cmame_interpretable_pipeline/06_surrogate_baselines.py \
   --runs-root results/cmame_method/interpretable_vf05_25_ar5_20/runs \
-  --base-run-name full_span_gathered_20260823 \
-  --output-dir results/cmame_method/interpretable_vf05_25_ar5_20/runs/full_span_gathered_20260823_summary \
+  --base-run-name sobol_ritz_factorized_all_run01 \
+  --output-dir results/cmame_method/interpretable_vf05_25_ar5_20/runs/sobol_ritz_factorized_all_run01_surrogates \
   --paper-figure-dir paper/figures \
-  --jobs 4
+  --jobs 1
 ```
 
 The benchmark uses the seven affine coefficients as inputs and the 21
@@ -242,6 +278,15 @@ directory. The flattened selections are available in
 `surrogate_baseline_prefix_hyperparameters.csv` and
 `surrogate_baseline_final_hyperparameters.csv`; the JSON protocol also keeps
 the scores of every Kriging covariance candidate.
+
+Regenerate the validation figure without a performance benchmark:
+
+```bash
+python scripts/cmame_interpretable_pipeline/05_paper_numerical_figures.py \
+  --summary-dir results/cmame_method/interpretable_vf05_25_ar5_20/runs/sobol_ritz_factorized_all_run01_summary \
+  --paper-figure-dir paper/figures \
+  --adaptive-validation-only
+```
 
 Smoke test:
 

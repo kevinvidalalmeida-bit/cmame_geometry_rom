@@ -1,0 +1,2201 @@
+     Efficient affine operator compilation for
+reduced-order elastic homogenization of voxelized
+                     composites
+
+        Kevin Vidal1*, Victor Alulema1,2 , Victor Berrazueta1 ,
+                         Esteban Valencia1
+   1
+     Department of Mechanical Engineering; LUAS-EPN; ATA-EPN
+Research Group, Escuela Politécnica Nacional, Quito, 170143, Ecuador.
+  2
+    EAVISE, PSI, Department of Electrical Engineering (ESAT), KU
+  Leuven, Jan Pieter de Nayerlaan 5, Sint-Katelijne-Waver, Belgium.
+
+
+       *Corresponding author(s). E-mail(s): kevin.vidal@epn.edu.ec;
+
+
+                                       Abstract
+  Repeated computational homogenization becomes prohibitively expensive when
+  a resolved microstructure must be evaluated over many combinations of con-
+  stituent properties. This work develops an efficient affine operator compiler for
+  reduced-order linear elastic homogenization on voxel grids. Microscopic strain
+  snapshots from a fast Fourier transform solver generate Galerkin spaces; phase-
+  supported constitutive factors, incremental cross-block contractions, and reuse
+  of the projected reference metric reduce the cost of forming their operators.
+  The compiler supports both complete snapshot spaces and proper orthogonal
+  decomposition, which share the same reduced Schur output map. Established
+  variational identities provide energy diagnostics relative to the discrete full-order
+  model. Across ten short-fiber composite microstructures with up to 2403 vox-
+  els, 6–16 training materials plus five monitoring materials give reduced ranks
+  of 36–96. Validation on 20 unseen materials shared across the ten geometries
+  yields mean and maximum relative stiffness errors of 0.0217% and 0.1322%.
+  A separate controlled comparison shows complete construction times of 30.66
+  and 159.41 seconds for two larger cells, reductions of 21.2 and 31.4 percent rel-
+  ative to the tested conventional compilation path; no reduction is observed for
+  the smallest cell. Energy-based proper orthogonal decomposition obtains smaller
+  ranks at nearly the same construction cost. Measured isolated reduced queries on
+  a central processing unit take 21.18–47.83 microseconds. These results support
+  efficient operator assembly as the computational contribution, with benefits that
+
+
+
+                                           1
+        depend on cell size, retained rank, and the numerical accuracy of the contracted
+        operators.
+
+        Keywords: Computational homogenization, Affine operator compilation, Reduced
+        basis, Proper orthogonal decomposition, FFT methods, Elastic composites
+
+
+
+
+Nomenclature
+Symbol         Meaning                           Symbol                 Meaning
+General formulation
+Ω, x, |Ω|   Periodic cell, spatial coordi- G                            Fixed discrete microstruc-
+            nate, and cell volume.                                      ture, including phase layout,
+                                                                        orientations, and grid.
+ξ, Ξ, ξ⋆       Constitutive-parameter vec- g, gi , m                    Macroscopic loading vec-
+               tor, admissible domain, and                              tor, loading amplitudes, and
+               queried point.                                           number of independent load-
+                                                                        ings.
+z i , z(g)     Unit macroscopic driving          z(x; g)                Local microscopic field.
+               states and their combina-
+               tion.
+        h
+Vper , Vper    Continuous        and      dis-   u, ug , v              Microscopic      fluctuation,
+               crete admissible periodic                                equilibrium fluctuation, and
+               zero-mean          fluctuation                           test function.
+               spaces.
+                                                                                            h
+L              Microscopic        differential   ϕa , ϕ b               Basis functions of Vper .
+               operator.
+A, Aq          Local constitutive operator       H eff , HFOM
+                                                          eff
+                                                              , Hreff
+                                                                  Continuum, full-order, and
+               and       fixed-microstructure                     reduced effective operators;
+               affine fields.                                     r denotes the Ritz rank.
+E              Volume-normalized                n                 Number of independent
+               quadratic energy.                                  microscopic unknowns in
+                                                                  the constrained discrete
+                                                                           h
+                                                                  space Vper .
+K, B, D         Microscopic, coupling, and X = [X1 , . . . , Xm ] Full-order response matrix
+                macroscopic energy blocks.                        satisfying KX = B.
+Q, γq , γ       Number of affine terms, ∥ · ∥F                    Frobenius norm.
+                affine constitutive coef-
+                ficient,   and      coefficient
+                vector.
+⪰, ⪯            Loewner ordering for sym- FOM, ROM                Full-order and reduced-order
+                metric matrices.                                  models.
+k, σe , d, ε, κ Thermal conductivity, elec- σ, ε(·)               Elastic      stress      and
+                trical conductivity, diffusiv-                    symmetric-gradient
+                ity, permittivity, and perme-                     operator.
+                ability.
+Nvox            Total voxel count; the
+                three-dimensional      strain-
+                based         implementation
+                stores six microscopic field
+                components per voxel.
+
+
+
+
+                                                   2
+Symbol                    Meaning                     Symbol        Meaning
+Sobol–Ritz construction and validation
+ΞC , NC              Sobol candidate sequence         ΞS , N s      Selected training prefix of
+                     and its size.                                  ΞC and its size.
+ΞM , NM              Independent monitor set          ΞV , N V      Independent held-out val-
+                     and its size.                                  idation set and its size.
+S, Sℓ                Final and intermediate           p, pℓ         Raw snapshot dimensions,
+                     snapshot matrices.                             p = mNs and pℓ = mℓ.
+r, Vr                Final Ritz rank and              K
+                                                      ˜︁ q , B
+                                                             ˜︁q    Affine blocks in raw snap-
+                     reference-energy     Ritz                      shot coordinates.
+                     basis.
+Kref , Gref , Rref   Reference        operator,       Kq,r , Bq,r   Precompiled       reduced
+                     reference-energy    Gram                       affine blocks.
+                     matrix, and Cholesky
+                     factor.
+Kr , Br              Material-dependent               Xr , X
+                                                           ˆ︁r      Reduced             micro-
+                     reduced operators.                             scopic    response     and
+                                                                    its       reference-energy
+                                                                    coordinates.
+ˆ︁ (j)
+X                         Intermediate      response ∆X, R          Microscopic      response-
+  ℓ
+                          coordinates in the raw                    error matrix and full-order
+                          snapshot basis for monitor                residual.
+                          point j.
+ (ℓ)
+eM , eV,j                 Monitor error and held- τROM , ℓ, ℓmin    ROM tolerance, enrich-
+                          out validation error.                     ment index, and first mon-
+                                                                    itored prefix size.
+ICG                       Representative full-order
+                          CG iteration count.
+Elasticity specialization and performance
+C, C eff , CFOM
+            eff
+                , Creff   Local and effective stiff- Em , νm        Matrix Young’s modulus
+                          ness tensors in Mandel                    and Poisson’s ratio.
+                          notation.
+EL , ET                   Fiber longitudinal and GLT , νLT , νT T   Queried fiber shear modu-
+                          transverse        Young’s                 lus and Poisson ratios.
+                          moduli.
+Vf , a11 , a22 , a33      Fiber volume fraction and T (x; G)        Energy-preserving Man-
+                          orientation-tensor diago-                 del rotation associated
+                          nal entries.                              with the local fiber
+                                                                    direction.
+λmin (·)                  Smallest eigenvalue of a tFOM , tROM      Measured time per FOM
+                          symmetric operator.                       and online ROM material
+                                                                    query.
+Tcompile , NBE            Total one-time offline
+                          compilation time and
+                          break-even query count.
+
+
+1 Introduction
+Material screening, constituent identification, and multiscale simulation require
+repeated homogenization of a fixed microstructure as its constituent properties vary.
+For voxelized short-fiber composites, resolving the fiber geometry and local anisotropy
+can require millions of voxels. The largest cells considered here contain 2403 voxels,
+so a single microscopic strain field has about 83 million stored scalar components.
+
+
+                                                 3
+Reusing this spatial information across material queries is attractive, but generating
+and contracting a collection of such fields creates a substantial offline computational
+and memory cost. This work addresses that cost for periodic, linear elastic composites
+with fixed phase and orientation fields.
+    FFT-based homogenization provides an efficient full-order reference on regular
+grids. Developments following the original scheme of Moulinec and Suquet [15] include
+accelerated iterations [5, 14], variational and Galerkin methods [4, 19], and upper–
+lower bounds on homogenized properties [20]. These developments reduce and control
+the cost of individual cell solutions. Many-query applications, however, can benefit
+from a further offline–online decomposition that reuses cell solutions over a constitutive
+parameter domain.
+    Reduced-basis and proper orthogonal decomposition (POD) approaches already
+provide this decomposition for computational homogenization [1, 3, 6, 10, 22]. Affine
+parameter dependence permits reduced operators and output functionals to be assem-
+bled offline [17, 18], and reduced Schur complements eliminate internal coordinates
+[11]. Thus, online evaluation of an effective tensor without voxel-field reconstruction
+is available to a properly implemented affine POD/reduced-basis model. The present
+Schur output map is an instance of that established Galerkin construction; it is not an
+alternative projection principle. Likewise, its energy-error identity and ordering under
+nested enrichment follow from standard variational arguments.
+    Among closely related contributions, Pham and Lee [16] consider reduced-basis
+homogenization with variable constituent properties for thermal and elastic periodic
+composites. This overlap requires the present contribution to be identified at the level
+of computational construction and verified performance, rather than through the use of
+variable materials or a reduced online solve alone. Other approaches reuse microstruc-
+tural information through deep material networks [7, 13], including component-scale
+applications [8, 9], or reduce spatial cost through sparse sampling and low-rank field
+representations [12, 21]. These strategies address related costs but do not constitute
+numerical baselines in the present study.
+    The computational development examined here is a compiler from microscopic
+strain snapshots to reusable affine Galerkin operators. For isotropic matrix and
+transversely isotropic fiber phases, seven constitutive coefficients separate material
+properties from fixed spatial factors. The compiler contracts these factors on their
+phase and orientation support, streams snapshot features within a prescribed device
+workspace, updates only new and cross blocks during enrichment, and recovers the
+reference-energy Gram matrix from already assembled blocks. This avoids forming
+global stiffness matrices and repeating unnecessary volumetric products. The resulting
+operators can retain the complete snapshot span or be transformed into POD coordi-
+nates. Their use by both models is central to a fair assessment of the compiler, and
+also limits any claim of intrinsic superiority over POD.
+    The numerical evidence has two parts. A campaign on ten three-dimensional
+short-fiber geometries tests tensor accuracy and energetic diagnostics over a common
+constitutive domain. A separate comparison on three geometries uses matched mate-
+rial sequences, monitoring decisions, full-order settings, and held-out data to separate
+operator compilation from basis compression. Both compilation paths are incremental;
+
+
+
+                                            4
+energy POD shares the factorized compiler, while a conventional spatial contraction
+path supplies an implementation baseline for L2 POD. We report complete measured
+construction intervals, isolated query latency, batched throughput, and peak mem-
+ory as distinct quantities. The results support a reduction in operator-assembly cost
+for the larger cells, but do not establish the best possible implementation of every
+competing method.
+    The scope is restricted to fixed-geometry, coercive linear elastic cell problems.
+Accuracy is assessed on reserved material samples, with separate checks of the voxel
+discretization and reduced operators. Section 2 defines the variational and affine model;
+Section 3 details compilation, normalization, and verification; Section 4 presents the
+elastic benchmarks and controlled reduced-basis comparison. Supporting derivations
+and resolution checks are given in the appendices.
+
+
+2 General parametric periodic homogenization
+2.1 Periodic cell problem and effective operator
+Let Ω denote the periodic representative cell, namely the finite region of the hetero-
+geneous material that is periodically repeated to describe the microstructure. A point
+within the cell is identified by x ∈ Ω, while |Ω| denotes its volume. The symbol G
+represents the fixed microstructure, including the phase distribution, local material
+orientations, and spatial discretization. Throughout one offline–online construction, G
+remains unchanged, whereas the constitutive properties of the constituent phases are
+allowed to vary.
+     These variable material properties are collected in the parameter vector ξ =
+[ξ1 , . . . , ξnξ ]T ∈ Ξ, where each ξi represents one constitutive parameter, such as a
+Young’s modulus, Poisson ratio, conductivity, or another material coefficient, and Ξ
+denotes the admissible parameter domain. Hence, each ξ ∈ Ξ identifies one material
+combination to be queried for the same fixed microstructure G .
+     The macroscopic loading is represented by g = [g1 , . . . , gm ]T ∈ Rm , where m is the
+number of independent macroscopic components required to characterize the effective
+response. Let z i denote the i-th unit macroscopic loading state and gi its amplitude.
+The resulting macroscopic field is defined in Eq. (1) as a linear combination of these
+unit states:
+                                                  m
+                                                 ∑︂
+                                        z (g ) =    gi z i .                             (1)
+                                             i=1
+
+For three-dimensional linear elasticity, z is the symmetric macroscopic strain, which
+has six independent components, and therefore m = 6.
+    If the material inside Ω were homogeneous, z (g ) would be sufficient to describe
+the local field. In a heterogeneous medium, however, the constituent phases generally
+respond differently to the same imposed macroscopic loading, causing the field to
+redistribute within the cell. In linear elasticity, for example, an imposed macroscopic
+strain is redistributed between the constituent phases according to their local stiffness
+and orientation. This microscopic redistribution is represented by a fluctuation field
+u(x) ∈ Vper , where Vper denotes the space of admissible periodic fluctuations, with
+
+
+                                             5
+the zero-mean condition in Eq. (2) imposed to preserve the prescribed macroscopic
+average:
+                                   ∫︂
+                                1
+                                      u(x) dx = 0.                            (2)
+                               |Ω| Ω
+
+Periodicity enforces compatibility of the fluctuation on opposite faces of the cell,
+while Eq. (2) removes its arbitrary constant component and prevents the microscopic
+correction from modifying the imposed macroscopic average.
+   The local field is then obtained by adding the microscopic correction to the
+prescribed macroscopic field, as written in Eq. (3):
+
+                                  z (x; g ) = z (g ) + Lu(x).                            (3)
+
+Here, L is the differential operator that converts the fluctuation variable into the
+physical field entering the constitutive law. For scalar transport, L = ∇, whereas in
+linear elasticity L = ε(·). Accordingly, Eq. (3) becomes ε(x) = ε + ε(u) in elasticity,
+showing that the local strain consists of the prescribed macroscopic strain plus the
+microscopic redistribution induced by the heterogeneous microstructure.
+    Once the local field in Eq. (3) has been established, the next step is to deter-
+mine the physical response it produces inside the heterogeneous cell. This response is
+governed by the local constitutive operator A(x; ξ, G ), which is assumed symmetric
+and coercive. Symmetry means that the constitutive coupling between two admissible
+local fields is unchanged when their roles are interchanged, z T1 Az 2 = z T2 Az 1 , allow-
+ing the response to be described through a quadratic variational functional, whereas
+coercivity requires every nonzero admissible local field to have a strictly positive ener-
+getic cost, meaning that a nonzero deformation or driving field cannot occur without
+storing or dissipating a positive amount of energy. Together, symmetry and coerciv-
+ity guarantee a stable and unique minimum of the variational problem and, after
+discretization, lead to a symmetric positive-definite microscopic operator; in linear
+elasticity, this general constitutive operator becomes the local stiffness tensor, A = C,
+which relates the local strain obtained from Eq. (3) to the corresponding stress through
+σ (x) = C(x; ξ, G )ε(x).
+    At this stage, Eq. (3), together with the local constitutive law, describes the
+response associated with any admissible fluctuation u, but it does not yet identify
+which fluctuation corresponds to the physical equilibrium of the heterogeneous cell.
+The microscopic cell problem therefore consists of selecting the particular fluctua-
+tion that satisfies equilibrium for the prescribed macroscopic loading g . Because the
+constitutive response is linear and symmetric, this equilibrium can be characterized
+variationally through a quadratic microscopic functional obtained from the local con-
+stitutive law and the field decomposition in Eq. (3); its derivation is provided in
+Appendix A, while the resulting volume-averaged functional is defined in Eq. (4) as
+
+                                      ∫︂
+                                 1                     T
+            Π(u; g, ξ, G ) =               [z (g ) + Lu] A(x; ξ, G ) [z (g ) + Lu] dx.   (4)
+                               2|Ω|    Ω
+
+
+
+                                                   6
+Equation (4) therefore assigns a quadratic volume-averaged response to each candidate
+fluctuation u; in linear elasticity, where A = C, this quantity is the volume-averaged
+stored elastic energy of the periodic cell.
+    Because the symmetry and coercivity of A make the microscopic variational prob-
+lem well posed, the physical equilibrium fluctuation is obtained by selecting, among all
+admissible fields, the one that minimizes Eq. (4), with this equilibrium field denoted
+by ug and defined in Eq. (5) as
+
+                                     ug = arg min Π(u; g, ξ, G ).                      (5)
+                                             u∈Vper
+
+
+    To verify that the equilibrium field ug , defined in Eq. (5), corresponds to a min-
+imum of the microscopic functional, consider a small admissible perturbation of this
+field, ug + ϵv , where ϵ controls the perturbation magnitude and v ∈ Vper is an admissi-
+ble test function representing any virtual direction that preserves the periodicity and
+zero-mean conditions of Eq. (2). If ug is at a minimum, an infinitesimal perturbation
+in any such direction cannot change the microscopic functional to first order, so the
+derivative with respect to ϵ must vanish at ϵ = 0 for every v , as expressed in Eq. (6):
+                                                     ⃓
+                            d                        ⃓
+                               Π(ug + ϵv ; g, ξ, G )⃓⃓     =0    ∀v ∈ Vper .           (6)
+                            dϵ                         ϵ=0
+
+
+   Substituting the microscopic functional of Eq. (4) into Eq. (6) and evaluating the
+derivative gives the weak equilibrium problem in Eq. (7):
+                ∫︂
+                         (Lv )T A(x; ξ, G ) [z (g ) + Lug ] dx = 0    ∀v ∈ Vper .      (7)
+                     Ω
+
+
+    Equation (7) therefore determines the equilibrium fluctuation ug by requiring the
+local constitutive response generated by z (g ) + Lug to remain in equilibrium for every
+admissible virtual perturbation v .
+    The weak formulation in Eq. (7) expresses the same physical equilibrium as the
+corresponding differential equation written pointwise inside the cell, but through an
+integral relation that is directly suited to the variational treatment, spatial discretiza-
+tion, and Ritz–Galerkin projection introduced later. In linear elasticity, with L = ε(·)
+and A = C, Eq. (7) is the weak form of mechanical equilibrium and corresponds to
+the principle of virtual work. In the absence of body forces, its equivalent pointwise
+form is ∇·σ = 0, with the derivation connecting both forms provided in Appendix B.
+    Once the equilibrium fluctuation ug has been obtained from Eq. (5), homoge-
+nization replaces the resolved heterogeneous cell by a homogeneous medium that
+reproduces the same minimum microscopic response under the prescribed macroscopic
+loading. The behavior of this equivalent medium is represented by the effective con-
+stitutive operator H eff (ξ ; G ) ∈ Rm×m , which characterizes the macroscopic response
+associated with the m loading components collected in g . Because the effective prob-
+lem retains the same linear and symmetric structure as the microscopic problem, its
+
+
+                                                      7
+corresponding quadratic functional is 12 g T H eff (ξ ; G )g , which is the macroscopic coun-
+terpart of the quadratic functional introduced in Eq. (4). Equating this macroscopic
+quantity to the minimum microscopic functional defines H eff through Eq. (8):
+
+                  1 T eff
+                    g H (ξ; G )g = Π(ug ; g, ξ, G ) = min Π(u; g, ξ, G ).                 (8)
+                  2                                  u∈Vper
+
+
+
+In linear elasticity, H eff = C eff , so Eq. (8) equates the macroscopic elastic energy of the
+homogeneous material with the minimum elastic energy of the resolved heterogeneous
+cell.
+    The algebra extends to other symmetric coercive cell problems if their constitu-
+tive law admits the finite affine representation used below. Only three-dimensional
+linear elasticity is assessed in this work. In particular, a true void phase or an incom-
+pressibility constraint does not satisfy the positive-definite setting without further
+treatment.
+
+
+2.2 Discrete energy and effective Schur map
+The continuous formulation defines the equilibrium fluctuation ug in Eq. (5), but
+computing this field requires a finite-dimensional representation. Accordingly, we intro-
+        h
+duce Vper     ⊂ Vper , the discrete fluctuation space associated with the periodic voxel
+grid, and seek the corresponding approximation uhg ∈ Vper          h
+                                                                     . Here, h denotes the
+characteristic voxel spacing and therefore indicates the spatial resolution of the dis-
+                                                                           h
+cretization. In the numerical implementation considered here, Vper             corresponds to
+the Fourier–Galerkin discretization associated with the periodic voxel grid [15, 19].
+The formulation developed below, however, relies only on the underlying variational
+structure and is therefore not restricted to this particular discretization. In the three-
+dimensional strain-based implementation, each voxel carries six microscopic unknowns
+corresponding to the six independent components of the symmetric strain tensor, so
+a grid with Nvox voxels stores 6Nvox microscopic field components whose equilibrium
+values are determined by the FOM. Compatibility, periodicity, and the zero-mean
+condition constrain these components, and n denotes the number of independent
+microscopic unknowns that remain in the resulting admissible ∑︁          discrete space. This
+                                                                            n
+space is represented by the basis {ϕa }na=1 . Accordingly, uh (x) = a=1 ua ϕa (x), with
+                      T   n
+u = [u1 , . . . , un ] ∈ R collecting these coefficients, and the basis is constructed so that
+periodicity, the zero-mean condition of Eq. (2), and the compatibility requirements of
+the chosen discretization are already satisfied.
+    Substituting this representation into the microscopic functional of Eq. (4) converts
+the continuous variational problem into a quadratic function of the coefficient vector
+u and the macroscopic loading g , whose derivation and matrix definitions are given in
+Appendix C, while the resulting discrete functional is written in Eq. (9) as
+
+                                   1 T                              1
+              E (u, g ; ξ, G ) =     u K (ξ; G )u − uT B (ξ ; G )g + g T D(ξ; G )g.       (9)
+                                   2                                2
+
+                                                  8
+Here, K (ξ ; G ) ∈ Rn×n describes the energetic contribution associated with the micro-
+scopic fluctuation, B (ξ ; G ) ∈ Rn×m couples the macroscopic loading to the microscopic
+degrees of freedom, and D(ξ ; G ) ∈ Rm×m represents the contribution associated
+directly with the imposed macroscopic field. Thus, the three terms in Eq. (9) cor-
+respond, respectively, to the microscopic contribution, the microscopic–macroscopic
+coupling, and the direct macroscopic contribution.
+     Because the local constitutive operator A is symmetric and coercive and the dis-
+crete space contains only admissible fluctuations, K (ξ ; G ) is symmetric positive definite
+for every ξ ∈ Ξ and fixed G . The minimum-energy structure of the continuous prob-
+lem is therefore preserved after discretization, ensuring a unique discrete equilibrium
+and making K (ξ ; G )−1 well defined.
+     The discrete equilibrium is obtained by minimizing Eq. (9) with respect to the coef-
+ficient vector u. Differentiating the discrete functional with respect to these coefficients
+and setting the result to zero gives K (ξ ; G )u−B (ξ ; G )g = 0, or equivalently K (ξ ; G )u =
+B (ξ ; G )g , whose solution provides the coefficients of the discrete equilibrium field uhg
+for the prescribed macroscopic loading g . To construct the complete response required
+for homogenization, the coefficient vectors associated with the m independent unit
+loading states are collected as the columns of X (ξ ; G ) = [X1 , . . . , Xm ] ∈ Rn×m , where
+each Xi represents the discrete microscopic response to the i-th unit loading. Col-
+lecting these m equilibrium problems leads to the full-order model (FOM) response
+system in Eq. (10):
+
+                                  K (ξ; G )X (ξ; G ) = B (ξ ; G ).                         (10)
+
+Since K (ξ ; G ) is invertible, X (ξ ; G ) = K (ξ ; G )−1 B (ξ ; G ), and the coefficient vector
+corresponding to any loading combination g follows as u = X (ξ ; G )g .
+   The matrix X therefore contains the microscopic responses required to construct
+the discrete effective operator. Substituting u = X (ξ ; G )g into Eq. (9) eliminates the
+microscopic coordinates while retaining their influence on the macroscopic behavior,
+and using Eq. (10) gives the effective Schur map derived in Appendix C and written
+in Eq. (11) as
+
+              eff
+             HFOM (ξ ; G ) = D(ξ ; G ) − B (ξ ; G )T X (ξ ; G )
+                                                                                           (11)
+                           = D(ξ ; G ) − B (ξ ; G )T K (ξ ; G )−1 B (ξ ; G ) ∈ Rm×m .
+
+
+Equation
+[︃           ]︃ is the Schur complement of K (ξ; G ) in the augmented energy matrix
+            (11)
+    K −B
+               (ξ ; G ), obtained by eliminating the microscopic coordinates u; this is why
+   −B T D
+   eff
+HFOM    is referred to as the effective Schur map. It is also the full-order discrete counter-
+part of the continuous effective operator H eff (ξ ; G ) defined in Eq. (8), condensing the
+n-dimensional microscopic problem into an m × m macroscopic operator while retain-
+ing the effect of the resolved microscopic fluctuations. For three-dimensional linear
+elasticity, m = 6, corresponding to the six independent components of the macroscopic
+strain.
+
+                                                 9
+2.3 Geometry–material affine separation
+The full-order effective operator in Eq. (11) depends on both the material parameters
+ξ and the microstructure G through the discrete blocks K , B , and D. For a fixed
+microstructure, varying ξ changes the local constitutive operator A(x; ξ, G ) while the
+spatial arrangement of the cell remains unchanged. If these constitutive variations can
+be represented by a finite set of Q spatial fields {Aq (x; G )}Q   q=1 , then the family satisfies
+A(·; ξ, G ) ∈ span{A1 (·; G ), . . . , AQ (·; G )}. In other words, each material defines only
+the scalar weights needed to combine these fixed spatial fields. For the linear-elastic
+constitutive family used in the numerical assessment, this representation is exact, while
+the general separation is written in Eq. (12) as
+
+                                                  Q
+                                                 ∑︂
+                               A(x; ξ, G ) =           γq (ξ)Aq (x; G ).                       (12)
+                                                 q=1
+
+
+Here, Q denotes the number of terms in the representation, γq (ξ ) is a material-
+dependent scalar coefficient, and Aq (x; G ) is the corresponding spatial field fixed by the
+microstructure, including its phase distribution and local orientations. This weighted-
+sum form is referred to as an affine separation because the local operator is expressed
+as a linear combination of fixed spatial fields, although the coefficients γq (ξ ) may
+depend nonlinearly on the original material parameters ξ .
+    The discrete blocks K , B , and D, introduced in Eq. (9), are obtained from spatial
+integrals containing the local constitutive operator A, as detailed in Appendix C.
+Replacing A in these definitions by the affine form of Eq. (12) allows each scalar
+coefficient γq (ξ ), which is independent of the spatial coordinate x, to be taken outside
+the corresponding integrals. The remaining spatial contributions then define fixed
+discrete blocks for each q , leading to the separation in Eq. (13):
+
+                                                  Q
+                                                 ∑︂
+                                  K (ξ; G ) =          γq (ξ)Kq (G ),
+                                                 q=1
+                                                  Q
+                                                 ∑︂
+                                  B (ξ ; G ) =         γq (ξ)Bq (G ),                          (13)
+                                                 q=1
+                                                  Q
+                                                 ∑︂
+                                  D(ξ; G ) =           γq (ξ)Dq (G ).
+                                                 q=1
+
+
+For each q = 1, . . . , Q, Kq (G ) ∈ Rn×n , Bq (G ) ∈ Rn×m , and Dq (G ) ∈ Rm×m contain the
+discrete contribution associated with the spatial field Aq (x; G ), and therefore depend
+on the microstructure but not on the queried material. Their explicit derivation from
+the spatial integrals is provided in Appendix D.
+     For a fixed microstructure G , these blocks are computed once and remain
+unchanged as the material varies, while a new material enters only through the coef-
+ficient vector γ (ξ ) = [γ1 (ξ ), . . . , γQ (ξ )]T ∈ RQ . The corresponding K (ξ ; G ), B (ξ ; G ),
+and D(ξ ; G ) are then assembled from the weighted sums in Eq. (13), without repeating
+
+
+                                                  10
+ constructed once per microstructure                   repeated material queries
+
+             fixed microstructure                            queried material
+                      G                                             ξ⋆
+
+                         local representation
+
+              spatial affine fields                          affine coefficients
+                {Aq (x; G)}Qq=1
+                                                                   γ(ξ⋆ )
+
+
+                         discretization
+
+            discrete affine blocks
+           {Kq (G), Bq (G), Dq (G)}
+
+                         Sobol–Ritz compilation
+                                                          reduced affine assembly
+            compiled Ritz blocks                                Kr , Br , D
+          {Kq,r (G), Bq,r (G), Dq (G)}
+                                                                       reduced solve and Schur map
+
+                                                             effective operator
+                                                                 Hreff (ξ⋆ ; G)
+
+
+
+Fig. 1 Geometry–material separation across the local, discrete, and compiled reduced
+levels. The fixed microstructure determines the spatial fields and their reusable opera-
+tors, while each queried material contributes only the scalar affine coefficients required
+to assemble and evaluate the online Ritz–Schur map.
+
+
+the spatial integrations over the microstructure. A change in G , in contrast, changes the
+spatial fields and their discrete blocks, requiring a new offline construction. Figure 1
+summarizes how this separation propagates from the local constitutive fields to the
+reusable reduced operators: the geometry-dependent information is constructed and
+compiled once, whereas a queried material supplies only the affine coefficients used in
+the reduced assembly.
+
+
+3 Affine compilation of reduced elastic operators
+The affine decomposition in Eq. (13) separates the material dependence, carried by the
+coefficients γq (ξ ), from the fixed microstructure-dependent blocks Kq (G ), Bq (G ), and
+Dq (G ). Consequently, the matrices K (ξ ; G ), B (ξ; G ), and D(ξ ; G ) can be assembled for
+a new material without recomputing the spatial contributions of the microstructure.
+However, the full-order response in Eq. (10) still requires solving the n-dimensional
+system K (ξ ; G )X (ξ ; G ) = B (ξ ; G ) for every new material.
+    To remove this remaining material-by-material full-order solve, the proposed
+Sobol–Ritz construction samples a limited number of representative materials through
+a Sobol sequence and uses their full-order microscopic responses to define a lower-
+dimensional Ritz space with r ≪ n. Subsequent material responses are then sought
+in this space by solving the same discrete minimum-energy problem of Eq. (9), but
+in reduced coordinates. This leads naturally to an offline–online formulation: the
+
+
+                                                  11
+microstructure-dependent reduced representation is constructed once during the offline
+stage, while each new material is evaluated online using only its affine coefficients
+and the precomputed reduced operators. The complete construction and query paths
+are previewed in Fig. 2, before their individual steps are developed in the following
+subsections.
+
+                                                           no: ℓ ← ℓ + 1
+
+
+
+
+  Sobol sequence       solve FOM at         snapshot                  project affine              (ℓ)
+        ΞC
+                             (ℓ)
+                            ξC              matrix Sℓ                                             eM ≤ τROM ?
+                                                                         blocks
+
+                                                                                            yes
+
+
+
+
+                                                                           freeze & normalize
+                                                                             (Vr , Cholesky)
+
+
+
+                                                                           compiled blocks
+                                                                           {Kq,r , Bq,r , Dq }
+
+
+                                                               stored,
+                                                               reused every query
+
+
+   new material         affine coeffs       assemble                  solve reduced
+                                                                                                   Hr (ξ⋆ )
+       ξ⋆                   γ(ξ⋆ )          K r , Br , D                  system
+
+
+Fig. 2 Offline compilation and online query stages of the Sobol–Ritz transfer operator. The offline
+stage (top) enriches the Ritz space adaptively until the monitor criterion of Eq. (22) is met,
+then freezes and normalizes it into reusable blocks; the online stage (bottom) evaluates any new
+material at reduced cost using only those stored blocks. Compare with Algorithm 1 for the full
+pseudocode
+
+3.1 Offline construction
+The offline stage converts the fixed microstructure G into a reusable set of reduced
+operators. Full-order responses at selected Sobol materials define the microscopic
+response space, which is enriched until the independent monitor criterion is satisfied
+and then frozen, normalized in a representative energy metric, and transformed into
+the reduced affine blocks used by the online model.
+
+3.1.1 Sobol sampling and microscopic response space
+The microscopic response space is constructed from full-order solutions evaluated at
+representative material points within the admissible domain Ξ, which are selected
+using a Sobol sequence, a deterministic low-discrepancy sequence designed to dis-
+tribute successive samples throughout a multidimensional domain with limited
+                         (1)          (N )
+clustering. Let ΞC = {ξ C , . . . , ξ C C } ⊂ Ξ denote the resulting fixed candidate
+
+
+                                                12
+sequence of NC material points in their prescribed Sobol order, from which the train-
+                                          (1)        (N )
+ing set is taken as the prefix ΞS = {ξ C , . . . , ξ C s }. This prefix structure allows
+additional materials to be appended without changing those already selected, so the
+response space can be enriched sequentially until the adaptive monitoring procedure
+introduced in Section 3.1.4 determines the final prefix length Ns .
+                                 (j)
+    For each training material ξ C ∈ ΞS , the full-order response system in Eq. (10) is
+solved for the m independent macroscopic loading states, and the resulting microscopic
+responses are collected in the snapshot matrix defined in Eq. (14) as
+                   [︂                                  ]︂
+                        (1)                   (N )
+             Sraw = X (ξC ; G ), . . . , X (ξ C s ; G ) ∈ Rn×p ,   p = mNs .          (14)
+
+   Each column of Sraw is called a snapshot and contains the n coefficients of one full-
+order microscopic equilibrium response associated with a particular material and unit
+macroscopic loading, while their linear combinations form the sampled microscopic
+response space range(Sraw ). The matrix is referred to as raw because these responses
+are still expressed in their original full-order coordinates, before the reference-energy
+normalization introduced later. Although p = mNs snapshots are collected, some may
+in principle be exact linear combinations of others, so the actual dimension of the
+response space is given by the rank of Sraw , denoted by r and defined in Eq. (15) as
+
+                                   r = rank(Sraw ) ≤ p.                               (15)
+
+In the exact-arithmetic full-span construction, the complete response span is retained,
+so r is used only to remove exact linear redundancy rather than to truncate indepen-
+dent microscopic response directions. Accordingly, if dependent snapshots are present,
+S ∈ Rn×r denotes a full-column-rank representation of the same space, satisfying
+range(S ) = range(Sraw ); in the reported main campaign all snapshot columns are
+retained, giving r = p and S = Sraw , while the retained response dimension remains
+much smaller than the full microscopic dimension, r ≪ n.
+
+3.1.2 Ritz projection onto the microscopic response space
+In the full-order formulation, the microscopic equilibrium for each material is obtained
+from the n-dimensional system in Eq. (10), so repeating this solve for every new mate-
+rial would retain the main computational cost identified in Section 3. The snapshot
+construction in Section 3.1.1 provides instead a smaller space containing the indepen-
+dent microscopic response directions observed over the training materials, allowing
+subsequent equilibria to be sought within range(S ) rather than over the complete
+microscopic space. Using the full-column-rank matrix S ∈ Rn×r , the reduced fluctua-
+tion is represented as ur = Sα, where α = [α1 , . . . , αr ]T ∈ Rr contains the coordinates
+that determine how the retained response directions are combined, so the equilibrium
+calculation is reduced from determining n microscopic coefficients to determining only
+r ≪ n reduced coordinates, while the underlying physical equilibrium problem remains
+unchanged.
+    The appropriate coordinates α are obtained by preserving the same minimum-
+energy principle as the FOM, but restricting the admissible response to range(S ), that
+
+
+                                             13
+is, α = arg minα∈Rr E (Sα, g ; ξ, G ). Substituting ur = Sα into the discrete energy of
+Eq. (9) gives E (Sα, g ; ξ, G ) = 12 αT S T K (ξ ; G )Sα−αT S T B (ξ ; G )g + 21 g T D(ξ ; G )g , and,
+since the macroscopic loading g is prescribed, stationarity with respect to α leads to
+the reduced equilibrium system
+
+                                 S T K (ξ; G )Sα = S T B (ξ ; G )g.                              (16)
+
+This restricted minimum-energy solution defines the Ritz approximation, with
+S T K (ξ; G )S ∈ Rr×r replacing the original n × n microscopic operator, so the same
+equilibrium principle is retained while the number of unknowns is reduced from n to r.
+     The same reduced equilibrium can be understood through the Galerkin condition,
+which provides an equivalent interpretation of Eq. (16). For the prescribed loading
+g , the full-order relation is K (ξ; G )u = B (ξ ; G )g , whereas the restricted response
+ur = Sα generally does not satisfy this equation exactly and therefore leaves the resid-
+ual ru = B (ξ ; G )g − K (ξ ; G )Sα, which measures the remaining equilibrium imbalance.
+Requiring S T ru = 0 makes this residual orthogonal to every direction contained in
+the snapshot space and recovers Eq. (16); since K (ξ ; G ) is symmetric positive defi-
+nite, the Ritz minimum-energy condition and the Galerkin orthogonality condition are
+therefore equivalent descriptions of the same reduced equilibrium. Moreover, because
+                                  (j)
+every training response X (ξ C ; G ) used to construct the snapshot matrix in Eq. (14)
+already belongs to range(S ), the corresponding FOM solution remains available within
+the Ritz space and is reproduced exactly in exact arithmetic, while approximation is
+required only for material points whose full-order responses are not already contained
+in that space.
+     Since the microscopic equilibrium is now sought entirely within range(S ), the affine
+operators that govern this equilibrium must also be expressed in the same reduced
+space to avoid returning to the full n-dimensional formulation during subsequent mate-
+rial evaluations. Accordingly, the blocks introduced in Eq. (13) are projected onto
+range(S ). Since Kq (G ) acts on the microscopic degrees of freedom and Bq (G ) couples
+them with the macroscopic loading, their projected forms are defined in Eq. (17) as
+
+     ˜︁ q = S T Kq (G )S ∈ Rr×r ,
+     K                                   ˜︁q = S T Bq (G ) ∈ Rr×m ,
+                                         B                                  q = 1, . . . , Q.    (17)
+
+These projected blocks retain the contribution of each affine term within the micro-
+scopic response space, while the tilde indicates that they are still expressed in the
+original snapshot coordinates before the reference-energy normalization introduced in
+Section 3.1.5; no corresponding projection is required for Dq (G ) ∈ Rm×m , because this
+block already acts entirely on the macroscopic loading space.
+    For clarity, the implementation stores the positive cross-energy contraction Bq =
+−Bq . Here Z contains the m unit macroscopic driving fields. The positive coupling is
+Bq = |Ω|−1 Ω (Lϕ)T Aq Z dx, and consequently solves K
+            ∫︁
+                                                               ˆ︁ = −B˜︁(ξ) and evaluates
+                                                         ˜︁ (ξ)X
+  eff           T ˜︁ −1 ˜︁
+H = D − B K B . This is algebraically identical to the sign convention Bq = −Bq
+              ˜︁
+used in the variational definition above; the distinction prevents an ambiguity when
+reproducing the voxel contractions from the code.
+
+
+                                                 14
+3.1.3 Direct voxel-to-reduced compilation
+The definitions above also give a direct implementation route. Let sj be a snapshot
+column and define its stored microscopic field by zj = Lsj . For a prefix Sℓ , collect these
+fields as Zℓ (x) = [z1 (x), . . . , zrℓ (x)]. Let Z (x) collect the local macroscopic driving
+fields for the m unit loadings, so that z (x; g ) = Z (x)g . The projected affine blocks
+can then be evaluated without forming either global microscopic matrix Kq or Bq :
+
+                                      ∫︂
+                         ˜︁ q(ℓ) = 1
+                         K               Zℓ (x)T Aq (x; G )Zℓ (x) dx,                    (18)
+                                   |Ω| Ω
+                                      ∫︂
+                             (ℓ)    1
+                         Bq =
+                          ˜︁             Zℓ (x)T Aq (x; G )Z (x) dx,                     (19)
+                                   |Ω| Ω
+                                      ∫︂
+                                    1
+                           Dq =          Z (x)T Aq (x; G )Z (x) dx.                      (20)
+                                   |Ω| Ω
+
+For the voxel grid these integrals are means over the ordered voxel set. In the imple-
+mentation the snapshots already contain the six strain components, so applying L is
+part of the FOM snapshot generation rather than an additional compilation pass. This
+is a computational reorganization of the same Galerkin blocks, not a different reduced
+model.
+    The constitutive factors are applied on their phase/orientation support. If Aq,v =
+                T                           T
+Uq,v diag(wq )Uq,v , the contraction uses Uq,v Zℓ (xv ) and the corresponding weighted
+products. The entries of wq retain their signs: individual affine terms can be indefinite
+even though their admissible constitutive sum is positive definite. No positive-definite
+factorization of each separate term is assumed. The orientation factors and support
+ordering are cached once per geometry; snapshot features are streamed in bounded
+blocks to keep the GPU workspace within its memory budget.
+    When a new block ∆Zℓ is appended, the old–old block is retained and only the
+cross and new blocks are computed:
+
+                                 [︄                   ]︄                 [︄         ]︄
+                                      K˜︁ q(ℓ) Cq(ℓ)                           (ℓ)
+                                                                            B˜︁q
+                   ˜︁ q(ℓ+1) =
+                   K                                       B˜︁q(ℓ+1) =
+                                        (ℓ)T       (ℓ) ,                         (ℓ) .   (21)
+                                      Cq       ∆Kq                         ∆Bq
+
+       (ℓ)                                    (ℓ)       (ℓ)
+Here Cq = |Ω|−1 Ω ZℓT Aq ∆Zℓ dx, while ∆Kq and ∆Bq use ∆Zℓ in the correspond-
+                   ∫︁
+
+ing new–new and macro contractions. With fixed constitutive ranks and six strain
+components, this gives an O(Nvox r2 ) cumulative contraction cost for an enriched pre-
+fix, whereas reassembling every prefix costs O(Nvox ℓ rℓ2 ). These estimates describe
+                                                    ∑︁
+only the operator-contraction stage; the FFT snapshot and monitor solves remain
+separate terms in the offline budget. Both paths in the controlled benchmark use
+incremental updates; their measured difference therefore cannot be attributed to
+incremental assembly alone.
+    The same projection is applied to each intermediate response space generated
+during sequential Sobol enrichment, as described in Section 3.1.4.
+
+
+                                                     15
+3.1.4 Adaptive enrichment and monitoring
+The Sobol sequence fixes the order in which training materials are introduced, but it
+does not determine how many are needed, so the response space is enlarged sequen-
+tially until its accuracy is considered sufficient. At enrichment step ℓ, the first ℓ Sobol
+materials define the full-column-rank response space Sℓ ∈ Rn×rℓ , with rℓ ≤ mℓ, and
+applying the projection of Eq. (17) gives the intermediate blocks K                               ˜︁ q(ℓ) = S T Kq (G )Sℓ
+                                                                                                             ℓ
+and B     ˜︁q(ℓ) = S T Bq (G ). Each added material can therefore introduce new micro-
+                       ℓ
+scopic response directions and update the current Ritz model without removing those
+already collected, while its accuracy is checked using an independent monitor set
+                  (1)      (N )
+ΞM = {ξM , . . . , ξ M M } ⊂ Ξ. Training and monitoring thus have different roles: the
+Sobol materials construct the response space, whereas the monitor materials only
+assess the current approximation and never contribute snapshots.
+       Each monitor material is solved once with the FOM to obtain the reference operator
+    eff         (j)
+HFOM (ξ M ; G ), which is then reused throughout the enrichment process. For a given
+step ℓ, its affine coefficients are combined with the current projected blocks to form
+K˜︁ ℓ (ξ (j) ; G ) = ∑︁Q γq (ξ (j) )K  ˜︁ q(ℓ) and B ˜︁ℓ (ξ (j) ; G ) = ∑︁Q γq (ξ (j) )B       ˜︁q(ℓ) , after which the
+         M               q=1       M                        M                 q=1          M
+coordinates of the m microscopic unit-loading responses, X                            ˆ︁ (j) ∈ Rrℓ ×m , are obtained
+                                                                                        ℓ
+                   (j)
+from K     ˜︁ ℓ Xˆ︁ = B
+                   ℓ
+                         ˜︁ℓ . The current effective operator then follows from the same Schur
+structure as the FOM, Hℓeff = D − B               ˜︁ T Xˆ︁ (j) , so, after the reference FOM solution has
+                                                    ℓ     ℓ
+been computed once, subsequent monitor evaluations require only the current reduced
+system.
+       Since the objective of the reduced model is the effective operator itself, the quality
+of the current response          space is assessed directly from this quantity using the Frobenius
+norm ∥A∥F = ( a,b A2ab )1/2 , which combines the differences of all matrix entries into
+                       ∑︁
+a single magnitude, so the largest relative error over the monitor set is defined in
+Eq. (22) as
+                                                ⃦                                             ⃦
+                                                ⃦ eff (j)                   eff       (j)
+                                                ⃦Hℓ (ξ M ; G ) − HFOM              (ξ M ; G )⃦
+                                                                                              ⃦
+                            (ℓ)                                                                F
+                          eM = max                         ⃦                        ⃦              .                (22)
+                                  j=1,...,NM               ⃦ eff          (j)
+                                                                      ( ξ     ; G )
+                                                                                    ⃦
+                                                           ⃦HFOM M                  ⃦
+                                                                                  F
+        (ℓ)
+Hence, eM is the largest relative effective-operator error observed over the monitor
+materials for the current Sobol prefix, and, starting from a prescribed minimum num-
+ber ℓmin of training materials, this quantity is evaluated after each enrichment step
+while the prefix is enlarged one material at a time until the error first falls below the
+prescribed tolerance τROM . This first-crossing rule defines the final training size in
+Eq. (23) as
+                              {︂                                  }︂
+                                                          (ℓ)
+                     Ns = min ℓ ∈ {ℓmin , . . . , NC } : eM ≤ τROM .                 (23)
+Thus, Ns is the smallest Sobol prefix satisfying the monitor criterion, whereas, if none
+of the NC candidate prefixes reaches the prescribed tolerance, the target is reported
+as unmet.
+    The sequential enrichment also preserves an important variational property, since
+each new Sobol material may enlarge the response space but cannot remove any
+previously retained direction, so the successive spaces satisfy the nested relation in
+
+
+                                                          16
+Eq. (24):
+                                range(Sℓ ) ⊆ range(Sℓ+1 ).                                (24)
+Because each Ritz solution minimizes the same discrete energy over its current space,
+enlarging that space can only decrease or preserve the minimum energy, which leads
+to the effective-operator ordering stated in Eq. (25):
+
+                         eff             eff
+                        HFOM (ξ ; G ) ⪯ Hℓ+1 (ξ ; G ) ⪯ Hℓeff (ξ ; G ).                   (25)
+
+The ordering in Eq. (25) means that, for any macroscopic loading g , the energy asso-
+ciated with the Ritz solution decreases or remains unchanged as the response space
+is enriched, approaching the full-order result from above. Thus, each enrichment step
+can only improve or preserve the Ritz effective response in exact arithmetic, while
+the FOM remains the full-space reference; the complete proof is given in Appendix E.
+This monotone enrichment is stopped using the monitor criterion of Eq. (22), which
+is evaluated only over the finite set ΞM , so τROM should be interpreted as a practi-
+cal offline stopping tolerance rather than as an error bound over the entire domain Ξ,
+with Eq. (23) determining the final training size Ns and therefore the point at which
+the response space is frozen.
+
+3.1.5 Reference-energy normalization and final operator
+      compilation
+Once the adaptive procedure in Section 3.1.4 determines Ns , the response space is
+frozen and no further microscopic directions are added. Although the resulting matrix
+S already spans the desired Ritz space, its columns come from different materials and
+loading states and may therefore have different energetic scales or be closely related,
+which can lead to poorly scaled reduced matrices. The response space is therefore re-
+expressed in a reference-energy coordinate system that improves its numerical scaling
+without changing its dimension or removing any of the retained information.
+    A representative microscopic operator is first constructed from the complete Sobol
+candidate sequence by averaging its affine coefficient vectors. The average coefficients
+and the corresponding reference operator are defined in Eq. (26) as
+
+                    NC                                        Q
+                  1 ∑︂       (j)
+                                                             ∑︂
+            γ=          γ (ξ C ) ∈ RQ ,        Kref (G ) =         γ q Kq (G ) ∈ Rn×n .   (26)
+                 NC j=1                                      q=1
+
+
+Using the affine representation in Eq. (13), Kref (G ) is simply the average microscopic
+operator associated with the candidate materials, so it provides a representative ener-
+getic scale for the admissible material domain. Candidate points outside the selected
+training prefix contribute only their affine coefficients to this average, which requires
+no additional FOM solutions and introduces no new snapshots.
+    The reference operator defines the energy-based inner product ⟨a, b⟩Kref = aT Kref b,
+which measures how two retained microscopic directions relate to each other under
+this representative energy. Applying it to all pairs of columns of S gives the Gram
+matrix Gref = S T Kref S , whose entries collect these pairwise energy products; using
+
+
+                                              17
+Eqs. (26) and (17), this matrix can be assembled directly from the already projected
+                  ∑︁Q
+blocks as Gref = q=1 γ q K˜︁ q , without returning to the full-dimensional operators.
+    Since S has full column rank and Kref is symmetric positive definite, Gref is also
+positive definite and can be factorized by Cholesky. This factorization is then used
+to rescale and orthogonalize the Ritz coordinates in the reference-energy metric, as
+defined in Eq. (27):
+
+                                                               −1
+                     Gref = S T Kref S = Rref
+                                          T
+                                              Rref ,    Vr = SRref ,                 (27)
+
+where Rref ∈ Rr×r is the invertible upper-triangular Cholesky factor and Vr ∈ Rn×r is
+the resulting reference-energy Ritz basis. From Eq. (27), VrT Kref Vr = I , so the columns
+of Vr have unit scale and are mutually orthogonal with respect to the reference energy,
+while range(Vr ) = range(S ) because Rref is invertible. The normalization therefore
+changes only the coordinates used to describe the Ritz space and does not truncate
+or modify the space itself.
+    The affine blocks can now be written in these normalized coordinates, so the oper-
+ators required for future material queries are stored directly in the final Ritz basis.
+                                                             −1
+Using Kq,r = VrT Kq (G )Vr , Bq,r = VrT Bq (G ), and Vr = SRref , together with Eq. (17),
+gives the compiled blocks in Eq. (28):
+
+                        −T ˜︁   −1                             −T ˜︁
+           Kq,r (G ) = Rref Kq Rref ∈ Rr×r ,      Bq,r (G ) = Rref Bq ∈ Rr×m .       (28)
+
+Because Eq. (28) uses only the already projected blocks, the full-dimensional basis
+Vr does not need to be formed explicitly during compilation. Together with the
+unchanged macroscopic blocks Dq (G ) ∈ Rm×m , the set {Kq,r (G ), Bq,r (G ), Dq (G )}Q
+                                                                                     q=1
+is the final microstructure-dependent representation stored for the online material
+queries introduced in Section 3.2.
+
+The same compiled blocks in POD coordinates.
+For a fixed positive-definite metric W , let GW = S T W S = U ΛU T . Retaining k
+                                 −1/2
+positive modes defines Tk = Uk Λk     and the POD basis Qk = STk . Its affine blocks
+are obtained entirely in reduced coordinates:
+
+               KqPOD = TkT K
+                           ˜︁ q Tk ,    BqPOD = TkT B
+                                                    ˜︁q ,    DqPOD = Dq .            (29)
+
+For energy POD, GW = Gref is already available. If all modes are retained, this is an
+invertible change of coordinates and the effective Schur output is unchanged in exact
+arithmetic. Truncation changes the approximation space; in the comparison below its
+dimension is selected on monitors, without inspecting held-out outputs. Neither this
+equivalence nor metric reuse requires reconstructing the POD fields on the voxel grid.
+
+3.2 Online Ritz–Schur transfer
+After the reference-energy normalization in Section 3.1.5, the fixed microstructure
+is fully represented by the compiled blocks {Kq,r (G ), Bq,r (G ), Dq (G )}Q
+                                                                           q=1 , so a new
+
+
+
+                                            18
+material ξ ⋆ ∈ Ξ enters the online model only through its affine coefficients γq (ξ ⋆ ).
+These coefficients are used to combine the stored blocks, giving the material-dependent
+reduced operators defined in Eq. (30):
+
+                                                 Q
+                                                ∑︂
+                              Kr (ξ ⋆ ; G ) =         γq (ξ ⋆ )Kq,r (G ),
+                                                q=1
+                                                 Q
+                                                ∑︂
+                              Br (ξ ⋆ ; G ) =         γq (ξ ⋆ )Bq,r (G ),               (30)
+                                                q=1
+                                                 Q
+                                                ∑︂
+                               D(ξ ⋆ ; G ) =          γq (ξ ⋆ )Dq (G ).
+                                                q=1
+
+
+Here, Kr (ξ ⋆ ; G ) ∈ Rr×r , Br (ξ ⋆ ; G ) ∈ Rr×m , and D(ξ ⋆ ; G ) ∈ Rm×m , so chang-
+ing the material modifies only the scalar weights used to combine the precomputed
+microstructure-dependent blocks, without requiring a new spatial assembly or projec-
+tion.
+    The m microscopic unit-loading responses are then represented in the normalized
+Ritz space as Xr = Vr X  ˆ︁r , where X   ˆ︁r ∈ Rr×m contains their reduced coordinates.
+Applying the same Ritz–Galerkin condition introduced in Section 3.1.2 gives the
+reduced equilibrium system in Eq. (31):
+
+                             Kr (ξ ⋆ ; G )X
+                                          ˆ︁r (ξ ⋆ ; G ) = Br (ξ ⋆ ; G ).               (31)
+
+The microscopic equilibrium is therefore obtained from a system of dimension r rather
+than n, with r ≪ n, after which the effective operator follows from the same Schur
+elimination used by the FOM. Since Xr = Vr X    ˆ︁r and Br = VrT B , the microscopic
+contribution B Xr can be evaluated directly as BrT X
+               T                                      ˆ︁r , leading to the online Ritz–
+Schur transfer defined in Eq. (32):
+
+               Hreff (ξ ⋆ ; G ) = D(ξ⋆ ; G ) − Br (ξ ⋆ ; G )T X
+                                                              ˆ︁r (ξ ⋆ ; G ) ∈ Rm×m .   (32)
+
+Thus, the queried material is mapped directly to its effective constitutive operator
+using only reduced quantities, while the full microscopic response Xr = Vr X   ˆ︁r does
+not need to be reconstructed during the online evaluation.
+    For fixed m, assembling the reduced affine operators requires O(Qr2 ) operations
+and solving Eq. (31) requires O(r3 ), giving an online complexity of O(Qr2 + r3 ).
+Although the reduced solve therefore scales cubically with r, this dimension is much
+smaller than the full microscopic dimension, r ≪ n, so the resulting dense algebra
+remains inexpensive. By comparison, the Fourier–Galerkin FOM used in the numerical
+assessment requires approximately O(mICG Nvox log Nvox ) per material, where ICG
+is the representative number of conjugate-gradient iterations and Nvox is the total
+number of voxels. In the three-dimensional strain-based implementation, the FOM
+stores six microscopic field components per voxel and therefore operates on an ambient
+representation of size 6Nvox , while n denotes the number of independent unknowns
+
+
+                                                 19
+after the discrete admissibility constraints are imposed. Consequently, n scales linearly
+with Nvox , and the online cost is governed by the small Ritz dimension r ≪ n rather
+than by the spatial resolution of the microstructure. The resulting reduction in query
+time is quantified for the three-dimensional elasticity cases in Section 4.3.
+
+3.3 Ritz–Schur error identity
+The Ritz construction also provides an exact relation between the microscopic response
+error and the resulting difference in the effective operator. For a fixed material–
+microstructure pair (ξ, G ), let ∆X = X − Xr ∈ Rn×m denote the difference between
+the FOM and ROM microscopic responses, and let R = B − KXr ∈ Rn×m denote
+the residual obtained when the ROM response is inserted into the full-order equilib-
+rium equation. A vanishing residual, R = 0, means that the ROM satisfies the FOM
+equilibrium exactly, whereas R ̸= 0 indicates that some microscopic equilibrium error
+remains; this connection follows directly from the FOM relation KX = B and the def-
+inition X = Xr +∆X , which give R = B −KXr = KX −KXr = K ∆X . Since K (ξ ; G )
+is invertible, R = 0 is therefore equivalent to ∆X = 0, showing that the residual
+directly measures the remaining difference between the FOM and ROM microscopic
+responses.
+    Combining this relation with the Galerkin orthogonality established in Section 3.1.2
+gives the exact Ritz–Schur identity in Eq. (33):
+
+     Hreff (ξ; G ) − HFOM
+                      eff
+                          (ξ ; G ) = (∆X )T K (ξ ; G )(∆X ) = RT K (ξ ; G )−1 R ⪰ 0.   (33)
+
+The complete algebraic derivation is provided in Appendix F. The condition ⪰ 0 means
+that the difference between the reduced and full-order operators gives a nonnegative
+energy for every macroscopic loading g , since g T [Hreff −HFOM
+                                                            eff
+                                                                ]g = (∆Xg )T K (∆Xg ) ≥
+0. Thus, the effective-operator difference is exactly the microscopic Ritz error measured
+through the energy associated with K , which is consistent with the Loewner ordering
+introduced in Section 3.1.4.
+    Equation (33) is exact with respect to the discrete FOM, but evaluating the term
+RT K −1 R directly would require applying the full-order inverse and would therefore
+remove the main advantage of the online model. The identity is consequently used
+here to establish the variational relation between the Ritz and FOM operators rather
+than as an online error estimator, while the accuracy of the frozen reduced model is
+assessed independently on material points that played no role in its construction.
+
+Finite precision and coordinate conditioning.
+The variational identity is an exact-arithmetic result. Nearly dependent snapshots and
+cancellation between signed affine terms can amplify errors in float32 volumetric con-
+tractions. Re-expressing reduced coordinates in an energy metric, or equilibrating a
+reduced system by a diagonal congruence, can improve its scaling but   √︁ cannot recover
+accuracy already lost during contraction. For example, with Pii = (Kr )ii , the sys-
+tem P −1 Kr P −1 y = P −1 Br is algebraically equivalent to the original system, with
+Xˆ︁ = P −1 y . This requires no voxel pass, but its runtime overhead and numerical ben-
+efit must be measured separately. It is not a finite-precision positivity certificate. The
+
+
+                                             20
+timing campaign below refers to the archived solver configuration used in that cam-
+paign; subsequent conditioning changes are not credited with those timings. Negative
+numerical Schur gaps are reported explicitly, rather than removed from the validation
+statistics or interpreted as a disproof of the exact identity.
+
+3.4 Independent held-out validation
+The monitor set ΞM cannot be used as the final accuracy test because it already
+participates in the offline construction by determining where the Sobol enrichment
+is stopped, so, after Ns , the response space, and the compiled operators have been
+                                            (1)      (N )
+frozen, a separate held-out set ΞV = {ξV , . . . , ξ V V } ⊂ Ξ is evaluated with both
+the FOM and the completed Ritz model. For each held-out material, the relative
+effective-operator error is defined in Eq. (34) as
+                   ⃦                                ⃦
+                   ⃦ eff (j)          eff    (j)
+                   ⃦Hr (ξ V ; G ) − HFOM  (ξ V ; G )⃦
+                                                    ⃦
+                                                     F
+            eV,j =       ⃦                ⃦            ,     j = 1, . . . , NV .     (34)
+                         ⃦ eff      (j)
+                         ⃦HFOM (ξ V ; G )⃦
+                                          ⃦
+                                              F
+
+These FOM evaluations are performed only after the reduced model has been
+completed and therefore cannot change Ns , the Ritz space, the reference-energy nor-
+malization, or any compiled operator. The two material sets consequently have distinct
+purposes: ΞM provides the practical offline stopping criterion, whereas ΞV measures
+the predictive accuracy of the final model on previously unseen materials.
+
+3.5 Offline–online workflow
+The preceding construction separates the computational work into two stages: the fixed
+microstructure is compiled once using full-order information during the offline stage,
+whereas each subsequent material query uses only the stored reduced operators and its
+affine constitutive coefficients. The complete sequence is summarized in Algorithm 1,
+while the held-out evaluation is included separately at the end of the algorithm only
+as a post-freeze assessment and does not modify the compiled model.
+   Algorithm 1. Offline compilation, online query, and independent validation of
+the Sobol–Ritz transfer operator for a fixed microstructure G .
+   Input: fixed microstructure G, constitutive domain Ξ, Sobol candidate sequence ΞC ,
+monitor set ΞM , tolerance τROM , and first monitored prefix size ℓmin .
+   Offline compilation
+
+Prepare phase/orientation factors and macro blocks Dq . Do not assemble global matrices Kq or Bq .
+                                                             eff     (j)
+Evaluate each material in ΞM once with the FOM and store HFOM     (ξ M ; G).
+Initialize the snapshot collection.
+for ℓ = 1, . . . , NC do
+                         (ℓ)
+   Solve Eq. (10) at ξC for the m unit macroscopic loadings.
+                    (ℓ)
+   Append X(ξ C ; G) to the accumulated snapshot matrix.
+   Form a full-column-rank matrix Sℓ that preserves the complete accumulated response span, removing exact redundanci
+
+
+                                           21
+                                                          (ℓ)   (ℓ)
+                                                        ˜︁q }Q from Eq. (17).
+   Contract only new and cross blocks to update {K
+                                                 ˜︁ q , B
+                                                             q=1
+   if ℓ ≥ ℓmin then
+        Evaluate the monitor materials using the current Ritz model.
+                                                     (ℓ)
+        Compute the maximum monitor error eM from Eq. (22).
+            (ℓ)
+        if eM ≤ τROM then
+              Set Ns ← ℓ, S ← Sℓ , and r ← rℓ .
+                            ˜︁ q(ℓ) and B
+                     ˜︁ q ← K
+              Freeze K                        ˜︁q(ℓ) for q = 1, . . . , Q.
+                                        ˜︁q ← B
+              break.
+        end if
+   end if
+end for
+if no prefix satisfies Eq. (23) then
+    Report the prescribed tolerance as unmet and terminate the compilation.
+end if
+Compute the average affine coefficients γ and the reference operator Kref (G) using Eq. (26).
+Assemble Gref = Q
+               ∑︁
+                  q=1 γ q Kq and compute the Cholesky factor Rref using Eq. (27).
+                          ˜︁
+Transform the frozen projected blocks into the normalized operators {Kq,r (G), Bq,r (G)}Q
+                                                                                        q=1 using Eq. (28).
+Store {Kq,r (G), Bq,r (G), Dq (G)}Q
+                                  q=1 as the compiled representation of G.
+
+    Online material query
+
+Given ξ⋆ ∈ Ξ:
+Evaluate its affine coefficients γ(ξ ⋆ ).
+Assemble Kr (ξ ⋆ ; G), Br (ξ ⋆ ; G), and D(ξ⋆ ; G) using Eq. (30).
+Solve Eq. (31) for X  ˆ︁r (ξ ⋆ ; G).
+            eff ⋆
+Evaluate Hr (ξ ; G) using Eq. (32).
+return Hreff (ξ ⋆ ; G).
+
+    Independent post-freeze validation
+
+                 (1)       (N )
+Given ΞV = {ξV , . . . , ξ V V }:
+for j = 1, . . . , NV do
+                   eff    (j)
+   Evaluate HFOM       (ξ V ; G) with the FOM.
+                       (j)
+   Evaluate Hreff (ξ V ; G) with the frozen reduced model.
+   Compute eV,j using Eq. (34).
+end for
+
+
+
+
+4 Numerical assessment in linear elasticity
+The proposed Sobol–Ritz transfer formulation is assessed in three-dimensional linear
+elasticity over ten periodic composite microstructures. Elasticity is selected as a con-
+servative representative case because it requires six independent macroscopic loading
+states, providing an upper workload with respect to the number of load cases among
+
+
+                                                22
+the physical problems considered here. The assessment then examines adaptive con-
+struction, independent held-out accuracy, computational performance, and comparison
+with data-only surrogates.
+
+
+
+
+4.1 Problem setup and numerical campaign
+For three-dimensional linear elasticity, the general formulation introduced in Section 2
+specializes as
+
+
+                         m = 6,             Lu = ε(u),             A = C,               H eff = C eff .                                  (35)
+
+
+Equation (35) implies X ∈ Rn×6 , HFOMeff
+                                          = CFOMeff
+                                                    , and Hreff = Creff . Accordingly, the
+full-order Schur map in Eq. (11) becomes CFOM = D − B T K −1 B .
+                                             eff
+
+    The constitutive family consists of an isotropic matrix and transversely isotropic
+fibers. The queried material vector is
+
+
+                                   ξ = (Em , νm , EL , ET , GLT , νLT , νT T ).                                                          (36)
+
+
+The seven quantities in Eq. (36) define the admissible constitutive domain used
+throughout the numerical campaign. For this material family, the affine representation
+contains Q = 7 coefficients. Their explicit construction in Mandel notation, including
+the local fiber-frame rotation, is provided in Appendix G.
+    The numerical campaign spans both constitutive and geometric variation. The
+admissible material domain is defined by the seven constitutive parameters in Table 1,
+while the ten fixed microstructures G00–G09 in Table 2 vary in fiber volume fraction,
+aspect ratio, and orientation distribution. Each microstructure is compiled indepen-
+dently into its own Sobol–Ritz operator. Figure 3 shows representative central voxel
+slices of the ten cells to illustrate their geometric variation.
+
+
+Table 1 Constitutive-parameter domain                         Table 2 Fixed microstructures used in the numer-
+used in the numerical assessment.                             ical campaign. The volume fraction is measured
+Parameter                          Symbol       Range         after voxelization.
+Matrix Young’s modulus              Em       [1.1, 4.4] GPa   Microstructure    Vf       Aspect ratio   Orientation (a11 , a22 , a33 )    Grid
+Matrix Poisson ratio                νm         [0.35, 0.42]
+Fiber longitudinal modulus          EL       [72, 395] GPa    G00              0.1502        12.5             (1/3, 1/3, 1/3)             1503
+Fiber transverse modulus            ET         [6, 23] GPa    G01              0.0497        12.5             (1/3, 1/3, 1/3)             1503
+Fiber longitudinal shear modulus    GLT        [8, 30] GPa    G02              0.2502        12.5             (1/3, 1/3, 1/3)             1503
+Fiber longitudinal Poisson ratio    νLT        [0.20, 0.26]   G03              0.1514         5.0             (1/3, 1/3, 1/3)              603
+Fiber transverse Poisson ratio      νT T       [0.35, 0.40]   G04              0.1499        20.0             (1/3, 1/3, 1/3)             2403
+                                                              G05              0.1483        12.5              (0.50, 0.50, 0)            1503
+                                                              G06              0.1502        12.5            (0.90, 0.05, 0.05)           1503
+                                                              G07              0.1497        12.5            (0.65, 0.25, 0.10)           1503
+                                                              G08              0.0489         5.0             (1/3, 1/3, 1/3)              603
+                                                              G09              0.2498        20.0             (1/3, 1/3, 1/3)             2403
+
+
+
+
+                                                              23
+Fig. 3 Central slices of the periodic microstructures G00–G09. Black and white denote
+the fiber and matrix phases, respectively
+
+    For each microstructure, a fixed Sobol candidate sequence of NC = 1024 con-
+stitutive points is used. Adaptive enrichment starts from ℓmin = 2 materials and is
+controlled by an independent monitor set of NM = 5 materials with τROM = 10−4 .
+After the reduced model is frozen, its accuracy is assessed on an independent NV = 20
+maximin design selected from a separate 4096-point Sobol pool. The same mate-
+rial designs are used for G00–G09. The five monitor materials require additional
+full-order solves; therefore 6–16 training materials mean 11–21 construction materi-
+als per geometry, each with six load cases. The 20 validation materials are charged
+separately. Sharing the validation design gives 200 material–geometry pairs, not 200
+independently drawn material vectors.
+    All reported microstructures are discretized using 6 voxels per fiber diameter, with
+the resolution-convergence study in Appendix H showing that, for the representative
+cells G08, G00, and G09, the relative change in effective stiffness between 5 and 6
+voxels per fiber diameter ranges from 0.099% to 0.910%. These changes exceed some
+reported reduction errors and do not establish convergence to a continuum reference;
+ROM accuracy below is measured against the corresponding voxel-discrete FOM.
+
+
+
+4.2 Adaptive construction and independent validation
+Adaptive construction.
+Table 3 summarizes the adaptive construction results for the ten microstructures. The
+first-crossing criterion selects Ns = 6–16 training materials, corresponding to final
+snapshot ranks of r = 36–96, while all microstructures satisfy the prescribed 0.01%
+monitor threshold. The required reduced-space dimension varies noticeably across
+geometries: the dilute cells G01 and G08 satisfy the stopping criterion with only six
+training materials, whereas G09 requires 16. This variation indicates that, even over
+the same constitutive domain, the complexity of the transferable microscopic response
+space depends strongly on the underlying microstructure.
+
+
+                                          24
+ Table 3: Adaptive construction and independent held-out validation. Relative errors
+ are reported in percent. Eigenvalues of Kr are dimensionless in reference-energy
+ coordinates; those of Creff are in GPa.
+                Adaptive construction     Held-out accuracy          Stability diagnostics
+                                 (N )
+                                eM s    Mean error Max. error
+ Microstructure Ns     r         [%]       [%]       [%]      min λmin (Kr ) min λmin (Creff )
+ G00             11   66     0.009620      0.02373     0.09871           0.326               1.656
+ G01              6   36     0.009056      0.01829     0.05248           0.332               1.048
+ G02             15   90     0.009524      0.02437     0.10317           0.327               2.335
+ G03             11   66     0.008080      0.01648     0.06047           0.325               1.323
+ G04             12   72     0.009094      0.02095     0.07929           0.327               1.773
+ G05             11   66     0.009766      0.02434     0.10458           0.325               1.202
+ G06             11   66     0.009210      0.02597     0.10833           0.326               1.137
+ G07             12   72     0.008014      0.01873     0.07006           0.326               1.342
+ G08              6   36     0.009212      0.01786     0.07948           0.329               0.931
+ G09             16   96     0.009754      0.02615     0.13216           0.327               2.659
+
+
+
+
+Independent held-out validation.
+After adaptive construction, each operator is frozen and evaluated on the independent
+held-out material set. Figure 4 contrasts the monitor trajectories used for stopping
+with the subsequent held-out errors. Across the 200 material–microstructure evalu-
+ations, the aggregate mean error is 0.02169%, the 95th percentile is 0.07765%, and
+the maximum error is 0.13216%. The held-out distribution is therefore broader than
+the monitor threshold, as expected because the stopping criterion controls only the
+independent monitor set rather than imposing a uniform error bound over the full
+constitutive domain.
+     Only 88 of the 200 pairs satisfy the 0.01% monitor tolerance on validation; 196
+satisfy 0.1%. A small monitor error therefore does not justify a uniform accuracy
+statement. The shared material design also limits statistical independence across
+geometries.
+     All reduced systems and effective tensors in this campaign are positive definite,
+with minimum reduced eigenvalue 0.325 in reference-energy coordinates and minimum
+stiffness eigenvalue 0.931 GPa. This statement applies to the evaluated points. The
+stronger numerical condition Creff − CFOM  eff
+                                                ⪰ 0 fails for 8 of 200 pairs: the minimum
+value of λmin (Creff − CFOM
+                         eff     eff
+                             )/∥CFOM    ∥2 is −2.19 × 10−6 . These diagnostics distinguish
+positive predicted elastic energy from a numerically certified upper bound. An addi-
+tional archived seed stress test also found an indefinite reduced system for a G08
+prefix (minimum eigenvalue -0.0937); this configuration is outside the main campaign
+in Table 3. It shows that robustness to nearly dependent snapshots is not established
+by the positive eigenvalues of the main campaign alone.
+     To relate tensor errors to mechanical responses, the same frozen tensors were also
+audited through their compliance and directional moduli (Table 4). The worst energy
+                                     eff −1/2                   eff −1/2
+error uses the spectral radius of CFOM         (Creff − CFOM
+                                                         eff
+                                                             )CFOM       , so it covers every
+macroscopic strain direction for each evaluated material. Directional Young and shear
+
+
+                                              25
+         Table 4: Mechanical response errors on the original 200 validation
+         pairs
+         Quantity                                          Maximum relative error [%]
+         Stiffness, Frobenius norm                                             0.1322
+         Energy, all macroscopic strain directions                             0.2783
+         Compliance, Frobenius norm                                            0.1613
+         Directional Young’s modulus, audited directions                       0.1561
+         Directional shear modulus, audited directions                         0.2031
+
+
+
+
+errors refer to the coordinate axes and shear planes; they are not extrema over all
+spatial orientations. These are tensor-level mechanical checks, not a component-scale
+loading simulation.
+
+
+
+
+Fig. 4 Adaptive construction and independent held-out validation. (a) Maximum
+monitor error during nested Sobol-prefix enrichment, with each trajectory terminating
+at the first crossing of the 0.01% target. (b) Relative errors over the 20 held-out mate-
+rials for each microstructure; horizontal segments denote microstructure-wise means.
+The reference level emphasizes the distinction between the adaptive stopping toler-
+ance and independent held-out accuracy
+
+
+4.3 Controlled comparison with POD and reduced-basis
+    models
+A separate campaign compares G08, G00, and G09 using two independent compila-
+tion runs per geometry, with reversed execution order in the second repetition. The
+complete snapshot model is denoted full-span RB. Energy POD and L2 POD use the
+same snapshot materials and all six load cases. Their retained ranks are selected using
+only the same five monitor materials, with the same 10−4 stopping target. Snapshots
+and volumetric contractions use float32; reduced algebra and the direct L2 Gram
+use float64. Validation tensors are excluded from all construction decisions and are
+
+                                              26
+      Table 5: Controlled construction and POD comparison. Construction
+      times are means of two complete measured intervals; CPU query times
+      are means of the two per-run medians. Maximum validation errors are
+      reported in percent
+      Cell Model / compilation        Rank Offline [s] CPU [µs] Max. error [%]
+      G08 Full-span RB / factorized      36      2.255      21.18         0.09396
+          Energy POD / factorized        32      2.260      19.83         0.09502
+          L2 POD / conventional          31      2.201      19.83         0.09613
+      G00 Full-span RB / factorized      66     30.659      31.51         0.14656
+          Energy POD / factorized        60     30.669      29.63         0.14875
+          L2 POD / conventional          59     38.891      29.49         0.15445
+      G09 Full-span RB / factorized      96    159.413      47.83         0.14112
+          Energy POD / factorized        92    159.445      46.38         0.14671
+          L2 POD / conventional          94    232.379      47.62         0.14222
+
+
+
+
+first computed after the initial model has been frozen. Twenty common fresh mate-
+rial vectors give 60 material–geometry pairs; the two timing repetitions do not create
+additional independent validation data.
+    The factorized path builds the full-span model and supplies the operators for energy
+POD. POD is charged the complete construction cost plus its selection and export
+stage, not merely the cost of a small eigendecomposition. The conventional path uses
+incremental spatial contractions and a direct L2 Gram product; it shares the opti-
+mized full-order solver and overlaps Gram work with independent compilation work.
+A full-span control using this second path isolates compilation from truncation. Fixed
+phase/orientation hashes, material sequences, and full-order settings are retained with
+the results. All device work is serialized between models; the two repetitions are
+insufficient for a broad hardware performance claim.
+    The complete construction interval starts at runtime preparation and ends at
+operator export. It includes geometry preparation, training solves, five monitor
+solves, contractions, normalization, and selection where applicable; it excludes Python
+import/startup and held-out validation. The full-span factorized intervals range from
+2.089 to 2.420 s for G08, 29.991 to 31.326 s for G00, and 157.814 to 161.012 s for G09.
+Relative to the tested conventional L2 POD path, mean construction is reduced by
+21.2% for G00 and 31.4% for G09, while it is 2.5% slower for G08. This is an imple-
+mentation comparison: energy POD uses the same factorized compiler and has nearly
+the same construction time with a smaller rank.
+    The conventional full-span controls require 2.195, 38.880, and 232.353 s for G08,
+G00, and G09, respectively. Their similarity to the corresponding L2 POD construc-
+tion costs confirms that operator assembly, rather than POD selection, dominates this
+difference. Re-expressing the same raw blocks in untruncated POD coordinates pre-
+serves their output to about 4.3 × 10−14 relative error. Independently compiled float32
+blocks, however, differ by up to 2.76 × 10−4 in relative effective-tensor norm in these
+runs, explaining why nominally equivalent full-span models need not have identical
+
+
+                                          27
+      Table 6: G09 construction budget, means of two repetitions in seconds.
+      Rounded entries may not sum exactly
+      Stage                            Full-span / factorized   L2 POD / conventional
+      Training FOM solves                             95.052                   94.799
+      Monitor FOM solves                              24.901                   24.077
+      Affine assembly                                 30.714                  104.919
+      Remaining non-overlapping time                   8.747                    8.584
+      Complete interval                              159.413                  232.379
+
+
+
+
+finite-precision validation errors. The G09 full-span, energy POD, and conventional
+L2 POD models meet the 10−4 Frobenius threshold on 11, 10, and 11 of the 20 held-
+out materials, respectively. Small negative Schur-gap eigenvalues also occur in this
+campaign (down to approximately −2.0 × 10−5 GPa); positive predicted stiffness and
+finite-precision upper-bound ordering remain separate checks.
+
+
+Where the G09 construction time is spent.
+Table 6 separates the measured stages. Gram work that overlaps other work is not
+added a second time. Once contraction is reduced, snapshot and monitoring solves
+account for about 75% of the factorized construction interval. Further reductions there-
+fore require either fewer necessary full-order materials or cheaper full-order solves, in
+addition to operator-level optimizations.
+
+
+Latency, throughput, and memory.
+The GPU construction uses an NVIDIA GeForce RTX 5070 Ti with CuPy 13.6.0
+and CUDA runtime 13.0. Isolated CPU queries include material-to-coefficient conver-
+sion, reduced assembly, a Cholesky solve with six right-hand sides, and tensor output,
+with one BLAS thread and 200 samples per model per run. The full-span times in
+Table 5 are therefore latencies, not per-item GPU batch averages. For G09, synchro-
+nized batches of 1024 coefficient queries take 3.932 ms for the full-span model, 3.785
+ms for energy POD, and 3.859 ms for conventional L2 POD. These measurements
+exclude one-time operator upload and are not isolated GPU query latencies.
+    Peak host resident memory for G09 is 36.93 GiB for factorized full-span construc-
+tion and 36.89 GiB for conventional L2 POD; sampled additional device memory is
+9.57 and 6.66 GiB, respectively. The factorized path does not show a peak-memory
+reduction in this comparison. Exported G09 operators occupy 537.5 KiB for full-span
+RB and 495.0 KiB for energy POD. The compact online artifact should therefore be
+distinguished from the much larger offline snapshot workspace.
+    For an intended query workload, amortization must use a common timing bound-
+ary: NBE = ⌈Toffline /(tFOM −tROM )⌉, provided the denominator is positive. Stage sums
+from older runs and per-item batch throughput are not interchanged with complete
+construction time and isolated latency. No universal break-even count is inferred from
+those mixed measurements.
+
+                                            28
+            Table 7: Same-prefix held-out comparison with data-only sur-
+            rogates. Relative Frobenius errors are reported in percent.
+                                     Mean error [%]       Maximum error [%]
+                                 Sobol–               Sobol–
+            Microstructure Ns     Ritz    RBF Kriging  Ritz       RBF Kriging
+            G00             11   0.0237  4.15     5.65   0.0987   14.38   17.37
+            G01             6    0.0183 14.22    12.05   0.0525   55.81   44.42
+            G02             15   0.0244  5.09     3.48    0.103   18.17    8.35
+            G03             11   0.0165  2.40    10.13   0.0605    6.12   33.54
+            G04             12   0.0209  4.70     5.12   0.0793   17.90   12.30
+            G05             11   0.0243  5.63     7.20    0.105   20.05   27.70
+            G06             11   0.0260  6.76     8.01    0.108   23.84   19.55
+            G07             12   0.0187  5.31     4.41   0.0701   18.59   10.89
+            G08             6    0.0179 10.21    14.46   0.0795   41.39   54.14
+            G09             16   0.0261  4.46     2.48    0.132   15.55    5.72
+            Overall         –    0.0217   6.29    7.30    0.132 55.81     54.14
+
+
+
+
+4.4 Comparison with data-only surrogates
+Sobol–Ritz is compared with RBF interpolation and Kriging regression under the same
+training and validation conditions. For each microstructure, the three approaches are
+trained using exactly the same Sobol material samples and evaluated on the same
+20 held-out materials. RBF and Kriging use the 21 independent components of the
+effective stiffness tensor as training outputs, whereas Sobol–Ritz uses the six corre-
+sponding microscopic response fields to construct the transfer space. RBF and Kriging
+hyperparameters are selected using training data only, as detailed in Appendix I.
+    The results in Table 7 show a clear separation between Sobol–Ritz and the data-
+only surrogates. The aggregate mean error of Sobol–Ritz is 0.0217%, compared with
+6.29% for RBF and 7.30% for Kriging; the corresponding maximum errors are 0.132%,
+55.81%, and 54.14%, respectively. The same material samples do not imply the same
+training information: RBF and Kriging use only the homogenized stiffness tensor,
+whereas Sobol–Ritz retains the six microscopic response fields to construct the trans-
+fer space. This comparison measures the benefit of retaining microscopic information
+and enforcing the cell equations together; it does not isolate their individual contribu-
+tions or replace the POD comparison. Moreover, the nested Sobol–Ritz construction
+preserves the variational structure of the full-order problem and provides a monotone
+Loewner ordering of the effective operator under nested enrichment, a property not
+enforced by the data-only surrogates.
+    Figure 5 illustrates how this difference evolves as the common training prefix
+increases for G03 and G09. Sobol–Ritz maintains substantially lower held-out errors
+over the sampled prefixes, showing that its advantage is already evident with small
+training sets.
+
+
+                                            29
+Fig. 5 Same-prefix sample efficiency for G03 and G09. Mean held-out relative error
+as the common training prefix increases. RBF and Kriging are retuned using only the
+training data available at each prefix
+
+
+5 Conclusions
+This work develops and assesses an affine operator compiler for reduced-order homog-
+enization of voxelized linear elastic composites. Phase-supported constitutive factors,
+incremental contractions, and reuse of projected metrics reduce the spatial work
+required to construct the reduced operators. The resulting Schur map is shared by
+full-span reduced-basis and POD models; its established variational identities provide
+discrete energy diagnostics for the implemented Galerkin models.
+    On ten short-fiber geometries, 6–16 snapshot materials plus five monitor materials
+produce ranks of 36–96 and a mean held-out stiffness error of 0.0217%, with maximum
+0.1322%. The maximum energy error over macroscopic strain directions is 0.2783%
+on those evaluated materials. Only 88 of the 200 material–geometry pairs meet the
+0.01% monitor tolerance. The independent validation errors therefore characterize
+predictive accuracy separately from the training stopping criterion. Voxel-resolution
+error remains a separate source of uncertainty.
+    The controlled three-geometry comparison attributes the main measured saving to
+operator compilation: complete construction is reduced by 21.2% for G00 and 31.4%
+for G09 relative to the tested conventional path, with no saving for G08. Energy
+POD uses the same compiler at almost identical offline cost and smaller rank. Isolated
+CPU queries require 21.18–47.83 microseconds for the full-span models. Peak offline
+memory remains substantial, and no advantage over all possible POD implementations
+is established.
+    Further development should connect these tensor-level results to a demanding
+mechanical workload, extend independent spatial verification, and control mixed-
+precision errors in nearly dependent contractions. Additional controlled ablations
+should separate the effects of constitutive factorization, incremental assembly, and
+metric reuse, using matched precision and full-order settings. These steps would
+
+
+
+                                          30
+strengthen the assessment of the compiler’s practical value for repeated elastic
+homogenization.
+
+
+A Derivation of the microscopic variational functional
+Consider a symmetric linear constitutive law in which the local response associated
+with a field z is
+                                 y = A(x; ξ, G )z,
+where y denotes the constitutively conjugate response. In linear elasticity, for example,
+z = ε, y = σ , and A = C.
+    Because the constitutive relation is linear, the quadratic potential associated with
+increasing the local field from zero to z is obtained by integrating the constitutive
+response along this loading path, giving
+                                         ∫︂ 1
+                                                                   1 T
+                           ψ (z ) =              z T A(tz ) dt =     z Az.
+                                             0                     2
+
+The factor 1/2 appears because the constitutive response increases linearly from zero
+to its final value. In elasticity, this expression reduces to the familiar strain-energy
+density ψ = 21 εT Cε.
+    Using the local-field decomposition introduced in Eq. (3),
+
+                                 z (x; g ) = z (g ) + Lu(x),
+
+the local quadratic potential becomes
+
+                              1              T
+                    ψ (x) =     [z (g ) + Lu] A(x; ξ, G ) [z (g ) + Lu] .
+                              2
+
+Integrating this quantity over Ω and dividing by the cell volume |Ω| gives the volume-
+averaged microscopic functional used in Eq. (4),
+                                    ∫︂
+                               1                          T
+            Π(u; g, ξ, G ) =                 [z (g ) + Lu] A(x; ξ, G ) [z (g ) + Lu] dx.
+                             2|Ω|        Ω
+
+
+B Derivation of the elastic weak cell problem
+For linear elasticity and in the absence of body forces, local mechanical equilibrium
+inside the periodic cell is expressed in strong form as
+
+                                         ∇·σ = 0           in Ω.
+
+To obtain the corresponding weak form, let v ∈ Vper be an arbitrary admissible dis-
+placement test function. Multiplying the equilibrium equation by v , integrating over
+
+
+                                                     31
+the cell, and applying integration by parts gives
+                                ∫︂                        ∫︂
+                                             T
+                            −            ε(v ) σ dx +              v T σn dS = 0,
+                                     Ω                       ∂Ω
+
+where n is the outward unit normal on ∂ Ω. For periodic fluctuations, the test function
+takes equal values on opposite faces while the associated tractions are anti-periodic, so
+the boundary contributions cancel pairwise and the remaining equilibrium condition is
+                                ∫︂
+                                         ε(v )T σ dx = 0            ∀v ∈ Vper .
+                                     Ω
+
+   The local strain and constitutive law are
+
+                  ε(x) = ε + ε(ug ),                  σ (x) = C(x; ξ, G ) [ε + ε(ug )] ,
+
+so substitution into the preceding relation yields
+                  ∫︂
+                       ε(v )T C(x; ξ, G ) [ε + ε(ug )] dx = 0                 ∀v ∈ Vper .
+                   Ω
+
+
+This is the linear-elastic specialization of Eq. (7), obtained by setting L = ε(·) and
+A = C.
+
+C Derivation of the discrete Schur representation
+Starting from the microscopic functional in Eq. (4), expansion of the quadratic
+integrand separates the microscopic, coupling, and macroscopic contributions as
+             ∫︂                                  ∫︂                                 ∫︂
+        1              T          1                            T         1
+   E=           (Lu) A(Lu) dx +                     (Lu) Az (g ) dx +                    z (g )T Az (g ) dx.
+      2|Ω|    Ω                 | Ω |             Ω                   2 | Ω|         Ω
+
+                                                                h
+    Let {ϕa }na=1 be a basis of the constrained discrete space Vper , so an admissible
+discrete fluctuation is written as
+                                                         n
+                                                        ∑︂
+                                           uh (x) =            ua ϕa (x).
+                                                        a=1
+
+
+Using the macroscopic loading expansion in Eq. (1), the three blocks entering Eq. (9)
+are
+                                     ∫︂
+                                  1
+                  Kab (ξ; G ) =          (Lϕa )T A(x; ξ, G )(Lϕb ) dx,
+                                 |Ω| Ω
+                                        ∫︂
+                                    1
+                   Bai (ξ; G ) = −         (Lϕa )T A(x; ξ, G )z i dx,
+                                   |Ω| Ω
+
+
+                                                        32
+                                               ∫︂
+                                          1
+                       Dij (ξ; G ) =                 z Ti A(x; ξ, G )z j dx,
+                                         |Ω|    Ω
+
+
+with a, b = 1, . . . , n and i, j = 1, . . . , m. The minus sign in the definition of B accounts
+for the cross-energy convention used in Eq. (9).
+    Stationarity of Eq. (9) with respect to u gives K (ξ ; G )u = B (ξ ; G )g . Collecting
+the m unit-loading responses gives Eq. (10), so X = K −1 B and u = Xg , with the
+dependence on (ξ, G ) understood. Substitution into the discrete energy then gives
+
+                                       1 T T                   1
+                     E (Xg, g ) =        g X KXg − g T X T Bg + g T Dg.
+                                       2                       2
+
+Using KX = B and K = K T gives X T KX = X T B = B T X , and therefore
+
+                                                     1 T [︁
+                                                       g D − B T X g.
+                                                                  ]︁
+                                E (Xg, g ) =
+                                                     2
+
+Comparison with Eq. (8) proves the Schur representation in Eq. (11).
+
+
+D Derivation of the affine discrete operators
+The discrete affine operators in Eq. (13) follow from the local separation in Eq. (12)
+and the block definitions in Appendix C. Substituting Eq. (12) into the definition of
+Kab (ξ; G ) gives
+
+                                     Q                   ∫︂
+                                    ∑︂       1
+                  Kab (ξ; G ) =     γq (ξ)                     (Lϕa )T Aq (x; G )(Lϕb ) dx.
+                                q=1
+                                           | Ω |           Ω
+
+
+
+Because γq (ξ ) is independent of x, the remaining integral defines the fixed
+microstructure-dependent block
+                                                ∫︂
+                                           1
+                       (Kq (G ))ab =                    (Lϕa )T Aq (x; G )(Lϕb ) dx,
+                                          |Ω|       Ω
+
+                               ∑︁
+and therefore K (ξ ; G ) =          q γq (ξ )Kq (G ). Applying the same substitution to the B
+and D definitions gives
+
+                               Q
+                              ∑︂                                              Q
+                                                                             ∑︂
+               B (ξ ; G ) =         γq (ξ)Bq (G ),              D(ξ; G ) =         γq (ξ)Dq (G ),
+                              q=1                                            q=1
+
+
+which completes the derivation of Eq. (13).
+
+
+                                                         33
+E Nested Ritz-space ordering and monitor
+  monotonicity
+This appendix proves the variational ordering stated in Eq. (25) and its consequence
+for the monitor error. For a fixed material–microstructure pair (ξ, G ) and macroscopic
+loading g , the FOM minimizes the discrete energy over the complete coordinate space
+Rn , whereas the Ritz approximation at enrichment step ℓ minimizes the same energy
+over range(Sℓ ). Hence,
+
+           1 T eff                           1 T eff
+             g HFOM g = minn E (u, g ),        g Hℓ g =    min       E (u, g ),
+           2            u∈R                  2          u∈range(Sℓ )
+
+
+where the dependence on (ξ, G ) is suppressed for readability.
+    Appending a new Sobol response block preserves every previously retained direc-
+tion, so Eq. (24) gives range(Sℓ ) ⊆ range(Sℓ+1 ). Minimization over these nested spaces
+therefore yields, for every g ∈ Rm ,
+
+                        1 T eff     1            1
+                          g HFOM g ≤ g T Hℓ+1
+                                          eff
+                                              g ≤ g T Hℓeff g,
+                        2           2            2
+
+which is equivalent to the Loewner ordering
+
+                                 eff    eff
+                                HFOM ⪯ Hℓ+1 ⪯ Hℓeff .
+
+This proves Eq. (25).
+    To connect this matrix ordering with the scalar monitor error, define ∆ℓ = Hℓeff −
+  eff                 eff      eff
+HFOM and ∆ℓ+1 = Hℓ+1       − HFOM  . The preceding result gives 0 ⪯ ∆ℓ+1 ⪯ ∆ℓ , so
+E = ∆ℓ − ∆ℓ+1 ⪰ 0. The difference between the squared Frobenius norms is then
+
+                   ∥∆ℓ ∥2F − ∥∆ℓ+1 ∥2F = 2 tr(∆ℓ+1 E ) + tr(E 2 ) ≥ 0,
+
+because the trace of the product of two positive-semidefinite matrices is nonnegative.
+Thus, ∥∆ℓ+1 ∥F ≤ ∥∆ℓ ∥F . Since the FOM denominator in Eq. (22) is fixed for each
+monitor material, its relative error is non-increasing under nested enrichment, and
+                                                   (ℓ+1)    (ℓ)
+taking the maximum over the fixed set ΞM gives eM        ≤ eM in exact arithmetic.
+
+F Derivation of the Ritz–Schur error identity
+Consider a fixed material–microstructure pair (ξ, G ) and suppress this dependence for
+readability. Let
+
+                ∆X = X − Xr ∈ Rn×m ,            R = B − KXr ∈ Rn×m .
+
+Using the full-order equation KX = B gives
+
+                              R = KX − KXr = K ∆X,
+
+
+                                           34
+and, because K is symmetric positive definite and therefore invertible, ∆X = K −1 R.
+   From the full-order and reduced Schur maps in Eqs. (11) and (32),
+
+               Hreff − HFOM
+                        eff
+                            = D − B T Xr − D − B T X = B T ∆X.
+                             (︁         )︁ (︁       )︁
+
+
+Using B = KX = K (Xr + ∆X ) and K = K T gives
+
+                        B T ∆X = XrT K ∆X + (∆X )T K (∆X ).
+
+The Galerkin condition associated with Eq. (31) is VrT (KXr − B ) = 0, or equivalently
+VrT R = 0. Since Xr = Vr X
+                         ˆ︁r and K ∆X = R, the cross term vanishes,
+
+                                XrT K ∆X = X
+                                           ˆ︁rT VrT R = 0,
+
+so
+                             Hreff − HFOM
+                                      eff
+                                           = (∆X )T K (∆X ).
+                       −1
+Substituting ∆X = K         R and using the symmetry of K gives
+
+                               (∆X )T K (∆X ) = RT K −1 R.
+
+Finally, for every g ∈ Rm ,
+
+                     g T (Hreff − HFOM
+                                   eff
+                                       )g = (∆Xg )T K (∆Xg ) ≥ 0,
+
+which proves the exact identity and positive-semidefinite ordering in Eq. (33).
+
+G Elasticity-specific affine constitutive representation
+This appendix specializes the general affine separation of Eq. (12) to the elastic mate-
+rial family defined in Eq. (36). Let χm (x) and χf (x) denote the matrix and fiber
+indicator functions, with χm + χf = 1.
+    For the isotropic matrix, the Lamé parameters are
+
+                               Em                       Em νm
+                   µm =                ,   λm =                       .
+                            2(1 + νm )            (1 + νm )(1 − 2νm )
+
+The corresponding Mandel stiffness is represented by the two fixed basis matrices in
+Eq. (37):
+
+                      (m)            (m)
+          Cm = λm M1 + µm M2
+               ⎡                                      ⎤
+                 λm + 2µm    λm       λm     0  0  0
+               ⎢    λm    λm + 2µm    λm     0  0  0 ⎥
+                                                                                   (37)
+               ⎢                                      ⎥
+               ⎢    λm       λm    λm + 2µm 0   0  0 ⎥⎥ ∈ R6×6 .
+             =⎢⎢
+               ⎢     0        0        0   2 µm 0  0  ⎥
+                                                      ⎥
+               ⎣     0        0        0     0 2µm 0 ⎦
+                     0        0        0     0  0 2µm
+
+
+                                           35
+   The fiber is transversely isotropic about its local longitudinal axis. From the five
+independent engineering constants in Eq. (36),
+
+                                     ET                                ET
+                        GT T =                ,          νT L = νLT       .
+                                 2(1 + νT T )                          EL
+                                         √           √        √
+Using the Mandel ordering (11, 22, 33,       2 23,    2 13,    2 12), the local fiber compliance
+is defined in Eq. (38) as
+
+                     1     νLT    νLT
+                    ⎡                                                         ⎤
+                         −      −        0     0                       0
+                  ⎢ EL     E L    EL                                          ⎥
+                  ⎢ ν      1      νT T                                        ⎥
+                  ⎢− LT         −        0     0                       0      ⎥
+                  ⎢ EL ET         ET
+                  ⎢                                                           ⎥
+                                                                              ⎥
+                  ⎢ νLT    νT T   1                                           ⎥
+                  ⎢−
+                  ⎢ E −E                 0     0                       0      ⎥
+              loc
+             Sf = ⎢    L     T   E T                                          ⎥ ∈ R6×6 .
+                                                                              ⎥
+                                                                                           (38)
+                  ⎢                      1                                    ⎥
+                  ⎢ 0      0      0            0                       0      ⎥
+                  ⎢                    2GT T                                  ⎥
+                                               1
+                  ⎢                                                           ⎥
+                  ⎢ 0      0      0      0                             0
+                  ⎢                                                           ⎥
+                                                                              ⎥
+                  ⎢                          2GLT                             ⎥
+                  ⎣                                                  1        ⎦
+                     0     0      0      0     0
+                                                                   2GLT
+
+                                        −1
+   The local stiffness is Cfloc = (Sloc
+                                    f )    . Transverse isotropy gives the five-coefficient
+representation in Eq. (39):
+                        ⎡                   ⎤
+                     c1 c2 c2    0     0 0
+                   ⎢c2 c3 c4     0     0 0⎥
+                   ⎢                           5
+                                            ⎥ ∑︂
+               loc   c2 c4 c3    0     0 0⎥              (f )
+                                                  cj (ξ)Mj ∈ R6×6 .
+                   ⎢
+              Cf = ⎢
+                   ⎢
+                                            ⎥=
+                                            ⎥                                              (39)
+                   ⎢ 0  0  0  c3 − c 4 0  0 ⎥ j=1
+                   ⎣0 0 0        0     c5 0 ⎦
+                     0 0 0       0     0 c5
+
+The coefficients cj (ξ ) follow directly from the inverse of Eq. (38), while the matrices
+   (f )
+Mj are fixed.
+    Let T (x; G ) ∈ R6×6 denote the energy-preserving Mandel rotation associated with
+the local fiber direction. Combining the matrix and fiber phases gives the local stiffness
+field defined in Eq. (40):
+
+            C(x; ξ, G ) = χm (x)Cm + χf (x)T (x; G )Cfloc T (x; G )T ∈ R6×6 .              (40)
+
+   Substituting Eqs. (37) and (39) into Eq. (40) gives the exact elasticity-specific
+separation defined in Eq. (41):
+
+                                              7
+                                             ∑︂
+                             C(x; ξ, G ) =         γq (ξ)Aq (x; G ).                       (41)
+                                             q=1
+
+
+
+                                              36
+The corresponding coefficient vector is defined in Eq. (42) as
+
+                                                                  T
+                    γ (ξ ) = [λm , µm , c1 , c2 , c3 , c4 , c5 ] ∈ R7 ,                Q = 7.   (42)
+
+The associated fixed spatial fields are
+
+                                              (m)                            (m)
+                                A1 = χm M1          ,        A2 = χm M2            ,
+
+and, for j = 1, . . . , 5,
+
+                                                                      (f )
+                             A2+j (x; G ) = χf (x)T (x; G )Mj T (x; G )T .
+
+Thus, the queried material changes only the seven coefficients in Eq. (42), while the
+phase distribution and local orientations remain fixed in Aq (x; G ). These fields generate
+the reusable discrete blocks in Eq. (13).
+
+H Voxel-resolution convergence
+The adopted voxel resolution is assessed using three representative microstructures
+spanning the considered ranges of fiber volume fraction and aspect ratio: G08, G00,
+and G09. For each microstructure, the same continuous fiber realization is rasterized
+at 3, 4, 5, and 6 voxels per fiber diameter, thereby isolating the effect of spatial
+discretization.
+    The constituent properties used for this resolution study correspond to the Carbon
+Fiber (290 GPa)/Resin Epoxy system from the ANSYS Composite Materials Sample
+Library [2]: Em = 3.78 GPa, νm = 0.35, EL = 290 GPa, ET = 23 GPa, GLT = 9 GPa,
+νLT = 0.20, and νT T = 0.40. These values lie within the constitutive domain defined
+in Table 1. The library provides constituent data; the cell calculations use the FFT
+solver described in this work.
+    Taking the result at 6 voxels per fiber diameter as reference, the resulting relative
+effective-stiffness differences are summarized in Table 8.
+
+
+                             Table 8: Relative effective-stiffness dif-
+                             ference 100eρ (%) with respect to 6 voxels
+                             per fiber diameter.
+                                               Resolution [voxels/diameter]
+                             Microstructure             3        4           5         6
+                             G08               0.140         0.0935     0.0993         0
+                             G00               2.494          1.160      0.384         0
+                             G09               5.383          2.998      0.910         0
+
+                             Note: ρ ∈ {3, 4, 5, 6} denotes the resolution in
+                             voxels per fiber diameter, and eρ = ∥Cρeff −
+                             C6eff ∥F /∥C6eff ∥F .
+
+
+
+
+                                                        37
+    At 5 voxels per fiber diameter, the differences relative to the 6-voxel reference are
+0.0993%, 0.384%, and 0.910% for G08, G00, and G09, respectively. The numerical
+campaign therefore adopts 6 voxels per fiber diameter as a common discretization
+level.
+
+
+I Training-only surrogate hyperparameter selection
+The RBF and Kriging comparisons use the same Sobol prefix available to the transfer
+model at each training size. Inputs are the seven affine constitutive coefficients, nor-
+malized coordinatewise using ranges computed from the fixed 1024-point candidate
+sequence. Outputs are the 21 independent upper-triangular entries of the symmetric
+Mandel stiffness tensor and are standardized using only the current training prefix.
+    For RBF, deterministic leave-one-out cross-validation minimizes the mean relative
+Frobenius tensor error over eight kernel families: linear, thin-plate, cubic, quintic, mul-
+tiquadric, inverse-multiquadric, inverse-quadratic, and Gaussian. The shape parameter
+spans 16 logarithmically spaced multiples from 2−12 to 23 of the inverse median
+pair distance. Five smoothing levels from zero to 10−1 and every polynomial degree
+admissible at the current fold size are also considered.
+    For Kriging, the covariance family is selected by maximum optimized training
+log marginal likelihood among ten isotropic and automatic-relevance-determination
+variants of Matérn, squared-exponential, rational-quadratic, and Matérn-plus-linear
+kernels. Covariance amplitude, length scales, nugget, and the rational-quadratic shape
+parameter when applicable are optimized continuously. Every candidate uses two
+deterministic optimizer restarts during family selection; the winning family is then
+refitted with ten deterministic restarts. This complete search is repeated for every
+microstructure and prefix. Monitor and held-out responses are excluded from all
+hyperparameter decisions.
+
+
+Statements and Declarations
+Funding
+This work was supported by Escuela Politécnica Nacional [grant number
+PIGR-2401] and the VLIR-UOS organization [grant number PIEX-DIM-VLIR-25
+(EC2024TEA547A101)].
+
+Competing interests
+The authors declare that they have no known competing financial interests or personal
+relationships that could have appeared to influence the work reported in this paper.
+
+Author contributions
+Kevin Vidal: conceptualization, methodology, software, formal analysis, investigation,
+data curation, visualization, and writing the original draft. Victor Alulema: concep-
+tualization, methodology, validation, formal analysis, investigation, and review and
+
+
+                                            38
+editing. Victor Berrazueta: validation, resources, and review and editing. Esteban
+Valencia: supervision, project administration, resources, and review and editing.
+
+Data and code availability
+The numerical data were generated computationally. The working project contains the
+geometry definitions, material sequences, full-order and reduced solvers, frozen oper-
+ator artifacts, and validation and timing records. A persistent public release location
+is not yet specified in this draft.
+
+AI-assisted work
+OpenAI Codex was used to assist with code development, numerical audit scripts, and
+manuscript restructuring. This assistance does not constitute independent scientific
+validation.
+
+Author identifiers
+Kevin Vidal: https://orcid.org/0009-0006-8667-4525; Victor Alulema: https://orcid.
+org/0000-0001-7351-5281; Victor Berrazueta: https://orcid.org/0009-0005-8405-6208;
+Esteban Valencia: https://orcid.org/0000-0002-6496-9908.
+
+References
+ [1] Abdulle A, Bai Y (2014) Reduced-order modelling numerical homogenization.
+     Philosophical Transactions of the Royal Society A: Mathematical, Physical
+     and Engineering Sciences 372(2021):20130388. https://doi.org/10.1098/rsta.2013.
+     0388
+
+ [2] Ansys, Inc. (2025) Constituents Material Data. Ansys, Inc., ansys Help, Short
+     Fiber Composites Guide, Release 2025 R2. Composite Materials sample library
+     in Engineering Data, including Carbon Fiber (290 GPa) and Resin Epoxy
+
+ [3] Boyaval S (2008) Reduced-basis approach for homogenization beyond the peri-
+     odic setting. Multiscale Modeling & Simulation 7(1):466–494. https://doi.org/10.
+     1137/070688791
+
+ [4] Brisard S, Dormieux L (2012) Combining galerkin approximation techniques with
+     the principle of hashin and shtrikman to derive a new fft-based numerical method
+     for the homogenization of composites. Computer Methods in Applied Mechanics
+     and Engineering 217–220:197–212. https://doi.org/10.1016/j.cma.2012.01.003
+
+ [5] Eyre DJ, Milton GW (1999) A fast numerical scheme for computing the response
+     of composites using grid refinement. The European Physical Journal Applied
+     Physics 6(1):41–47. https://doi.org/10.1051/epjap:1999150
+
+ [6] Fritzen F, Leuschner M (2013) Reduced basis hybrid computational homogeniza-
+     tion based on a mixed incremental formulation. Computer Methods in Applied
+
+
+                                          39
+    Mechanics and Engineering 260:143–154. https://doi.org/10.1016/j.cma.2013.03.
+    007
+
+ [7] Gajek S, Schneider M, Böhlke T (2020) On the micromechanics of deep material
+     networks. Journal of the Mechanics and Physics of Solids 142:103984. https://
+     doi.org/10.1016/j.jmps.2020.103984
+
+ [8] Gajek S, Schneider M, Böhlke T (2021) An FE–DMN method for the multi-
+     scale analysis of short fiber reinforced plastic components. Computer Methods in
+     Applied Mechanics and Engineering 384:113952. https://doi.org/10.1016/j.cma.
+     2021.113952
+
+ [9] Gajek S, Schneider M, Böhlke T (2022) An FE–DMN method for the multiscale
+     analysis of thermomechanical composites. Computational Mechanics 69(5):1087–
+     1113. https://doi.org/10.1007/s00466-021-02131-0
+
+[10] Hernández JA, Oliver J, Huespe AE, et al (2014) High-performance model reduc-
+     tion techniques in computational multiscale homogenization. Computer Methods
+     in Applied Mechanics and Engineering 276:149–189. https://doi.org/10.1016/j.
+     cma.2014.03.011
+
+[11] Huynh DBP, Knezevic DJ, Patera AT (2013) A static condensation reduced basis
+     element method: approximation and a posteriori error estimation. ESAIM: Math-
+     ematical Modelling and Numerical Analysis 47(1):213–251. https://doi.org/10.
+     1051/m2an/2012022
+
+[12] Kochmann J, Manjunatha K, Gierden C, et al (2019) A simple and flexible model
+     order reduction method for FFT-based homogenization problems using a sparse
+     sampling technique. Computer Methods in Applied Mechanics and Engineering
+     347:622–638. https://doi.org/10.1016/j.cma.2018.11.032
+
+[13] Liu Z, Wu CT, Koishi M (2019) A deep material network for multiscale topology
+     learning and accelerated nonlinear modeling of heterogeneous materials. Com-
+     puter Methods in Applied Mechanics and Engineering 345:1138–1168. https:
+     //doi.org/10.1016/j.cma.2018.09.020
+
+[14] Michel JC, Moulinec H, Suquet P (2001) A computational scheme for linear
+     and non-linear composites with arbitrary phase contrast. International Journal
+     for Numerical Methods in Engineering 52(1–2):139–160. https://doi.org/10.1002/
+     nme.275
+
+[15] Moulinec H, Suquet P (1998) A numerical method for computing the overall
+     response of nonlinear composites with complex microstructure. Computer Meth-
+     ods in Applied Mechanics and Engineering 157(1–2):69–94. https://doi.org/10.
+     1016/S0045-7825(97)00218-1
+
+
+
+
+                                         40
+[16] Pham QX, Lee K (2025) Reduced basis homogenization of thermal and elastic
+     properties for periodic composite materials. International Journal of Mechanical
+     Sciences 304:109801. https://doi.org/10.1016/j.ijmecsci.2024.109801
+
+[17] Prud’homme C, Rovas DV, Veroy K, et al (2002) Reliable real-time solution of
+     parametrized partial differential equations: Reduced-basis output bound methods.
+     Journal of Fluids Engineering 124(1):70–80. https://doi.org/10.1115/1.1448332
+
+[18] Quarteroni A, Rozza G, Manzoni A (2011) Certified reduced basis approxima-
+     tion for parametrized partial differential equations and applications. Journal of
+     Mathematics in Industry 1(3). https://doi.org/10.1186/2190-5983-1-3
+
+[19] Vondřejc J, Zeman J, Marek I (2014) An FFT-based Galerkin method for
+     homogenization of periodic media. Computers & Mathematics with Applications
+     68(3):156–173. https://doi.org/10.1016/j.camwa.2014.05.014
+
+[20] Vondřejc J, Zeman J, Marek I (2015) Guaranteed upper–lower bounds on homog-
+     enized properties by FFT-based Galerkin method. Computer Methods in Applied
+     Mechanics and Engineering 297:258–291. https://doi.org/10.1016/j.cma.2015.09.
+     003
+
+[21] Vondřejc J, Liu D, Ladecký M, et al (2020) FFT-based homogenisation acceler-
+     ated by low-rank tensor approximations. Computer Methods in Applied Mechan-
+     ics and Engineering 364:112890. https://doi.org/10.1016/j.cma.2020.112890
+
+[22] Yvonnet J, He QC (2007) The reduced model multiscale method (R3M) for
+     the non-linear homogenization of hyperelastic media at finite strains. Journal
+     of Computational Physics 223(1):341–368. https://doi.org/10.1016/j.jcp.2006.09.
+     019
+
+
+
+
+                                         41
+

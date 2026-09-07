@@ -48,15 +48,6 @@ COEFF_NAMES = [
     "fiber_G_LT",
 ]
 
-DUAL_COEFF_NAMES = [
-    "matrix_inv_E",
-    "matrix_nu_over_E",
-    "fiber_inv_E_L",
-    "fiber_inv_E_T",
-    "fiber_nu_LT_over_E_L",
-    "fiber_nu_TT_over_E_T",
-    "fiber_inv_2G_LT",
-]
 
 ENGINEERING_COLUMNS = [
     "E1",
@@ -220,43 +211,6 @@ def _mandel_rotation_matrix(rotation: np.ndarray) -> np.ndarray:
     return transform
 
 
-def _isotropic_compliance_bases() -> tuple[np.ndarray, np.ndarray]:
-    """Two isotropic compliance bases in Mandel notation."""
-    inv_e = np.eye(6, dtype=float)
-    nu_over_e = np.zeros((6, 6), dtype=float)
-    nu_over_e[:3, :3] = -1.0
-    np.fill_diagonal(nu_over_e[:3, :3], 0.0)
-    nu_over_e[3, 3] = nu_over_e[4, 4] = nu_over_e[5, 5] = 1.0
-    return inv_e, nu_over_e
-
-
-def _fiber_local_compliance_bases_axis0() -> list[np.ndarray]:
-    """Five transversely isotropic compliance bases in Mandel notation."""
-    inv_e_l = np.zeros((6, 6), dtype=float)
-    inv_e_t = np.zeros((6, 6), dtype=float)
-    nu_lt_over_e_l = np.zeros((6, 6), dtype=float)
-    nu_tt_over_e_t = np.zeros((6, 6), dtype=float)
-    inv_2g_lt = np.zeros((6, 6), dtype=float)
-
-    inv_e_l[0, 0] = 1.0
-    inv_e_t[1, 1] = inv_e_t[2, 2] = 1.0
-    inv_e_t[3, 3] = 1.0
-
-    nu_lt_over_e_l[0, 1] = nu_lt_over_e_l[1, 0] = -1.0
-    nu_lt_over_e_l[0, 2] = nu_lt_over_e_l[2, 0] = -1.0
-
-    nu_tt_over_e_t[1, 2] = nu_tt_over_e_t[2, 1] = -1.0
-    nu_tt_over_e_t[3, 3] = 1.0
-
-    inv_2g_lt[4, 4] = inv_2g_lt[5, 5] = 1.0
-    return [
-        inv_e_l,
-        inv_e_t,
-        nu_lt_over_e_l,
-        nu_tt_over_e_t,
-        inv_2g_lt,
-    ]
-
 
 def phase_orientation_voxel_order(phase: np.ndarray, ori: np.ndarray) -> np.ndarray:
     """Return a deterministic phase/orientation order for contiguous kernels."""
@@ -355,7 +309,6 @@ def _affine_tensor_batch_factory(
     matrix_bases: tuple[np.ndarray, np.ndarray],
     fiber_local_bases: list[np.ndarray],
     coefficient_names: list[str],
-    local_frame_snapshots: bool = False,
     gathered_factor_ritz: bool = False,
 ) -> Any:
     """Build a phase/orientation-aware affine fourth-order tensor map."""
@@ -367,23 +320,19 @@ def _affine_tensor_batch_factory(
     fiber_selector = _contiguous_selector(fiber_idx)
     fiber_group_ids = np.empty(0, dtype=np.int32)
     fiber_bases_by_group = np.empty((0, 5, 6, 6), dtype=np.float64)
-    fiber_mandel_rotations = np.empty((0, 6, 6), dtype=np.float64)
     if len(fiber_idx):
         inverse, unique_oris = _group_quantized_orientations(
             ori_flat[fiber_idx], AFFINE_ORIENTATION_QUANTIZATION
         )
         group_bases: list[np.ndarray] = []
-        group_rotations: list[np.ndarray] = []
         for axis in unique_oris:
             rotation = rotation_matrix_from_vector(axis)
-            group_rotations.append(_mandel_rotation_matrix(rotation))
             group_bases.append(np.stack(
                 [rotate_C_mandel(basis, rotation) for basis in fiber_local_bases],
                 axis=0,
             ))
         fiber_group_ids = np.asarray(inverse, dtype=np.int32)
         fiber_bases_by_group = np.stack(group_bases, axis=0)
-        fiber_mandel_rotations = np.stack(group_rotations, axis=0)
 
     q_count = len(coefficient_names)
     nvox = max(1, int(phase_flat.size))
@@ -423,16 +372,6 @@ def _affine_tensor_batch_factory(
                 "coefficient_slices": tuple(),
                 "ranks": tuple(),
             }
-        ),
-    }
-    local_exact_factorizations = {
-        "matrix": exact_factorizations["matrix"],
-        "fiber": (
-            _exact_spectral_factorization(
-                np.asarray(fiber_local_bases, dtype=np.float64)[None, ...]
-            )
-            if len(fiber_idx)
-            else exact_factorizations["fiber"]
         ),
     }
     stiffness_matrix_fast_path = tuple(coefficient_names) == tuple(COEFF_NAMES)
@@ -831,12 +770,9 @@ def _affine_tensor_batch_factory(
     apply.orientation_kernel = "grouped" if fiber_group_runs else "voxelwise"
     apply.coefficient_names = tuple(coefficient_names)
     apply.exact_factorizations = exact_factorizations
-    apply.local_exact_factorizations = local_exact_factorizations
-    apply.local_frame_snapshots = bool(local_frame_snapshots)
     apply.gathered_factor_ritz = bool(gathered_factor_ritz)
     apply.fiber_group_ids = fiber_group_ids
     apply.fiber_group_runs = fiber_group_runs
-    apply.fiber_mandel_rotations = fiber_mandel_rotations
     apply.apply_indices = apply_indices
     apply.apply_all = apply_all
     apply.apply_supported_chunk = apply_supported_chunk
@@ -854,7 +790,6 @@ def affine_stress_batch_factory(
     phase: np.ndarray,
     ori: np.ndarray,
     *,
-    local_frame_snapshots: bool = False,
     gathered_factor_ritz: bool = False,
 ) -> Any:
     """Build the affine stiffness action used by primal Ritz compilation."""
@@ -864,165 +799,9 @@ def affine_stress_batch_factory(
         matrix_bases=_isotropic_bases(),
         fiber_local_bases=_fiber_local_bases_axis0(),
         coefficient_names=COEFF_NAMES,
-        local_frame_snapshots=bool(local_frame_snapshots),
         gathered_factor_ritz=bool(gathered_factor_ritz),
     )
 
-
-_LOCAL_FRAME_KERNEL_CACHE: dict[str, Any] = {}
-
-
-def _local_frame_kernel(dtype: np.dtype) -> Any:
-    """Compile the voxelwise global-to-local Mandel rotation kernel."""
-    import cupy as cp
-
-    key = np.dtype(dtype).name
-    if key not in ("float32", "float64"):
-        raise ValueError("local-frame snapshots require float32 or float64 fields")
-    if key not in _LOCAL_FRAME_KERNEL_CACHE:
-        scalar = "float" if key == "float32" else "double"
-        name = f"mandel_global_to_local_{key}"
-        source = f"""
-        extern "C" __global__
-        void {name}(
-            const {scalar}* values,
-            {scalar}* output,
-            const int* group_ids,
-            const {scalar}* rotations,
-            const int rows,
-            const int voxels)
-        {{
-            const long long index =
-                (long long)blockDim.x * blockIdx.x + threadIdx.x;
-            const long long total = (long long)rows * 6 * voxels;
-            if (index >= total) return;
-            const int voxel = (int)(index % voxels);
-            const int local_component = (int)((index / voxels) % 6);
-            const int row = (int)(index / ((long long)6 * voxels));
-            const int group = group_ids[voxel];
-            {scalar} value = ({scalar})0;
-            #pragma unroll
-            for (int global_component = 0; global_component < 6; ++global_component) {{
-                const {scalar} rotation = rotations[
-                    ((long long)group * 6 + global_component) * 6
-                    + local_component
-                ];
-                value += rotation * values[
-                    ((long long)row * 6 + global_component) * voxels + voxel
-                ];
-            }}
-            output[index] = value;
-        }}
-        """
-        _LOCAL_FRAME_KERNEL_CACHE[key] = cp.RawKernel(source, name)
-    return _LOCAL_FRAME_KERNEL_CACHE[key]
-
-
-def _localize_snapshot_fields_inplace(
-    fields: np.ndarray,
-    affine: Any,
-    *,
-    max_chunk_voxels: int = 1_000_000,
-) -> dict[str, Any]:
-    """Rotate ordered fiber snapshots once into their local Mandel frames."""
-    values = np.asarray(fields)
-    if values.ndim != 3 or values.shape[1] != 6:
-        raise ValueError("snapshot fields must have shape (r, 6, nvox)")
-    if not bool(getattr(affine, "local_frame_snapshots", False)):
-        raise ValueError("affine map is not configured for local-frame snapshots")
-    support_blocks = getattr(affine, "support_blocks", ())
-    fiber_selector = next(
-        (selector for support, _, selector in support_blocks if support == "fiber"),
-        slice(0, 0),
-    )
-    if not isinstance(fiber_selector, slice):
-        raise ValueError("local-frame snapshots require contiguous fiber support")
-    fiber_start = int(fiber_selector.start or 0)
-    fiber_stop = int(fiber_selector.stop or values.shape[2])
-    fiber_count = max(0, fiber_stop - fiber_start)
-    group_ids = np.asarray(getattr(affine, "fiber_group_ids"), dtype=np.int32)
-    rotations = np.asarray(
-        getattr(affine, "fiber_mandel_rotations"), dtype=np.float64
-    )
-    if fiber_count != len(group_ids):
-        raise ValueError("fiber group map does not match ordered snapshot fields")
-    if not fiber_count:
-        return {
-            "local_frame_backend": "none",
-            "local_frame_transform_wall_s": 0.0,
-            "local_frame_chunk_voxels": 0,
-            "local_frame_workspace_peak_bytes": 0,
-        }
-
-    started = time.perf_counter()
-    chunk_voxels = min(int(max_chunk_voxels), fiber_count)
-    workspace_peak_bytes = 0
-    backend = "cpu"
-    try:
-        import cupy as cp
-
-        cp_dtype = cp.float32 if values.dtype == np.float32 else cp.float64
-        free_bytes, _ = cp.cuda.runtime.memGetInfo()
-        bytes_per_voxel = values.shape[0] * 6 * values.dtype.itemsize * 2 + 4
-        gpu_limit = max(4096, int(0.18 * free_bytes) // max(bytes_per_voxel, 1))
-        chunk_voxels = max(4096, min(chunk_voxels, gpu_limit, fiber_count))
-        rotations_gpu = cp.asarray(rotations, dtype=cp_dtype)
-        kernel = _local_frame_kernel(values.dtype)
-        for relative_start in range(0, fiber_count, chunk_voxels):
-            relative_stop = min(relative_start + chunk_voxels, fiber_count)
-            global_start = fiber_start + relative_start
-            global_stop = fiber_start + relative_stop
-            host_chunk = np.ascontiguousarray(values[:, :, global_start:global_stop])
-            input_gpu = cp.asarray(host_chunk, dtype=cp_dtype)
-            output_gpu = cp.empty_like(input_gpu)
-            groups_gpu = cp.asarray(group_ids[relative_start:relative_stop])
-            count = int(relative_stop - relative_start)
-            total = int(values.shape[0] * 6 * count)
-            kernel(
-                ((total + 255) // 256,),
-                (256,),
-                (
-                    input_gpu,
-                    output_gpu,
-                    groups_gpu,
-                    rotations_gpu,
-                    np.int32(values.shape[0]),
-                    np.int32(count),
-                ),
-            )
-            output_gpu.get(out=host_chunk)
-            values[:, :, global_start:global_stop] = host_chunk
-            workspace_peak_bytes = max(
-                workspace_peak_bytes,
-                int(host_chunk.nbytes + input_gpu.nbytes + output_gpu.nbytes + groups_gpu.nbytes),
-            )
-            del host_chunk, input_gpu, output_gpu, groups_gpu
-        cp.cuda.get_current_stream().synchronize()
-        backend = "gpu_raw_kernel"
-    except Exception as exc:
-        raise RuntimeError(
-            "local-frame Ritz snapshot rotation requires CUDA/CuPy"
-        ) from exc
-    return {
-        "local_frame_backend": backend,
-        "local_frame_transform_wall_s": float(time.perf_counter() - started),
-        "local_frame_chunk_voxels": int(chunk_voxels),
-        "local_frame_workspace_peak_bytes": int(workspace_peak_bytes),
-    }
-
-
-def affine_compliance_batch_factory(
-    phase: np.ndarray,
-    ori: np.ndarray,
-) -> Any:
-    """Build the affine compliance action used by dual Ritz compilation."""
-    return _affine_tensor_batch_factory(
-        phase,
-        ori,
-        matrix_bases=_isotropic_compliance_bases(),
-        fiber_local_bases=_fiber_local_compliance_bases_axis0(),
-        coefficient_names=DUAL_COEFF_NAMES,
-    )
 
 
 def _material_coefficients(row: dict[str, Any]) -> np.ndarray:
@@ -1053,25 +832,6 @@ def _material_coefficients(row: dict[str, Any]) -> np.ndarray:
     )
     return coeffs
 
-
-def _dual_material_coefficients(row: dict[str, Any]) -> np.ndarray:
-    """Seven exact affine coefficients of the phase compliance field."""
-    em = float(row["Em"])
-    ef_l = float(row["Ef_L"])
-    ef_t = float(row["Ef_T"])
-    g_lt = float(row["G_LT"])
-    return np.asarray(
-        [
-            1.0 / em,
-            float(row["nu_m"]) / em,
-            1.0 / ef_l,
-            1.0 / ef_t,
-            float(row["nu_LT"]) / ef_l,
-            float(row["nu_TT"]) / ef_t,
-            1.0 / (2.0 * g_lt),
-        ],
-        dtype=np.float64,
-    )
 
 
 def _material_coefficients_batch(parameters: np.ndarray) -> np.ndarray:
@@ -1111,26 +871,6 @@ def _material_coefficients_batch(parameters: np.ndarray) -> np.ndarray:
         )
     )
 
-
-def _dual_material_coefficients_batch(parameters: np.ndarray) -> np.ndarray:
-    """Vectorized seven-term affine compliance coefficients."""
-    values = np.asarray(parameters, dtype=np.float64)
-    if values.ndim != 2 or values.shape[1] != len(MATERIAL_PARAMETER_COLUMNS):
-        raise ValueError(
-            "parameters must have columns " + ", ".join(MATERIAL_PARAMETER_COLUMNS)
-        )
-    em, nu_m, ef_l, ef_t, g_lt, nu_lt, nu_tt = values.T
-    return np.column_stack(
-        (
-            1.0 / em,
-            nu_m / em,
-            1.0 / ef_l,
-            1.0 / ef_t,
-            nu_lt / ef_l,
-            nu_tt / ef_t,
-            1.0 / (2.0 * g_lt),
-        )
-    )
 
 
 def _engineering_constants_batch(C_mandel: np.ndarray) -> np.ndarray:
@@ -1650,17 +1390,7 @@ def _factorized_chunk_gpu(
     """Return exact affine Ritz contributions using constitutive-rank factors."""
     import cupy as cp
 
-    use_local_fiber = bool(
-        support == "fiber" and getattr(affine, "local_frame_snapshots", False)
-    )
-    use_gathered_fiber = bool(
-        support == "fiber" and getattr(affine, "gathered_factor_ritz", False)
-    )
-    factorizations = getattr(
-        affine,
-        "local_exact_factorizations" if use_local_fiber else "exact_factorizations",
-        None,
-    )
+    factorizations = getattr(affine, "exact_factorizations", None)
     if not isinstance(factorizations, dict) or support not in factorizations:
         raise NotImplementedError("affine map does not expose exact factorizations")
     factorization = factorizations[support]
@@ -1733,55 +1463,9 @@ def _factorized_chunk_gpu(
         (len(coefficient_slices), right.shape[0], 6), dtype=cp.float64
     )
     sum_workspace_peak_bytes = 0
-    if use_local_fiber:
-        right_features[:] = cp.einsum(
-            "ak,ran->rkn",
-            factors[0],
-            right,
-            optimize=True,
-        )
-        if left_features is not None and left is not None:
-            left_features[:] = cp.einsum(
-                "ak,ran->rkn",
-                factors[0],
-                left,
-                optimize=True,
-            )
-        rotations_cpu = np.asarray(
-            getattr(affine, "fiber_mandel_rotations"), dtype=np.float64
-        )
-        global_factors_cpu = np.einsum(
-            "gab,bk->gak",
-            rotations_cpu,
-            factors_cpu[0],
-            optimize=True,
-        )
-        rotation_cache = factorization.setdefault("_global_factor_gpu_cache", {})
-        if dtype_name not in rotation_cache:
-            compute_dtype = cp.float32 if dtype_name == "float32" else cp.float64
-            rotation_cache[dtype_name] = cp.asarray(
-                global_factors_cpu, dtype=compute_dtype
-            )
-        global_factors = rotation_cache[dtype_name]
-        group_ids_gpu = cp.asarray(group_ids)
-        for local_q, (factor_start, factor_stop) in enumerate(coefficient_slices):
-            voxel_factors = global_factors[
-                group_ids_gpu, :, factor_start:factor_stop
-            ]
-            global_stress = cp.einsum(
-                "nak,k,rkn->ran",
-                voxel_factors,
-                weights[factor_start:factor_stop],
-                right_features[:, factor_start:factor_stop],
-                optimize=True,
-            )
-            sums[local_q] = cp.sum(global_stress, axis=2, dtype=cp.float64)
-            sum_workspace_peak_bytes = max(
-                sum_workspace_peak_bytes,
-                int(voxel_factors.nbytes + global_stress.nbytes + group_ids_gpu.nbytes),
-            )
-            del voxel_factors, global_stress
-    elif use_gathered_fiber:
+    if bool(
+        support == "fiber" and getattr(affine, "gathered_factor_ritz", False)
+    ):
         group_ids_gpu = cp.asarray(group_ids)
         voxel_factors = factors[group_ids_gpu]
         right_features[:] = cp.einsum(
@@ -2152,11 +1836,7 @@ def _factorized_raw_gpu(
         np.asarray(cp.asnumpy(diagonal_accumulator), dtype=np.float64) / float(nvox)
     )
     b_host = np.asarray(cp.asnumpy(b_accumulator), dtype=np.float64) / float(nvox)
-    rank_factorizations = (
-        getattr(affine, "local_exact_factorizations")
-        if bool(getattr(affine, "local_frame_snapshots", False))
-        else getattr(affine, "exact_factorizations")
-    )
+    rank_factorizations = getattr(affine, "exact_factorizations")
     factorization_ranks = {
         support: list(rank_factorizations[support]["ranks"])
         for support in ("matrix", "fiber")
@@ -2183,9 +1863,6 @@ def _factorized_raw_gpu(
         "basis_gpu_uploads": int(basis_gpu_uploads),
         "stress_workspace_peak_bytes": int(workspace_peak_bytes),
         "gpu_resident_reduced_accumulation": True,
-        "local_frame_snapshots": bool(
-            getattr(affine, "local_frame_snapshots", False)
-        ),
         "gathered_factor_ritz": bool(
             getattr(affine, "gathered_factor_ritz", False)
         ),
@@ -2424,208 +2101,6 @@ def _transform_raw_operators_with_rank_policy(
     # Historical name retained for cache compatibility: invR = T.T.
     return Kq, Bq, T.T, gram_meta
 
-
-def _householder_r(matrix: np.ndarray) -> np.ndarray:
-    """Return the thin Householder-QR R factor without materializing Q."""
-    values = np.asarray(matrix, dtype=np.float64, order="F")
-    if values.ndim != 2 or values.shape[0] < values.shape[1]:
-        raise ValueError("Householder QR requires a tall matrix")
-    factored = scipy_linalg.qr(
-        values,
-        mode="r",
-        overwrite_a=True,
-        check_finite=False,
-    )[0]
-    rank = int(values.shape[1])
-    return np.array(np.triu(factored[:rank]), dtype=np.float64, copy=True)
-
-
-def _experimental_tsqr_factor(
-    basis: np.ndarray | list[np.ndarray],
-    *,
-    nvox: int,
-    block_max_gib: float = 2.0,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """Factor the normalized tall snapshot matrix by blocked Householder TSQR."""
-    started = time.perf_counter()
-    rank = _basis_rank_nvox(basis, int(nvox))
-    if rank < 1:
-        raise ValueError("TSQR requires at least one snapshot")
-    if not np.isfinite(float(block_max_gib)) or float(block_max_gib) <= 0.0:
-        raise ValueError("TSQR block_max_gib must be finite and positive")
-
-    first = _field_component_voxel_view(
-        basis[0] if isinstance(basis, list) else basis[0], int(nvox)
-    )
-    storage_itemsize = int(first.dtype.itemsize)
-    block_budget_bytes = int(float(block_max_gib) * (1024**3))
-    bytes_per_voxel = rank * 6 * (storage_itemsize + np.dtype(np.float64).itemsize)
-    minimum_voxels = max(1, math.ceil(rank / 6))
-    block_voxels = max(
-        minimum_voxels,
-        min(int(nvox), block_budget_bytes // max(bytes_per_voxel, 1)),
-    )
-    if block_voxels * bytes_per_voxel > block_budget_bytes:
-        raise MemoryError(
-            "TSQR workspace cap cannot hold one full-rank Householder block"
-        )
-
-    scale = 1.0 / math.sqrt(float(nvox))
-    accumulated_r: np.ndarray | None = None
-    local_factor_wall_s = 0.0
-    merge_factor_wall_s = 0.0
-    block_count = 0
-    peak_snapshot_chunk_bytes = 0
-    peak_qr_matrix_bytes = 0
-    for start in range(0, int(nvox), int(block_voxels)):
-        end = min(start + int(block_voxels), int(nvox))
-        values = _basis_chunk(basis, nvox=int(nvox), start=start, end=end)
-        peak_snapshot_chunk_bytes = max(
-            peak_snapshot_chunk_bytes, int(values.nbytes)
-        )
-        tall = np.array(
-            values.reshape(rank, -1).T,
-            dtype=np.float64,
-            order="F",
-            copy=True,
-        )
-        tall *= scale
-        peak_qr_matrix_bytes = max(peak_qr_matrix_bytes, int(tall.nbytes))
-        local_started = time.perf_counter()
-        local_r = _householder_r(tall)
-        local_factor_wall_s += float(time.perf_counter() - local_started)
-        del tall, values
-
-        if accumulated_r is None:
-            accumulated_r = local_r
-        else:
-            merge_started = time.perf_counter()
-            accumulated_r = _householder_r(
-                np.asfortranarray(np.vstack((accumulated_r, local_r)))
-            )
-            merge_factor_wall_s += float(time.perf_counter() - merge_started)
-        block_count += 1
-
-    if accumulated_r is None:
-        raise RuntimeError("TSQR produced no local factors")
-    diagonal = np.diag(accumulated_r).copy()
-    signs = np.where(diagonal < 0.0, -1.0, 1.0)
-    accumulated_r *= signs[:, None]
-    diagonal = np.diag(accumulated_r)
-    if not np.all(np.isfinite(accumulated_r)) or np.any(diagonal == 0.0):
-        raise np.linalg.LinAlgError(
-            "TSQR encountered an arithmetic-zero snapshot direction"
-        )
-
-    metadata = {
-        "qr_method": "blocked_householder_tsqr",
-        "qr_compute_dtype": "float64",
-        "qr_forms_explicit_q": False,
-        "qr_rank": int(rank),
-        "qr_block_count": int(block_count),
-        "qr_block_voxels": int(block_voxels),
-        "qr_block_max_gib": float(block_max_gib),
-        "qr_peak_snapshot_chunk_bytes": int(peak_snapshot_chunk_bytes),
-        "qr_peak_factor_matrix_bytes": int(peak_qr_matrix_bytes),
-        "qr_estimated_peak_temporary_bytes": int(
-            peak_snapshot_chunk_bytes + peak_qr_matrix_bytes
-        ),
-        "qr_local_factor_wall_s": float(local_factor_wall_s),
-        "qr_merge_factor_wall_s": float(merge_factor_wall_s),
-        "qr_factor_wall_s": float(time.perf_counter() - started),
-        "qr_r_condition": float(np.linalg.cond(accumulated_r)),
-        "qr_r_diagonal_min_abs": float(np.min(np.abs(diagonal))),
-        "qr_r_diagonal_max_abs": float(np.max(np.abs(diagonal))),
-        "qr_r_diagonal_relative_min": float(
-            np.min(np.abs(diagonal))
-            / max(np.max(np.abs(diagonal)), np.finfo(np.float64).tiny)
-        ),
-    }
-    return accumulated_r, metadata
-
-
-def _experimental_tsqr_recompile(
-    *,
-    basis: np.ndarray | list[np.ndarray],
-    raw_Kq: np.ndarray,
-    raw_Bq: np.ndarray,
-    Dq: np.ndarray,
-    G: np.ndarray,
-    nvox: int,
-    block_max_gib: float = 2.0,
-) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """Recompile raw affine blocks in full-span TSQR coordinates."""
-    total_started = time.perf_counter()
-    R, metadata = _experimental_tsqr_factor(
-        basis,
-        nvox=int(nvox),
-        block_max_gib=float(block_max_gib),
-    )
-    rank = int(R.shape[0])
-    raw_K = np.asarray(raw_Kq, dtype=np.float64)
-    raw_B = np.asarray(raw_Bq, dtype=np.float64)
-    if raw_K.shape[1:] != (rank, rank) or raw_B.shape[1] != rank:
-        raise ValueError("raw affine blocks do not match the TSQR snapshot rank")
-
-    transform_started = time.perf_counter()
-    Kq = np.empty_like(raw_K)
-    Bq = np.empty_like(raw_B)
-    for q in range(raw_K.shape[0]):
-        left = scipy_linalg.solve_triangular(
-            R.T,
-            raw_K[q],
-            lower=True,
-            check_finite=False,
-        )
-        Kq[q] = scipy_linalg.solve_triangular(
-            R.T,
-            left.T,
-            lower=True,
-            check_finite=False,
-        ).T
-        Kq[q] = 0.5 * (Kq[q] + Kq[q].T)
-        Bq[q] = scipy_linalg.solve_triangular(
-            R.T,
-            raw_B[q],
-            lower=True,
-            check_finite=False,
-        )
-    transform_wall_s = float(time.perf_counter() - transform_started)
-
-    identity = np.eye(rank, dtype=np.float64)
-    T = scipy_linalg.solve_triangular(
-        R.T,
-        identity,
-        lower=True,
-        check_finite=False,
-    )
-    gram = 0.5 * (np.asarray(G, dtype=np.float64) + np.asarray(G, dtype=np.float64).T)
-    qr_gram = R.T @ R
-    orthogonality = T @ gram @ T.T
-    metadata.update(
-        {
-            "qr_transform_wall_s": transform_wall_s,
-            "qr_total_wall_s": float(time.perf_counter() - total_started),
-            "qr_gram_reconstruction_relative_error": float(
-                np.linalg.norm(qr_gram - gram, ord="fro")
-                / max(np.linalg.norm(gram, ord="fro"), np.finfo(float).tiny)
-            ),
-            "qr_orthogonality_frobenius_error": float(
-                np.linalg.norm(orthogonality - identity, ord="fro")
-            ),
-            "qr_orthogonality_spectral_error": float(
-                np.linalg.norm(orthogonality - identity, ord=2)
-            ),
-            "qr_discarded_rank": 0,
-        }
-    )
-    operators = {
-        "Kq": Kq,
-        "Bq": Bq,
-        "Dq": np.asarray(Dq, dtype=np.float64).copy(),
-        "R": R,
-    }
-    return operators, metadata
 
 
 def _reference_energy_qr_recompile(
@@ -3789,12 +3264,39 @@ def _extend_reduced_operators(
     return Kq, Bq, Dq, metadata
 
 
+def _solve_diagonally_equilibrated(K: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Solve a dense SPD system after a diagonal change of coordinates.
+
+    With ``S=diag(K)**(-1/2)``, the equivalent system ``S K S y = S rhs``
+    has unit diagonal and the original unknown is ``a=S y``.  This changes
+    neither the Ritz map nor its Schur complement; it only avoids exposing
+    the linear solve to the scale of the raw snapshot coordinates.
+    """
+    stiffness = 0.5 * (
+        np.asarray(K, dtype=np.float64) + np.asarray(K, dtype=np.float64).T
+    )
+    right = np.asarray(rhs, dtype=np.float64)
+    diagonal = np.diag(stiffness)
+    if not np.all(np.isfinite(diagonal)) or np.any(diagonal <= 0.0):
+        raise np.linalg.LinAlgError(
+            "Reduced Ritz solve has a non-positive/non-finite diagonal; "
+            f"min_diag={float(np.nanmin(diagonal)):.3e}."
+        )
+    inv_scale = 1.0 / np.sqrt(diagonal)
+    balanced = (stiffness * inv_scale[:, None]) * inv_scale[None, :]
+    balanced_rhs = inv_scale[:, None] * right if right.ndim == 2 else inv_scale * right
+    factor = np.linalg.cholesky(balanced)
+    forward = np.linalg.solve(factor, balanced_rhs)
+    solution = np.linalg.solve(factor.T, forward)
+    return inv_scale[:, None] * solution if right.ndim == 2 else inv_scale * solution
+
+
 def _solve_spd_reduced(K: np.ndarray, B: np.ndarray) -> np.ndarray:
-    """Solve K a = -B in float64 without modifying the Ritz operator."""
+    """Solve ``K a = -B`` with a scale-invariant float64 coordinate change."""
     stiffness = 0.5 * (np.asarray(K, dtype=np.float64) + np.asarray(K, dtype=np.float64).T)
     rhs = -np.asarray(B, dtype=np.float64)
     try:
-        return np.linalg.solve(stiffness, rhs)
+        return _solve_diagonally_equilibrated(stiffness, rhs)
     except np.linalg.LinAlgError as exc:
         eigvals = scipy_linalg.eigvalsh(stiffness, check_finite=False)
         raise np.linalg.LinAlgError(
@@ -3870,7 +3372,18 @@ class GpuAffineBatchEvaluator:
         B = cp.einsum("nq,qij->nij", coeffs, self.Bq, optimize=True)
         D = cp.einsum("nq,qij->nij", coeffs, self.Dq, optimize=True)
         try:
-            amplitudes = cp.linalg.solve(K, -B)
+            diagonal = cp.diagonal(K, axis1=1, axis2=2)
+            if bool(cp.any(~cp.isfinite(diagonal)).item()) or bool(cp.any(diagonal <= 0).item()):
+                raise np.linalg.LinAlgError("GPU reduced Ritz solve has a non-positive diagonal.")
+            inv_scale = 1.0 / cp.sqrt(diagonal)
+            balanced = K * inv_scale[:, :, None] * inv_scale[:, None, :]
+            balanced_rhs = -B * inv_scale[:, :, None]
+            factor = cp.linalg.cholesky(balanced)
+            forward = cp.linalg.solve(factor, balanced_rhs)
+            balanced_solution = cp.linalg.solve(
+                cp.swapaxes(factor, -1, -2), forward
+            )
+            amplitudes = balanced_solution * inv_scale[:, :, None]
         except Exception as exc:
             raise np.linalg.LinAlgError(
                 "GPU reduced Ritz solve failed; no Tikhonov regularization is applied."
@@ -3921,7 +3434,11 @@ class IncrementalAffineBatchEvaluator:
             self.stiffness + np.swapaxes(self.stiffness, -1, -2)
         )
         try:
-            self.amplitudes = np.linalg.solve(self.stiffness, -self.B)
+            self.amplitudes = np.empty_like(self.B, dtype=np.float64)
+            for index in range(len(self.stiffness)):
+                self.amplitudes[index] = _solve_spd_reduced(
+                    self.stiffness[index], self.B[index]
+                )
         except np.linalg.LinAlgError as error:
             raise np.linalg.LinAlgError(
                 "A reduced Ritz solve failed; no regularization is applied."

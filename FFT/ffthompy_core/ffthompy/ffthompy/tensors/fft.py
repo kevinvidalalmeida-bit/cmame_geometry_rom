@@ -309,12 +309,12 @@ def rfftn_cached(x, N_tuple, axes):
     return fft_mod.rfftn(x, s=N_tuple, axes=axes, workers=FFT_WORKERS)
 
 
-def irfftn_cached(x, N_tuple, axes):
+def irfftn_cached(x, N_tuple, axes, *, overwrite_x=False):
     x = to_backend_array(x, prefer_backend=get_fft_backend())
     fft_mod = _fft_module_for_value(x)
     if is_cupy_array(x):
         plan = _maybe_cupy_plan(x, axes, "C2R", shape=N_tuple)
-        return fft_mod.irfftn(x, s=N_tuple, axes=axes, plan=plan) if plan else fft_mod.irfftn(x, s=N_tuple, axes=axes)
+        return fft_mod.irfftn(x, s=N_tuple, axes=axes, plan=plan, overwrite_x=overwrite_x) if plan else fft_mod.irfftn(x, s=N_tuple, axes=axes, overwrite_x=overwrite_x)
     return fft_mod.irfftn(x, s=N_tuple, axes=axes, workers=FFT_WORKERS)
 
 

@@ -897,15 +897,22 @@ def indexed_sym21_array(x, yval):
 def indexed_sym21_product(x, y):
     assert(x.Fourier == y.Fourier)
     assert(np.all(x.N == y.N))
-    out = indexed_sym21_array(x, y.val)
+    value = y.val
+    # A caller may request host solutions while the indexed material stays on
+    # CUDA. Postprocessing must upload that field before the GPU-only product.
+    if cp is not None and isinstance(value, np.ndarray) and value.dtype == np.float32:
+        value = cp.asarray(value)
+    out = indexed_sym21_array(x, value)
     if out is None:
         raise NotImplementedError("indexed_sym21_product requiere CuPy float32.")
     order = len(out.shape) - len(x.N)
     return y.copy(name='{0}({1})'.format(x.name, y.name), val=out, order=order)
 
 
-def _get_cupy_elastic_direct_kernel(kind, projection):
-    key = (kind, projection)
+def _get_cupy_elastic_direct_kernel(kind, projection, reference_eta=1.0):
+    if reference_eta != 1.0 and (projection != 'g1' or not np.isfinite(reference_eta) or reference_eta <= 2./3.):
+        raise ValueError('An isotropic reference metric requires eta > 2/3 and G1.')
+    key = (kind, projection, reference_eta != 1.0)
     kernel = _CUPY_ELASTIC_DIRECT_KERNELS.get(key)
     if kernel is not None:
         return kernel
@@ -1089,6 +1096,10 @@ def _get_cupy_elastic_direct_kernel(kind, projection):
             .replace("WRITE_Y", write_y)
             .replace("G2_EXPR", g2_expr)
     )
+    if reference_eta != 1.0:
+        code = code.replace('const long total) {', 'const long total, const float reference_factor) {')
+        code = code.replace('const float invn4 = invn2 * invn2;',
+                            'const float invn4 = reference_factor * invn2 * invn2;')
 
     try:
         kernel = cp.RawKernel(code, "elasticity_direct_apply")
@@ -1144,7 +1155,8 @@ def elasticity_direct_array(x, yval):
     if not yval.flags.c_contiguous:
         yval = cp.ascontiguousarray(yval)
 
-    kernel = _get_cupy_elastic_direct_kernel(kind, projection)
+    reference_eta = float(getattr(x, 'reference_eta', 1.0))
+    kernel = _get_cupy_elastic_direct_kernel(kind, projection, reference_eta)
     if kernel is None:
         return None
 
@@ -1173,7 +1185,7 @@ def elasticity_direct_array(x, yval):
                 np.float32(inv_y[1]),
                 np.float32(inv_y[2]),
                 np.int64(total),
-            ),
+            ) + ((np.float32(2.-1./reference_eta),) if reference_eta != 1.0 else ()),
         )
     except Exception:
         return None

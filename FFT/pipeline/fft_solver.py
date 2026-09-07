@@ -23,7 +23,7 @@ from ffthompy.tensors.fft import (
     set_fft_workers,
     get_fft_backend_status,
 )
-from ffthompy.tensors.operators import set_cupy_fused_matvec, set_cupy_unscaled_fft_pair
+from ffthompy.tensors.operators import set_cupy_fused_matvec, set_cupy_unscaled_fft_pair, set_cupy_reuse_inverse_input
 from ffthompy.problem import Problem
 
 try:
@@ -290,7 +290,10 @@ def _save_solution_fields_if_requested(
         if not hasattr(solution, "val"):
             raise RuntimeError(f"La solucion para load_id={load_id} no esta disponible.")
         total = _to_numpy_array(solution.val).astype(field_dtype, copy=False)
-        fluctuation = total.copy()
+        # A GPU-to-host transfer already owns an independent NumPy buffer.
+        # Reuse it when no separate total field has to be retained.
+        owns_host_transfer = cp is not None and isinstance(solution.val, cp.ndarray)
+        fluctuation = total if owns_host_transfer and (consume_in_memory or not save_total) else total.copy()
         fluctuation[load_id] -= field_dtype.type(1.0)
         field_shape = list(fluctuation.shape)
         if consume_in_memory:
@@ -931,6 +934,28 @@ def _estimate_shared_array_bytes(items: Any) -> int:
     return int(total)
 
 
+def compile_cfield_geometry(phase, ori, quantization=AFFINE_ORIENTATION_QUANTIZATION):
+    """Compile material-independent orientation groups for an immutable geometry.
+
+    The caller owns this explicit cache. Strong references and read-only inputs
+    prevent accidental reuse for a different geometry or a writable array.
+    """
+    if phase.flags.writeable or ori.flags.writeable:
+        raise ValueError('Compiled constitutive geometry requires read-only phase and orientation arrays.')
+    mask = phase == 1
+    indices = np.argwhere(mask).astype(np.int32, copy=False)
+    if len(indices):
+        inverse, means = _group_quantized_orientations(ori[mask].astype(np.float64), quantization)
+        rotations = np.asarray([rotation_matrix_from_vector(mean) for mean in means])
+    else:
+        inverse = np.empty(0, dtype=np.int64)
+        rotations = np.empty((0, 3, 3), dtype=np.float64)
+    for array in (indices, inverse, rotations):
+        array.setflags(write=False)
+    return {'phase': phase, 'ori': ori, 'quantization': quantization,
+            'fiber_indices': indices, 'inverse_groups': inverse, 'rotations': rotations}
+
+
 def _build_cfield_gpu(
     phase: np.ndarray,
     ori: np.ndarray,
@@ -941,6 +966,7 @@ def _build_cfield_gpu(
     rotation_batch_size: int = 0,
     assign_chunk_voxels: int = _CFIELD_ASSIGN_CHUNK_VOXELS,
     indexed: bool = False,
+    geometry_layout=None,
 ) -> Tuple[Any, int, float]:
     t0 = time.perf_counter()
     Nx, Ny, Nz = phase.shape
@@ -949,8 +975,15 @@ def _build_cfield_gpu(
     if indexed and not packed_sym21:
         raise ValueError("Cfield indexado requiere storage='sym21'.")
 
-    fiber_mask_cpu = (phase == 1)
-    fiber_idx_cpu = np.argwhere(fiber_mask_cpu).astype(np.int32, copy=False)
+    if geometry_layout is None:
+        fiber_mask_cpu = (phase == 1)
+        fiber_idx_cpu = np.argwhere(fiber_mask_cpu).astype(np.int32, copy=False)
+    else:
+        if (geometry_layout['phase'] is not phase or geometry_layout['ori'] is not ori
+                or phase.flags.writeable or ori.flags.writeable
+                or geometry_layout['quantization'] != QUANT):
+            raise ValueError('Compiled constitutive geometry does not match the immutable solver inputs.')
+        fiber_idx_cpu = geometry_layout['fiber_indices']
 
     Cm_gpu = cp.asarray(Cm, dtype=gpu_dtype)
     if indexed:
@@ -971,13 +1004,17 @@ def _build_cfield_gpu(
             return (index_map, table), 0, time.perf_counter() - t0
         return Cfield, 0, time.perf_counter() - t0
 
-    fiber_ori_cpu = ori[fiber_mask_cpu].astype(np.float64, copy=False)
-    inv_idx, means = _group_quantized_orientations(fiber_ori_cpu, QUANT)
-    n_unique = len(means)
-
-    R_batch = np.empty((n_unique, 3, 3), dtype=np.float64)
-    for g_id in range(n_unique):
-        R_batch[g_id] = rotation_matrix_from_vector(means[g_id])
+    if geometry_layout is None:
+        fiber_ori_cpu = ori[fiber_mask_cpu].astype(np.float64, copy=False)
+        inv_idx, means = _group_quantized_orientations(fiber_ori_cpu, QUANT)
+        n_unique = len(means)
+        R_batch = np.empty((n_unique, 3, 3), dtype=np.float64)
+        for g_id in range(n_unique):
+            R_batch[g_id] = rotation_matrix_from_vector(means[g_id])
+    else:
+        inv_idx = geometry_layout['inverse_groups']
+        R_batch = geometry_layout['rotations']
+        n_unique = len(R_batch)
 
     Cf_local_f64 = Cf_local.astype(np.float64)
     C4_local = mandel_to_tensor4(Cf_local_f64)
@@ -1188,10 +1225,20 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
         cfield_indexed = False
     cupy_fused_matvec = bool(p.get('cupy_fused_matvec', True))
     cupy_unscaled_fft_pair = bool(p.get('cupy_unscaled_fft_pair', True))
+    cupy_reuse_inverse_input = bool(p.get('cupy_reuse_inverse_input', False))
+    cupy_matrix_reference = bool(p.get('cupy_matrix_reference', False))
+    cupy_reference_eta = float(p.get('cupy_reference_eta', 1.0))
+    if cupy_matrix_reference:
+        matrix_poisson = float(p['nu_m'])
+        cupy_reference_eta = (1.-matrix_poisson)/(1.-2.*matrix_poisson)
+    if cupy_reference_eta != 1.0 and (not use_gpu or solver_real_dtype != 'float32'
+            or not np.isfinite(cupy_reference_eta) or cupy_reference_eta <= 2./3.):
+        raise ValueError('Reference-energy CG requires float32 CUDA and eta > 2/3.')
     cupy_lazy_scalars = bool(p.get('cupy_lazy_scalars', True))
     cupy_fused_cg_updates = bool(p.get('cupy_fused_cg_updates', True))
     cupy_fused_xr_rr = bool(p.get('cupy_fused_xr_rr', False))
     cupy_fused_dot = bool(p.get('cupy_fused_dot', False))
+    cupy_stable_reductions = bool(p.get('cupy_stable_reductions', False))
     cupy_residual_check_every = max(1, int(p.get('cupy_residual_check_every', 1)))
     fast_macro_add = bool(p.get('fast_macro_add', True))
     check_macro_mean = bool(p.get('check_macro_mean', False))
@@ -1200,6 +1247,7 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
         or p.get("solution_field_return_in_memory", False)
         or callable(p.get("solution_field_consumer"))
     )
+    stress_field_requested = bool(callable(p.get("stress_field_consumer")))
     solution_sensitivity_requested = bool(
         p.get("solution_sensitivity_out_path")
         or p.get("solution_sensitivity_return_in_memory", False)
@@ -1214,6 +1262,10 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
         or stress_volume_requested
     )
     load_batch_size = max(1, int(p.get('load_batch_size', 1)))
+    if cupy_reference_eta != 1.0 and load_batch_size != 1:
+        raise ValueError('Reference-energy CG requires load_batch_size=1.')
+    if p.get('project_initial_solution_fields', False) and load_batch_size != 1:
+        raise ValueError('Projected initial fields require load_batch_size=1.')
     postprocess_batch_size = max(1, int(p.get('postprocess_batch_size', 6)))
     postprocess_assembly = str(p.get('postprocess_assembly', 'gemm')).strip().lower()
     if postprocess_assembly not in {'scalar', 'einsum', 'gemm'}:
@@ -1337,6 +1389,7 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             rotation_batch_size=cfield_rotation_batch_size,
             assign_chunk_voxels=cfield_assign_chunk_voxels,
             indexed=cfield_indexed,
+            geometry_layout=p.get('compiled_cfield_geometry'),
         )
         if cfield_indexed:
             Cfield_index, Cfield_table = Cfield_payload
@@ -1511,6 +1564,7 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
     set_cupy_plan_mode(cupy_plan_mode)
     set_cupy_fused_matvec(cupy_fused_matvec)
     set_cupy_unscaled_fft_pair(cupy_unscaled_fft_pair)
+    set_cupy_reuse_inverse_input(cupy_reuse_inverse_input)
 
     problem_conf = {
         'name':        'shortfiber_TI_opt',
@@ -1526,6 +1580,7 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             'parallel_backend': p.get('internal_load_backend', 'auto'),
             'parallel_workers': p.get('internal_load_workers', 2),
             'real_dtype': solver_real_dtype,
+            'profile_timing': bool(p.get('profile_timing', False)),
             'fast_macro_add': bool(fast_macro_add),
             'check_macro_mean': bool(check_macro_mean),
             'store_solution_fields': bool(store_solution_fields),
@@ -1540,7 +1595,14 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             'solution_field_stream_before_sensitivity': bool(
                 callable(p.get("solution_field_consumer")) and solution_sensitivity_requested
             ),
+            'stress_field_consumer': p.get("stress_field_consumer")
+            if stress_field_requested else None,
+            'stress_field_dtype': str(
+                p.get("stress_field_dtype", p.get("solver_real_dtype", solver_real_dtype))
+            ),
+            'stress_field_equilibrate': bool(p.get("stress_field_equilibrate", True)),
             'initial_solution_fields': p.get('initial_solution_fields'),
+            'project_initial_solution_fields': bool(p.get('project_initial_solution_fields', False)),
             'load_batch_size': int(load_batch_size),
             'postprocess_batch_size': int(postprocess_batch_size),
             'postprocess_assembly': str(postprocess_assembly),
@@ -1565,12 +1627,15 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             'atol': solver_atol,
             'maxiter': int(p.get('solver_maxiter', 1000)),
             'callback': p.get('solver_callback', 'none'),
+            'profile_cg_timing': bool(p.get('profile_cg_timing', False)),
+            'check_true_residual': bool(p.get('check_true_residual', False)),
             'real_dtype': solver_real_dtype,
             'keep_solution_on_device': bool(p.get('keep_solution_on_device', False)),
             'cupy_lazy_scalars': bool(cupy_lazy_scalars),
             'cupy_fused_cg_updates': bool(cupy_fused_cg_updates),
             'cupy_fused_xr_rr': bool(cupy_fused_xr_rr),
             'cupy_fused_dot': bool(cupy_fused_dot),
+            'cupy_stable_reductions': bool(cupy_stable_reductions),
             'cupy_residual_check_every': int(cupy_residual_check_every),
             'fast_macro_add': bool(fast_macro_add),
             'check_macro_mean': bool(check_macro_mean),
@@ -1578,6 +1643,8 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
         },
     }
 
+    if cupy_reference_eta != 1.0:
+        problem_conf['solver']['cupy_reference_eta'] = cupy_reference_eta
     prob = Problem(problem_conf)
 
     if solver_verbose:
@@ -1740,6 +1807,18 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             Ngrid=Ngrid,
             p=p,
         )
+    stress_field_info: Dict[str, Any] = {}
+    if stress_field_requested:
+        streamed_stresses = prob.output.get("stress_fields_primal")
+        if not isinstance(streamed_stresses, dict) or not bool(
+            streamed_stresses.get("streamed", False)
+        ):
+            raise RuntimeError("El consumidor de tensiones no recibio campos primales.")
+        consumed_stresses = tuple(
+            int(value) for value in streamed_stresses.get("load_ids", ())
+        )
+        p["_stress_fields_consumed"] = consumed_stresses
+        stress_field_info = dict(streamed_stresses)
 
     stress_slice_info: Dict[str, Any] = {}
     if stress_slice_requested:
@@ -1796,16 +1875,23 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             "use_cfield_material_fast_path": bool(use_cfield_material_fast_path),
             "cupy_fused_matvec": bool(cupy_fused_matvec),
             "cupy_unscaled_fft_pair": bool(cupy_unscaled_fft_pair),
+            "cupy_reuse_inverse_input": bool(cupy_reuse_inverse_input),
+            "cupy_matrix_reference": cupy_matrix_reference,
+            "cupy_reference_eta": cupy_reference_eta,
             "cupy_lazy_scalars": bool(cupy_lazy_scalars),
             "cupy_fused_cg_updates": bool(cupy_fused_cg_updates),
             "cupy_fused_xr_rr": bool(cupy_fused_xr_rr),
             "cupy_fused_dot": bool(cupy_fused_dot),
+            "cupy_stable_reductions": bool(cupy_stable_reductions),
+            "compiled_cfield_geometry": p.get('compiled_cfield_geometry') is not None,
             "cupy_residual_check_every": int(cupy_residual_check_every),
             "fast_macro_add": bool(fast_macro_add),
             "check_macro_mean": bool(check_macro_mean),
             "store_solution_fields": bool(store_solution_fields),
+            "stress_field_info": stress_field_info,
             "load_batch_size": int(load_batch_size),
             "warm_start_used": bool(p.get("initial_solution_fields") is not None),
+            "project_initial_solution_fields": bool(p.get("project_initial_solution_fields", False)),
             "postprocess_batch_size": int(postprocess_batch_size),
             "postprocess_assembly": str(postprocess_assembly),
             "projection_storage": str(projection_storage),

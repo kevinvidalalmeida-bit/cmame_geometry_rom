@@ -15,6 +15,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--summary-dir", type=Path, required=True)
     parser.add_argument("--paper-figure-dir", type=Path, required=True)
+    parser.add_argument(
+        "--adaptive-validation-only",
+        action="store_true",
+        help="Generate only the validation figure from the frozen campaign summary.",
+    )
     return parser
 
 
@@ -152,7 +157,8 @@ def main() -> None:
     figure_dir.mkdir(parents=True, exist_ok=True)
 
     _adaptive_validation(summary_dir, figure_dir)
-    _performance_scaling(summary_dir, figure_dir)
+    if not args.adaptive_validation_only:
+        _performance_scaling(summary_dir, figure_dir)
 
 
 if __name__ == "__main__":
