@@ -1699,6 +1699,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--venv-path", type=Path, default=project_path(paths["venv_path"]))
     parser.add_argument("--save-operators", action=argparse.BooleanOptionalAction, default=bool(pipeline.get("save_operators", True)))
+    parser.add_argument(
+        "--save-basis-fields",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Persist each newly appended microscopic basis field. Disabled by "
+            "default; intended for independent residual-enrichment experiments."
+        ),
+    )
     parser.add_argument("--cleanup-snapshot-fields", action=argparse.BooleanOptionalAction, default=bool(pipeline.get("cleanup_snapshot_fields", True)))
     parser.add_argument("--quiet-solver", action=argparse.BooleanOptionalAction, default=bool(pipeline.get("quiet_solver", True)))
     parser.add_argument("--write-plot", action=argparse.BooleanOptionalAction, default=bool(pipeline.get("write_per_geometry_plots", False)))
@@ -2037,6 +2046,7 @@ def main() -> int:
                 "target_error": float(args.target_error),
                 "basis_tolerance": float(args.basis_tolerance),
                 "basis_dtype": str(args.basis_dtype),
+                "save_basis_fields": bool(args.save_basis_fields),
                 "full_rank_basis_mode": str(args.full_rank_basis_mode),
                 "ritz_contraction_dtype": str(args.ritz_contraction_dtype),
                 "final_ritz_recompute_dtype": str(
@@ -2189,6 +2199,7 @@ def main() -> int:
 
         training_started = time.perf_counter()
         for training_materials, candidate_id in enumerate(candidate_ids, start=1):
+            rank_before_append = len(basis)
             records, operators, warm_start_fields = append_sobol_batch(
                 run_dir=run_dir,
                 geometry=geometry,
@@ -2232,6 +2243,9 @@ def main() -> int:
                 inverse_voxel_order=inverse_voxel_order,
                 nearest_warm_start=bool(args.nearest_warm_start),
             )
+            if bool(args.save_basis_fields):
+                appended = basis.active_fields[rank_before_append:]
+                common.save_basis_block(run_dir, rank_before_append, list(appended))
             snapshot_rows.extend(records)
             for record in records:
                 for name in cumulative:
