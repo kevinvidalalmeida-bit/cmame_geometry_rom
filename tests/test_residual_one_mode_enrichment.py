@@ -40,3 +40,17 @@ def test_residual_gram_and_one_mode_audits():
     assert np.isfinite(step.eta_after)
     # Incremental Gram update must equal a fresh anchor-metric product.
     assert np.allclose(greedy.G, greedy.A.T @ np.linalg.solve(M, greedy.A), atol=1e-11)
+
+    # The physically relevant Ritz--Schur defect does decrease: for any SPD
+    # K(gamma), enlarging a nested Ritz space cannot increase the K-energy
+    # error.  This is the monotonicity that the G00/G09 campaign must audit.
+    K = np.einsum("q,qij->ij", gamma, Kq)
+    B = np.einsum("q,qij->ij", gamma, Bq)
+    truth = np.linalg.solve(K, B)
+    def energy_defect(V):
+        y = np.linalg.solve(V.T @ K @ V, V.T @ B)
+        error = truth - V @ y
+        return error.T @ K @ error
+    before = energy_defect(old)
+    after = energy_defect(greedy.V)
+    assert np.all(np.linalg.eigvalsh(before - after) >= -1e-10)
