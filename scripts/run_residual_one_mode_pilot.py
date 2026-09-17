@@ -19,6 +19,14 @@ import rom_reduced_operator as reduced
 from residual_one_mode_fields import residual_stresses
 
 
+class _CompactResidualRequest(dict):
+    """Keep the solver's diagnostic dump from formatting a full 3-D field."""
+
+    def __repr__(self) -> str:
+        field = np.asarray(self["residual_stress"])
+        return f"{{'residual_stress': ndarray(shape={field.shape}, dtype={field.dtype})}}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -26,6 +34,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--selection-metric", choices=("anchor", "stress-proxy"), default="anchor")
     parser.add_argument("--extra-mode", type=Path, nargs="*", default=[])
+    parser.add_argument("--target-candidate-id", type=int, default=None)
     args = parser.parse_args()
     run_dir, geometry_dir = args.run_dir.resolve(), args.geometry_dir.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -55,8 +64,15 @@ def main() -> int:
         V = np.concatenate((anchor_basis, extra), axis=0)
     else:
         V = anchor_basis
-    pool = pd.read_csv(run_dir / "final_validation_pool.csv")
-    target = pool.iloc[0].to_dict()
+    if args.target_candidate_id is None:
+        pool = pd.read_csv(run_dir / "final_validation_pool.csv")
+        target = pool.iloc[0].to_dict()
+    else:
+        pool = pd.read_csv(run_dir / "candidate_pool_used.csv")
+        selected = pool.loc[pool["candidate_id"].astype(int) == int(args.target_candidate_id)]
+        if len(selected) != 1:
+            raise ValueError("target candidate id is absent or duplicated")
+        target = selected.iloc[0].to_dict()
     gamma = reduced._material_coefficients(target)
     K = np.einsum("q,qij->ij", gamma, existing["raw_Kq"])
     B = np.einsum("q,qij->ij", gamma, existing["raw_Bq"])
@@ -102,7 +118,9 @@ def main() -> int:
         "active_load_ids": [0], "partial_load_output": True,
         "free_gpu_memory_after_solve": True,
         "residual_correction_requests": [
-            {"residual_stress": np.asarray(stress, dtype=np.float32)[:, np.argsort(order)].reshape((6,) + phase.shape)}
+            _CompactResidualRequest(
+                residual_stress=np.asarray(stress, dtype=np.float32)[:, np.argsort(order)].reshape((6,) + phase.shape)
+            )
             for stress in requested_stresses
         ],
         "residual_correction_consumer": consume,

@@ -514,6 +514,7 @@ def solve_material(
     solution_sensitivity_dtype: str | np.dtype | None = None,
     solution_sensitivity_consumer: Callable[[int, str, int, np.ndarray], None] | None = None,
     solution_sensitivity_batch_size: int | None = None,
+    solution_sensitivity_indices: list[int] | tuple[int, ...] | None = None,
     solution_sensitivity_progress: Callable[[int, str, list[int], float], None] | None = None,
     residual_correction_requests: list[dict[str, Any]] | None = None,
     residual_correction_consumer: Callable[[int, np.ndarray, dict[str, Any]], None] | None = None,
@@ -616,6 +617,11 @@ def solve_material(
         params["solution_sensitivity_dtype"] = str(np.dtype(solution_sensitivity_dtype))
     if solution_sensitivity_batch_size is not None:
         params["solution_sensitivity_batch_size"] = int(solution_sensitivity_batch_size)
+    if solution_sensitivity_indices is not None:
+        selected_sensitivities = tuple(sorted({int(q) for q in solution_sensitivity_indices}))
+        if not selected_sensitivities or any(q < 0 or q >= 7 for q in selected_sensitivities):
+            raise ValueError("solution_sensitivity_indices must select coefficients in [0, 6].")
+        params["solution_sensitivity_indices"] = selected_sensitivities
     if solution_sensitivity_progress is not None:
         params["solution_sensitivity_progress"] = solution_sensitivity_progress
     if residual_correction_requests:
@@ -681,16 +687,18 @@ def solve_material(
         )
     if in_memory_sensitivities:
         if solution_sensitivity_consumer is not None:
-            expected = {(q, load_id) for q in range(7) for load_id in range(6)}
+            selected = params.get("solution_sensitivity_indices", tuple(range(7)))
+            expected = {(int(q), load_id) for q in selected for load_id in range(6)}
             consumed = set(consumed_sensitivities or ())
             if consumed != expected:
                 raise RuntimeError(
                     f"El consumidor no recibio las 42 sensibilidades en {material_dir}."
                 )
         elif return_solution_sensitivities:
+            selected = params.get("solution_sensitivity_indices", tuple(range(7)))
             if (
                 solution_sensitivities is None
-                or np.asarray(solution_sensitivities).shape[:3] != (7, 6, 6)
+                or np.asarray(solution_sensitivities).shape[:3] != (len(selected), 6, 6)
             ):
                 raise RuntimeError(
                     f"El solver no devolvio las sensibilidades afines en {material_dir}."

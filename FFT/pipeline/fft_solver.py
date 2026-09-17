@@ -1495,7 +1495,25 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             affine_sensitivity_storage = "sym21_full_cpu"
             affine_sensitivity_bytes = _estimate_shared_array_bytes(affine_sensitivity_cfields)
         affine_sensitivity_build_s = time.perf_counter() - sens_t0
+        selected_sensitivity_indices = tuple(
+            int(q) for q in p.get("solution_sensitivity_indices", range(len(AFFINE_SENSITIVITY_NAMES)))
+        )
+        if (
+            not selected_sensitivity_indices
+            or len(set(selected_sensitivity_indices)) != len(selected_sensitivity_indices)
+            or any(q < 0 or q >= len(AFFINE_SENSITIVITY_NAMES) for q in selected_sensitivity_indices)
+        ):
+            raise ValueError("solution_sensitivity_indices must be unique indices in [0, 6].")
+        affine_sensitivity_cfields = [
+            affine_sensitivity_cfields[q] for q in selected_sensitivity_indices
+        ]
+        affine_sensitivity_names = [
+            AFFINE_SENSITIVITY_NAMES[q] for q in selected_sensitivity_indices
+        ]
         record_gpu_memory("after_affine_sensitivity_cfields")
+    else:
+        selected_sensitivity_indices = ()
+        affine_sensitivity_names = []
 
     force_disk = p.get('force_disk_cfield', False)
     CFIELD_PATH = None
@@ -1612,7 +1630,8 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             'active_load_ids': p.get('active_load_ids', None),
             'partial_load_output': bool(p.get('partial_load_output', False)),
             'affine_sensitivity_cfields': affine_sensitivity_cfields,
-            'affine_sensitivity_names': list(AFFINE_SENSITIVITY_NAMES),
+            'affine_sensitivity_names': affine_sensitivity_names,
+            'affine_sensitivity_indices': selected_sensitivity_indices,
             'affine_sensitivity_consumer': p.get("solution_sensitivity_consumer"),
             'affine_sensitivity_progress': p.get("solution_sensitivity_progress"),
             'affine_sensitivity_batch_size': int(

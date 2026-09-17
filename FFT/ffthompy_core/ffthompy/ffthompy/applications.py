@@ -612,6 +612,11 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
         names = ['gamma_{0}'.format(q) for q in range(q_count)]
     if len(names) != q_count:
         raise ValueError("affine_sensitivity_names no coincide con affine_sensitivity_cfields.")
+    coefficient_indices = tuple(
+        int(q) for q in pb.solve.get('affine_sensitivity_indices', range(q_count))
+    )
+    if len(coefficient_indices) != q_count:
+        raise ValueError("affine_sensitivity_indices no coincide con affine_sensitivity_cfields.")
 
     active_load_ids = pb.solve.get('active_load_ids', None)
     if active_load_ids is None:
@@ -709,9 +714,9 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
         host_transfer_wall_s += float(time.perf_counter() - transfer_started)
         if streaming:
             consumer_started = time.perf_counter()
-            consumer(int(q), str(names[q]), int(load_id), host_value)
+            consumer(int(coefficient_indices[q]), str(names[q]), int(load_id), host_value)
             consumer_wall_s += float(time.perf_counter() - consumer_started)
-            consumed.append((int(q), int(load_id)))
+            consumed.append((int(coefficient_indices[q]), int(load_id)))
         else:
             fields[int(q), int(storage_index)] = host_value
 
@@ -737,7 +742,7 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
                 x_host = to_host_array(X.val).astype(np.dtype(real_dtype), copy=False)
                 solver_wall_s = float(time.perf_counter() - solve_started)
                 solver_infos.append({
-                    'coefficient_index': int(q),
+                    'coefficient_index': int(coefficient_indices[q]),
                     'coefficient_name': str(names[q]),
                     'load_ids': [load_id],
                     'info': info,
@@ -748,7 +753,7 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
                 del x_host
                 if callable(progress):
                     progress(
-                        int(q), str(names[q]), [load_id],
+                        int(coefficient_indices[q]), str(names[q]), [load_id],
                         solver_wall_s,
                     )
                 continue
@@ -784,7 +789,7 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
             x_host = to_host_array(X.val).astype(np.dtype(real_dtype), copy=False)
             solver_wall_s = float(time.perf_counter() - solve_started)
             solver_infos.append({
-                'coefficient_index': int(q),
+                'coefficient_index': int(coefficient_indices[q]),
                 'coefficient_name': str(names[q]),
                 'load_ids': [int(value) for value in chunk_load_ids],
                 'info': info,
@@ -796,7 +801,7 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
             del x_host
             if callable(progress):
                 progress(
-                    int(q), str(names[q]),
+                    int(coefficient_indices[q]), str(names[q]),
                     [int(value) for value in chunk_load_ids],
                     solver_wall_s,
                 )
@@ -822,6 +827,7 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
 
     summary = {
         'coefficient_names': names,
+        'coefficient_indices': [int(q) for q in coefficient_indices],
         'load_ids': [int(value) for value in load_ids],
         'batch_size': int(batch_size),
         'solve_count': int(len(solver_infos)),
@@ -835,6 +841,7 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
     }
     output = {
         'coefficient_names': names,
+        'coefficient_indices': [int(q) for q in coefficient_indices],
         'load_ids': [int(value) for value in load_ids],
         'field_shape': [int(D)] + [int(value) for value in field_shape],
         'streamed': bool(streaming),
