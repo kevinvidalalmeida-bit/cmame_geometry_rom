@@ -61,16 +61,30 @@ def main() -> int:
         fft_backend="gpu", load_batch_size=1,
     )
     started = time.perf_counter()
-    common.solve_material(
-        material_row=anchor, material_dir=args.out / "anchor_correction",
-        geometry=geometry, runtime=runtime, profile="snapshot", seed=20260821,
-        save_solution_fields=False,
-        residual_correction_requests=[
-            {"residual_stress": np.asarray(stresses[i])[:, np.argsort(order)].reshape((6,) + phase.shape)}
+    correction_dir = args.out / "anchor_correction_fast"
+    correction_dir.mkdir(parents=True, exist_ok=True)
+    params = common.sweep._material_solver_params(
+        sobol_gpu=runtime["sobol_gpu"], config=runtime["config"],
+        material_row=anchor, design_row=geometry.design_row,
+        material_dir=correction_dir, seed=20260821, save_solution_fields=False,
+    )
+    settings = common.SOLVER_PROFILES["snapshot32"]
+    params.update({
+        "solver_profile": "snapshot32", "solver_real_dtype": "float32",
+        "solver_rtol": float(settings["solver_rtol"]), "solver_atol": 0.0,
+        "solver_maxiter": int(settings["solver_maxiter"]),
+        "cfield_storage": "sym21", "cfield_indexed": True,
+        "projection_storage": "direct", "projection_backend": "numpy",
+        "phase_array": phase, "ori_array": ori, "preloaded_geometry": True,
+        "active_load_ids": [0], "partial_load_output": True,
+        "free_gpu_memory_after_solve": True,
+        "residual_correction_requests": [
+            {"residual_stress": np.asarray(stresses[i], dtype=np.float32)[:, np.argsort(order)].reshape((6,) + phase.shape)}
             for i in range(6)
         ],
-        residual_correction_consumer=consume,
-    )
+        "residual_correction_consumer": consume,
+    })
+    runtime["sobol_gpu"].solve_homogenization(params)
     Z = np.stack(corrections)  # load, component, voxel
     S = -np.einsum("lcn,mcn->lm", stresses, Z, optimize=True) / phase.size
     S = 0.5 * (S + S.T)
