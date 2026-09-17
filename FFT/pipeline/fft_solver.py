@@ -1618,6 +1618,8 @@ def solve_homogenization(p: Dict[str, Any]) -> np.ndarray:
             'affine_sensitivity_batch_size': int(
                 p.get('solution_sensitivity_batch_size', 0)
             ),
+            'residual_correction_requests': p.get('residual_correction_requests'),
+            'residual_correction_consumer': p.get('residual_correction_consumer'),
         },
         'postprocess': [{'kind': 'GaNi', 'fft_form': solver_fft_form}],
         'solver':      {

@@ -846,6 +846,55 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
     return output, summary
 
 
+def solve_residual_correction_fields(D, Nbar, Afun, pb, GN, A, fft_form='c'):
+    """Solve one-mode greedy corrections from explicitly supplied residuals.
+
+    A request contains a zero-mean Ritz corrector and one macro strain.  The
+    right-hand side is exactly ``-G A_anchor (E + x_r)``.  This avoids the
+    q-by-load affine tangent block: a greedy iteration supplies only one RHS.
+    """
+    requests = pb.solve.get('residual_correction_requests', None)
+    if not requests:
+        return None, {}
+    consumer = pb.solve.get('residual_correction_consumer', None)
+    dtype = np.dtype(_solver_real_dtype(pb))
+    field_shape = tuple(int(v) for v in np.asarray(Nbar, dtype=int).tolist())
+    expected = (D,) + field_shape
+    output = [] if not callable(consumer) else None
+    diagnostics = []
+    for index, request in enumerate(requests):
+        if not isinstance(request, dict):
+            raise ValueError('residual correction request must be a dictionary.')
+        corrector = np.asarray(request.get('corrector'), dtype=dtype)
+        macro = np.asarray(request.get('macro_strain'), dtype=dtype)
+        if corrector.shape != expected or macro.shape != (D,):
+            raise ValueError('expected corrector=(D,*N) and macro_strain=(D,).')
+        value = corrector.copy()
+        value += macro.reshape((D,) + (1,) * len(field_shape))
+        if str(pb.solve.get('fft_backend', '')).lower() == 'cupy':
+            value = to_backend_array(value, prefer_backend='cupy')
+        total = Tensor(name='residual_total_{0}'.format(index), val=value,
+                       order=1, N=Nbar, Y=pb.Y, Fourier=False, fft_form=fft_form)
+        started = time.perf_counter()
+        stress = A(total)
+        B = -(GN(stress))
+        x0 = B.zeros_like(name='x0_residual_{0}'.format(index))
+        X, info = linear_solver(solver=pb.solver['kind'], Afun=Afun, B=B,
+                                x0=x0, par=dict(pb.solver), callback=None)
+        host = to_host_array(X.val).astype(dtype, copy=False)
+        meta = {'request_index': int(index), 'info': info,
+                'solve_wall_s': float(time.perf_counter() - started),
+                'converged': bool(info.get('converged', False))}
+        if callable(consumer):
+            consumer(int(index), host, meta)
+        else:
+            output.append(host)
+        diagnostics.append(meta)
+        del X, x0, B, stress, total, host
+        _release_affine_sensitivity_batch_memory(pb)
+    return output, {'request_count': len(requests), 'requests': diagnostics}
+
+
 def stream_primal_solution_fields_before_sensitivity(D, Nbar, pb, solutions, load_ids):
     consumer = pb.solve.get('solution_field_consumer', None)
     if not callable(consumer):
@@ -1294,6 +1343,14 @@ def elasticity(problem):
             if sensitivity_output is not None:
                 pb.output['affine_sensitivity_' + primaldual] = sensitivity_output
                 pb.output['affine_sensitivity_summary_' + primaldual] = affine_sensitivity_summary
+
+        if primaldual == 'primal' and pb.solve.get('residual_correction_requests', None):
+            residual_output, residual_summary = solve_residual_correction_fields(
+                D, Nbar, Afun, pb, GN, A, fft_form
+            )
+            if residual_output is not None:
+                pb.output['residual_corrections_' + primaldual] = residual_output
+            pb.output['residual_correction_summary_' + primaldual] = residual_summary
 
         # POSTPROCESSING
         partial_load_output = bool(pb.solve.get('partial_load_output', False))
