@@ -680,10 +680,21 @@ def append_raw_normalized(
     appended: list[np.ndarray] = []
     for block in new_fields:
         values = np.asarray(block, dtype=np.float32)
-        gram = reduced._contract_component_major_compute(
-            values, values, compute_dtype=np.float32
+        # Only the diagonal of the 6x6 Gram matrix is needed here.  Forming
+        # all 36 pairwise products wastes most of the contraction work.  The
+        # fields are already host-resident, so a streaming CPU reduction also
+        # avoids uploading every multi-gigabyte block merely to obtain six
+        # scalars.
+        flat = values.reshape(len(values), -1)
+        squared_norms = np.einsum(
+            "ij,ij->i", flat, flat, dtype=np.float32
         )
-        norms = np.sqrt(np.maximum(np.diag(gram), np.finfo(np.float64).tiny))
+        norms = np.sqrt(
+            np.maximum(
+                np.asarray(squared_norms, dtype=np.float64),
+                np.finfo(np.float64).tiny,
+            )
+        )
         values /= norms[:, None, None].astype(np.float32)
         appended.extend(values[i] for i in range(len(values)))
     existing_basis.extend(appended)
@@ -714,6 +725,9 @@ def solve_ordered_fields(
     sensitivity_block_consumer: Callable[[int, str, np.ndarray], None] | None = None,
     sensitivity_batch_size: int | None = None,
     sensitivity_indices: tuple[int, ...] | None = None,
+    persistent_gpu_cache: bool = False,
+    difference_reference: np.ndarray | None = None,
+    difference_scale: float = 1.0,
 ) -> tuple[np.ndarray, dict[str, Any]] | tuple[np.ndarray, dict[str, Any], np.ndarray]:
     """Solve the FOM for one material, returning reordered fields (6, 6, nvox)."""
     nvox = int(voxel_order.size)
@@ -756,6 +770,9 @@ def solve_ordered_fields(
             axis=1,
             out=fields[int(load_id)],
         )
+        if difference_reference is not None:
+            fields[int(load_id)] -= np.asarray(difference_reference[int(load_id)])
+            fields[int(load_id)] *= np.float32(difference_scale)
         field_loads_seen.add(int(load_id))
         if field_block_consumer is not None and field_loads_seen == set(range(6)):
             field_block_consumer(fields)
@@ -819,6 +836,7 @@ def solve_ordered_fields(
                     solution_sensitivity_batch_size=sensitivity_batch_size,
                     solution_sensitivity_indices=sensitivity_indices,
                     solution_sensitivity_progress=sensitivity_progress,
+                    persistent_gpu_cache=bool(persistent_gpu_cache),
                 )
         else:
             record = common.solve_material(
@@ -841,6 +859,7 @@ def solve_ordered_fields(
                     solution_sensitivity_batch_size=sensitivity_batch_size,
                     solution_sensitivity_indices=sensitivity_indices,
                     solution_sensitivity_progress=sensitivity_progress,
+                    persistent_gpu_cache=bool(persistent_gpu_cache),
                 )
     if return_raw_fields and return_sensitivity_fields:
         if raw_fields is None or sensitivity_fields is None:
@@ -1193,6 +1212,30 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--compile-cfield-geometry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compile and reuse fixed phase/orientation indexing across materials.",
+    )
+    parser.add_argument(
+        "--persistent-gpu-cache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Reuse FFT/projection allocations between sequential single-RHS "
+            "solves (default: enabled for GPU FD secants only)."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-warm-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep the six anchor fields on the GPU while solving sequential FD "
+            "secants, avoiding repeated host-to-device warm-start transfers."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1200,6 +1243,10 @@ def main() -> int:
     pipeline_started = time.perf_counter()
     stage_profile_rows: list[dict[str, Any]] = []
     args = parse_args()
+    if args.persistent_gpu_cache is None:
+        args.persistent_gpu_cache = (
+            str(args.tangent_method) == "fd" and str(args.fft_backend) == "gpu"
+        )
     if not 0 <= int(args.geometry_id) <= 9:
         raise ValueError("geometry-id must be in [0, 9].")
     if float(args.tolerance) <= 0.0:
@@ -1244,6 +1291,14 @@ def main() -> int:
         fft_backend=str(args.fft_backend),
         load_batch_size=int(args.load_batch_size),
     )
+    if bool(args.compile_cfield_geometry) and str(args.fft_backend) == "gpu":
+        from pipeline.fft_solver import compile_cfield_geometry
+
+        geometry.phase.setflags(write=False)
+        geometry.ori.setflags(write=False)
+        runtime["compiled_cfield_geometry"] = compile_cfield_geometry(
+            geometry.phase, geometry.ori
+        )
     runtime_setup_wall_s = float(time.perf_counter() - runtime_started)
     _stage_profile_row(
         stage_profile_rows,
@@ -1509,6 +1564,7 @@ def main() -> int:
                 sensitivity_block_consumer=consume_sensitivity_block,
                 sensitivity_batch_size=int(args.sensitivity_batch_size),
                 sensitivity_indices=sensitivity_indices,
+                persistent_gpu_cache=bool(args.persistent_gpu_cache),
             )
             anchor_raw_fields = None
             sensitivity_fields = None
@@ -1525,6 +1581,7 @@ def main() -> int:
                 voxel_order=voxel_order,
                 quiet_solver=bool(args.quiet_solver),
                 return_raw_fields=True,
+                persistent_gpu_cache=bool(args.persistent_gpu_cache),
             )
             sensitivity_fields = None
         total_fom_solves += 1
@@ -1633,6 +1690,16 @@ def main() -> int:
             all_step_dfs.append(step_df)
 
             perturbed_fields: dict[int, np.ndarray] = {}
+            secant_initial_fields: Any = anchor_raw_fields
+            if bool(args.gpu_warm_start) and str(args.fft_backend) == "gpu":
+                import cupy as cp
+
+                secant_initial_fields = cp.asarray(anchor_raw_fields)
+                # The upload is asynchronous; the host buffer may be released
+                # only after CUDA has finished reading it.
+                cp.cuda.get_current_stream().synchronize()
+                del anchor_raw_fields
+                anchor_raw_fields = None
             fd_rows_by_q = {
                 int(row["coefficient_index"]): row
                 for row in step_df.to_dict(orient="records")
@@ -1643,6 +1710,11 @@ def main() -> int:
                     f"material={int(mat['material_id'])} {mat['material_label']}",
                     flush=True,
                 )
+                forward_q = None
+                forward_step = None
+                if fd_mode == "forward":
+                    forward_q = int(mat["material_id"]) - 100000 - 1000 * anchor_idx
+                    forward_step = float(fd_rows_by_q[forward_q]["signed_step"])
                 fields, record = solve_ordered_fields(
                     run_dir=run_dir,
                     geometry=geometry,
@@ -1653,13 +1725,13 @@ def main() -> int:
                     basis_dtype=dtype,
                     voxel_order=voxel_order,
                     quiet_solver=bool(args.quiet_solver),
-                    initial_solution_fields=anchor_raw_fields,
+                    initial_solution_fields=secant_initial_fields,
+                    persistent_gpu_cache=bool(args.persistent_gpu_cache),
+                    difference_reference=(anchor_fields if fd_mode == "forward" else None),
+                    difference_scale=(1.0 / forward_step if forward_step is not None else 1.0),
                 )
                 if fd_mode == "forward":
-                    q = (int(mat["material_id"]) - 100000 - 1000 * anchor_idx)
-                    step = float(fd_rows_by_q[q]["signed_step"])
-                    tangent_blocks.append((fields - anchor_fields) / step)
-                    del fields
+                    tangent_blocks.append(fields)
                 else:
                     perturbed_fields[int(mat["material_id"])] = fields
                 total_fom_solves += 1
@@ -1673,6 +1745,7 @@ def main() -> int:
                     material_id=int(mat["material_id"]),
                     solver_profile=str(record.get("solver_profile", args.tangent_profile or args.profile)),
                 )
+            del secant_initial_fields
             gc.collect()
 
             for row in ([] if fd_mode == "forward" else step_df.to_dict(orient="records")):
@@ -1687,6 +1760,18 @@ def main() -> int:
 
             del perturbed_fields
             gc.collect()
+
+        if bool(args.persistent_gpu_cache):
+            release_started = time.perf_counter()
+            runtime["sobol_gpu"].free_gpu_memory_pool(clear_fft_cache=True)
+            gc.collect()
+            _stage_profile_row(
+                stage_profile_rows,
+                stage="release_sequential_solver_cache",
+                scope="anchor",
+                anchor_id=anchor_idx,
+                wall_s=float(time.perf_counter() - release_started),
+            )
 
         # -------------------------------------------------------------------
         # 4. Enrich the basis using double-pass MGS
@@ -2091,10 +2176,11 @@ def main() -> int:
             "tangents. Anchors are chosen by worst ROM monitor error until "
             "tolerance is met."
         )
-        fd_tangent_count = (
-            len(reduced.COEFF_NAMES)
-            if args.fd_mode == "forward"
-            else 2 * len(reduced.COEFF_NAMES)
+        independent_tangent_count = len(reduced.COEFF_NAMES) - int(
+            bool(args.omit_redundant_tangent)
+        )
+        fd_tangent_count = independent_tangent_count * (
+            1 if args.fd_mode == "forward" else 2
         )
         solves_per_anchor = (
             f"1 anchor + {fd_tangent_count} tangent FD = "
@@ -2147,6 +2233,10 @@ def main() -> int:
         "legacy_monitor_material_source_csv": str(base_monitor_truth_csv),
         "legacy_final_material_source_csv": str(base_final_truth_csv),
         "fft_backend": str(args.fft_backend),
+        "compile_cfield_geometry": bool(args.compile_cfield_geometry),
+        "persistent_gpu_cache": bool(args.persistent_gpu_cache),
+        "gpu_warm_start": bool(args.gpu_warm_start),
+        "load_batch_size": int(args.load_batch_size),
         "gamma_fd_rel_step_requested": (
             float(args.rel_step) if str(args.tangent_method) == "fd" else None
         ),

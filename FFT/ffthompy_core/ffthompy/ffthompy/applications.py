@@ -483,7 +483,12 @@ def solve_load_elasticity(iL, D, Nbar, Afun, pb, GN, A, add_macro2minimizer, lin
     init_fields = pb.solve.get('initial_solution_fields', None)
     if init_fields is not None:
         x0 = EN.zeros_like(name='x0')
-        val = np.asarray(init_fields[iL], dtype=real_dtype)
+        initial_value = init_fields[iL]
+        if hasattr(x0.val, "get") or type(x0.val).__module__.startswith("cupy"):
+            import cupy as cp
+            val = cp.asarray(initial_value, dtype=real_dtype)
+        else:
+            val = np.asarray(initial_value, dtype=real_dtype)
         if val.size != x0.val.size:
             raise ValueError(
                 'initial_solution_fields[{0}] has {1} entries; expected {2}.'.format(
@@ -492,8 +497,10 @@ def solve_load_elasticity(iL, D, Nbar, Afun, pb, GN, A, add_macro2minimizer, lin
             )
         val = val.reshape(x0.val.shape)
         if hasattr(x0.val, "get") or type(x0.val).__module__.startswith("cupy"):
-            import cupy as cp
-            x0.val = cp.asarray(val)
+            # CG updates x0 in place.  A device-resident anchor warm start is
+            # shared by all perturbed materials, so each load needs its own
+            # inexpensive device-to-device working copy.
+            x0.val = val.copy()
         else:
             x0.val = val
         if pb.solve.get('project_initial_solution_fields', False):

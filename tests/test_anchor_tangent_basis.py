@@ -17,6 +17,31 @@ for path in (ROOT, ROOT / "scripts", ROOT / "src", EXPERIMENTS):
 import cmame_anchor_tangent_adaptive as adaptive
 
 
+def test_raw_normalized_uses_unit_norm_rows_without_changing_span():
+    rng = np.random.default_rng(20260917)
+    blocks = [
+        rng.standard_normal((6, 6, 19)).astype(np.float32),
+        rng.standard_normal((6, 6, 19)).astype(np.float32),
+    ]
+    original = np.concatenate([block.reshape(6, -1) for block in blocks], axis=0)
+    basis = []
+
+    appended = adaptive.append_raw_normalized(basis, blocks)
+
+    normalized = np.stack(appended).reshape(len(appended), -1)
+    np.testing.assert_allclose(
+        np.einsum("ij,ij->i", normalized, normalized),
+        np.ones(len(appended)),
+        rtol=2.0e-6,
+        atol=2.0e-6,
+    )
+    for index in range(len(appended)):
+        cosine = np.dot(normalized[index], original[index]) / (
+            np.linalg.norm(normalized[index]) * np.linalg.norm(original[index])
+        )
+        np.testing.assert_allclose(cosine, 1.0, rtol=2.0e-6, atol=2.0e-6)
+
+
 def test_fused_gpu_cgs2_preserves_reference_subspace():
     rng = np.random.default_rng(20260818)
     nvox = 24
