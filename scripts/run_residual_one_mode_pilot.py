@@ -25,6 +25,7 @@ def main() -> int:
     parser.add_argument("--geometry-dir", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--selection-metric", choices=("anchor", "stress-proxy"), default="anchor")
+    parser.add_argument("--extra-mode", type=Path, nargs="*", default=[])
     args = parser.parse_args()
     run_dir, geometry_dir = args.run_dir.resolve(), args.geometry_dir.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -36,11 +37,24 @@ def main() -> int:
         phase.reshape(-1)[order], ori.reshape(-1, 3)[order]
     )
     basis_paths = sorted((run_dir / "basis_fields").glob("basis_*.npy"))
-    V = np.stack([np.load(path, mmap_mode="r").reshape(6, -1) for path in basis_paths])
+    anchor_basis = np.stack([np.load(path, mmap_mode="r").reshape(6, -1) for path in basis_paths])
     with np.load(run_dir / "reduced_operators.npz") as payload:
         existing = {name: np.asarray(payload[name]) for name in payload.files if name in {
             "Kq", "Bq", "Dq", "raw_Kq", "raw_Bq", "invR", "G"
         }}
+    if args.extra_mode:
+        extra = np.stack([np.load(path).reshape(6, -1) for path in args.extra_mode])
+        Kq, Bq, Dq, metadata = reduced._extend_reduced_operators(
+            existing=existing, old_basis=anchor_basis, new_basis=extra,
+            affine_stress_batch=affine, preserve_raw_coordinates=True,
+            factorized_ritz=True,
+        )
+        existing = {"Kq": Kq, "Bq": Bq, "Dq": Dq,
+                    "raw_Kq": metadata["raw_Kq"], "raw_Bq": metadata["raw_Bq"],
+                    "invR": metadata["invR"]}
+        V = np.concatenate((anchor_basis, extra), axis=0)
+    else:
+        V = anchor_basis
     pool = pd.read_csv(run_dir / "final_validation_pool.csv")
     target = pool.iloc[0].to_dict()
     gamma = reduced._material_coefficients(target)
@@ -109,10 +123,12 @@ def main() -> int:
         trace_value = float(np.trace(S))
         mode = np.einsum("l,lcn->cn", direction, Z, optimize=True)
     mode /= np.sqrt(max(eta, np.finfo(float).eps))
-    np.save(args.out / "mode_0006.npy", mode.astype(np.float32))
+    mode_path = args.out / f"mode_{len(V):04d}.npy"
+    np.save(mode_path, mode.astype(np.float32))
     result = {
         "geometry_id": int(geometry.manifest.get("geometry_id", -1)),
         "anchor_materials": 1, "rank_before": int(len(V)), "rank_after": int(len(V) + 1),
+        "mode_path": str(mode_path),
         "target_material_id": int(target.get("material_id", target.get("final_validation_id", 0))),
         "selection_metric": str(args.selection_metric),
         "eta_before": eta, "trace_before": trace_value,
