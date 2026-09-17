@@ -849,9 +849,11 @@ def solve_affine_sensitivity_fields(D, Nbar, Afun, pb, GN, solutions, fft_form='
 def solve_residual_correction_fields(D, Nbar, Afun, pb, GN, A, fft_form='c'):
     """Solve one-mode greedy corrections from explicitly supplied residuals.
 
-    A request contains a zero-mean Ritz corrector and one macro strain.  The
-    right-hand side is exactly ``-G A_anchor (E + x_r)``.  This avoids the
-    q-by-load affine tangent block: a greedy iteration supplies only one RHS.
+    A request contains either a zero-mean Ritz corrector plus macro strain, or
+    a preassembled residual stress.  The latter lets the affine compiler form
+    ``B(gamma)-K(gamma)VY`` while this routine only applies the anchor inverse.
+    This avoids the q-by-load affine tangent block: a greedy iteration supplies
+    only one RHS.
     """
     requests = pb.solve.get('residual_correction_requests', None)
     if not requests:
@@ -865,18 +867,29 @@ def solve_residual_correction_fields(D, Nbar, Afun, pb, GN, A, fft_form='c'):
     for index, request in enumerate(requests):
         if not isinstance(request, dict):
             raise ValueError('residual correction request must be a dictionary.')
-        corrector = np.asarray(request.get('corrector'), dtype=dtype)
-        macro = np.asarray(request.get('macro_strain'), dtype=dtype)
-        if corrector.shape != expected or macro.shape != (D,):
-            raise ValueError('expected corrector=(D,*N) and macro_strain=(D,).')
-        value = corrector.copy()
-        value += macro.reshape((D,) + (1,) * len(field_shape))
-        if str(pb.solve.get('fft_backend', '')).lower() == 'cupy':
-            value = to_backend_array(value, prefer_backend='cupy')
-        total = Tensor(name='residual_total_{0}'.format(index), val=value,
-                       order=1, N=Nbar, Y=pb.Y, Fourier=False, fft_form=fft_form)
         started = time.perf_counter()
-        stress = A(total)
+        residual_stress = request.get('residual_stress', None)
+        if residual_stress is None:
+            corrector = np.asarray(request.get('corrector'), dtype=dtype)
+            macro = np.asarray(request.get('macro_strain'), dtype=dtype)
+            if corrector.shape != expected or macro.shape != (D,):
+                raise ValueError('expected corrector=(D,*N) and macro_strain=(D,).')
+            value = corrector.copy()
+            value += macro.reshape((D,) + (1,) * len(field_shape))
+            if str(pb.solve.get('fft_backend', '')).lower() == 'cupy':
+                value = to_backend_array(value, prefer_backend='cupy')
+            total = Tensor(name='residual_total_{0}'.format(index), val=value,
+                           order=1, N=Nbar, Y=pb.Y, Fourier=False, fft_form=fft_form)
+            stress = A(total)
+        else:
+            value = np.asarray(residual_stress, dtype=dtype)
+            if value.shape != expected:
+                raise ValueError('expected residual_stress=(D,*N).')
+            if str(pb.solve.get('fft_backend', '')).lower() == 'cupy':
+                value = to_backend_array(value, prefer_backend='cupy')
+            stress = Tensor(name='residual_stress_{0}'.format(index), val=value,
+                            order=1, N=Nbar, Y=pb.Y, Fourier=False, fft_form=fft_form)
+            total = None
         B = -(GN(stress))
         x0 = B.zeros_like(name='x0_residual_{0}'.format(index))
         X, info = linear_solver(solver=pb.solver['kind'], Afun=Afun, B=B,
