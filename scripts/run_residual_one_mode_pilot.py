@@ -24,6 +24,7 @@ def main() -> int:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--geometry-dir", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--selection-metric", choices=("anchor", "stress-proxy"), default="anchor")
     args = parser.parse_args()
     run_dir, geometry_dir = args.run_dir.resolve(), args.geometry_dir.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -48,8 +49,16 @@ def main() -> int:
     Y = reduced._solve_spd_reduced(K, B)
     stresses = residual_stresses(affine, V, gamma, Y)
 
-    corrections: list[np.ndarray | None] = [None] * 6
-    infos: list[dict] = [{} for _ in range(6)]
+    if args.selection_metric == "stress-proxy":
+        proxy = np.einsum("lcn,mcn->lm", stresses, stresses, optimize=True) / phase.size
+        _, proxy_vectors = np.linalg.eigh(0.5 * (proxy + proxy.T))
+        direction = proxy_vectors[:, -1]
+        requested_stresses = [np.einsum("l,lcn->cn", direction, stresses, optimize=True)]
+    else:
+        direction = None
+        requested_stresses = [stresses[i] for i in range(6)]
+    corrections: list[np.ndarray | None] = [None] * len(requested_stresses)
+    infos: list[dict] = [{} for _ in requested_stresses]
     def consume(index: int, field: np.ndarray, meta: dict) -> None:
         # FFT emits physical voxel order; Ritz fields use phase/orientation order.
         corrections[index] = np.asarray(field, dtype=np.float32).reshape(6, -1)[:, order].copy()
@@ -68,9 +77,9 @@ def main() -> int:
         material_row=anchor, design_row=geometry.design_row,
         material_dir=correction_dir, seed=20260821, save_solution_fields=False,
     )
-    settings = common.SOLVER_PROFILES["snapshot32"]
+    settings = common.SOLVER_PROFILES["rom_floor"]
     params.update({
-        "solver_profile": "snapshot32", "solver_real_dtype": "float32",
+        "solver_profile": "rom_floor", "solver_real_dtype": "float32",
         "solver_rtol": float(settings["solver_rtol"]), "solver_atol": 0.0,
         "solver_maxiter": int(settings["solver_maxiter"]),
         "cfield_storage": "sym21", "cfield_indexed": True,
@@ -79,26 +88,34 @@ def main() -> int:
         "active_load_ids": [0], "partial_load_output": True,
         "free_gpu_memory_after_solve": True,
         "residual_correction_requests": [
-            {"residual_stress": np.asarray(stresses[i], dtype=np.float32)[:, np.argsort(order)].reshape((6,) + phase.shape)}
-            for i in range(6)
+            {"residual_stress": np.asarray(stress, dtype=np.float32)[:, np.argsort(order)].reshape((6,) + phase.shape)}
+            for stress in requested_stresses
         ],
         "residual_correction_consumer": consume,
     })
     runtime["sobol_gpu"].solve_homogenization(params)
-    Z = np.stack(corrections)  # load, component, voxel
-    S = -np.einsum("lcn,mcn->lm", stresses, Z, optimize=True) / phase.size
-    S = 0.5 * (S + S.T)
-    eigenvalues, eigenvectors = np.linalg.eigh(S)
-    direction = eigenvectors[:, -1]
-    eta = float(eigenvalues[-1])
-    mode = np.einsum("l,lcn->cn", direction, Z, optimize=True)
+    Z = np.stack(corrections)
+    if args.selection_metric == "stress-proxy":
+        selected_stress = requested_stresses[0]
+        mode = Z[0]
+        eta = float(-np.einsum("cn,cn", selected_stress, mode) / phase.size)
+        trace_value = float(np.trace(proxy))
+    else:
+        S = -np.einsum("lcn,mcn->lm", stresses, Z, optimize=True) / phase.size
+        S = 0.5 * (S + S.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(S)
+        direction = eigenvectors[:, -1]
+        eta = float(eigenvalues[-1])
+        trace_value = float(np.trace(S))
+        mode = np.einsum("l,lcn->cn", direction, Z, optimize=True)
     mode /= np.sqrt(max(eta, np.finfo(float).eps))
     np.save(args.out / "mode_0006.npy", mode.astype(np.float32))
     result = {
         "geometry_id": int(geometry.manifest.get("geometry_id", -1)),
         "anchor_materials": 1, "rank_before": int(len(V)), "rank_after": int(len(V) + 1),
         "target_material_id": int(target.get("material_id", target.get("final_validation_id", 0))),
-        "eta_before": eta, "trace_before": float(np.trace(S)),
+        "selection_metric": str(args.selection_metric),
+        "eta_before": eta, "trace_before": trace_value,
         "dominant_load": direction.tolist(),
         "correction_solve_wall_s": float(time.perf_counter() - started),
         "all_corrections_converged": bool(all(x.get("converged", False) for x in infos)),
