@@ -515,6 +515,8 @@ def solve_material(
     solution_sensitivity_consumer: Callable[[int, str, int, np.ndarray], None] | None = None,
     solution_sensitivity_batch_size: int | None = None,
     solution_sensitivity_progress: Callable[[int, str, list[int], float], None] | None = None,
+    residual_correction_requests: list[dict[str, Any]] | None = None,
+    residual_correction_consumer: Callable[[int, np.ndarray, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Solve one material or return a validated campaign-owned cache entry."""
     if profile not in SOLVER_PROFILES:
@@ -544,6 +546,8 @@ def solve_material(
     material_dir = Path(material_dir)
     material_dir.mkdir(parents=True, exist_ok=True)
     if (
+        not residual_correction_requests
+        and
         not in_memory_fields
         and not in_memory_sensitivities
         and stress_field_consumer is None
@@ -614,6 +618,9 @@ def solve_material(
         params["solution_sensitivity_batch_size"] = int(solution_sensitivity_batch_size)
     if solution_sensitivity_progress is not None:
         params["solution_sensitivity_progress"] = solution_sensitivity_progress
+    if residual_correction_requests:
+        params["residual_correction_requests"] = residual_correction_requests
+        params["residual_correction_consumer"] = residual_correction_consumer
     if initial_solution_fields is not None:
         params["initial_solution_fields"] = initial_solution_fields
         params["project_initial_solution_fields"] = bool(project_initial_solution_fields)
